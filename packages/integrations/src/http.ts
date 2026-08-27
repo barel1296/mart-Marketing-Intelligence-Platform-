@@ -1,0 +1,285 @@
+import { ProviderError, type ProviderErrorClass } from '@mart/shared';
+import { getLogger, counters } from '@mart/observability';
+
+export type FetchImpl = (input: string, init?: RequestInit) => Promise<Response>;
+
+export type HttpClientOptions = {
+  provider: string;
+  fetchImpl?: FetchImpl;
+  timeoutMs?: number;
+  maxAttempts?: number;
+  /** Minimum spacing between requests to one provider, in milliseconds. */
+  minIntervalMs?: number;
+  /** Injected for deterministic tests; defaults to real timers. */
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+};
+
+export type RequestOptions = {
+  method?: 'GET' | 'POST';
+  url: string;
+  headers?: Record<string, string>;
+  query?: Record<string, string | number | boolean | undefined | null>;
+  body?: unknown;
+  /** Response parsing mode; CSV providers return text. */
+  responseType?: 'json' | 'text';
+  /** Overrides the client default for this call. */
+  timeoutMs?: number;
+};
+
+export type HttpResponse<T = unknown> = {
+  status: number;
+  body: T;
+  headers: Record<string, string>;
+  attempts: number;
+};
+
+const DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_MAX_ATTEMPTS = 3;
+
+/**
+ * Classify a provider HTTP failure.
+ *
+ * The class drives behaviour (retry vs alert vs ask a human to reconnect), so
+ * collapsing everything into `unknown_error` is treated as a bug.
+ */
+export function classifyHttpStatus(status: number, bodyText: string): ProviderErrorClass {
+  if (status === 401) return 'authentication_error';
+  if (status === 403) {
+    // Providers use 403 both for "token lacks permission" and for expiry.
+    return /expire|invalid[_ ]?token|session has expired/i.test(bodyText)
+      ? 'expired_credential'
+      : 'authorization_error';
+  }
+  if (status === 400 || status === 404 || status === 422) return 'invalid_request';
+  if (status === 429) return 'rate_limited';
+  if (status === 408 || status === 504) return 'timeout';
+  if (status >= 500) return 'provider_unavailable';
+  return 'unknown_error';
+}
+
+export function isRetryableClass(errorClass: ProviderErrorClass): boolean {
+  return (
+    errorClass === 'rate_limited' ||
+    errorClass === 'provider_unavailable' ||
+    errorClass === 'timeout'
+  );
+}
+
+/** Exponential backoff with full jitter, capped. */
+export function backoffDelayMs(
+  attempt: number,
+  retryAfterMs?: number,
+  random = Math.random,
+): number {
+  if (retryAfterMs && retryAfterMs > 0) return Math.min(retryAfterMs, 60_000);
+  const base = Math.min(1000 * 2 ** (attempt - 1), 30_000);
+  return Math.floor(base / 2 + random() * (base / 2));
+}
+
+function parseRetryAfter(headers: Headers): number | undefined {
+  const value = headers.get('retry-after');
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return seconds * 1000;
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : undefined;
+}
+
+/**
+ * A minimal provider HTTP client.
+ *
+ * Responsibilities kept deliberately narrow: request construction, rate-limit
+ * spacing, bounded retries with backoff, timeouts, and error classification.
+ * It never logs headers (which carry credentials) and never returns them.
+ */
+export class ProviderHttpClient {
+  private readonly provider: string;
+  private readonly fetchImpl: FetchImpl;
+  private readonly timeoutMs: number;
+  private readonly maxAttempts: number;
+  private readonly minIntervalMs: number;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly now: () => number;
+  private nextAllowedAt = 0;
+
+  constructor(options: HttpClientOptions) {
+    this.provider = options.provider;
+    this.fetchImpl = options.fetchImpl ?? ((url, init) => fetch(url, init));
+    this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
+    this.minIntervalMs = options.minIntervalMs ?? 0;
+    this.sleep = options.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+    this.now = options.now ?? (() => Date.now());
+  }
+
+  private buildUrl(url: string, query?: RequestOptions['query']): string {
+    if (!query) return url;
+    const target = new URL(url);
+    for (const [key, value] of Object.entries(query)) {
+      if (value === undefined || value === null) continue;
+      target.searchParams.set(key, String(value));
+    }
+    return target.toString();
+  }
+
+  private async respectRateLimit(): Promise<void> {
+    if (this.minIntervalMs <= 0) return;
+    const wait = this.nextAllowedAt - this.now();
+    if (wait > 0) await this.sleep(wait);
+    this.nextAllowedAt = this.now() + this.minIntervalMs;
+  }
+
+  async request<T = unknown>(options: RequestOptions): Promise<HttpResponse<T>> {
+    const url = this.buildUrl(options.url, options.query);
+    const responseType = options.responseType ?? 'json';
+    let attempt = 0;
+    let lastError: ProviderError | null = null;
+
+    while (attempt < this.maxAttempts) {
+      attempt += 1;
+      await this.respectRateLimit();
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? this.timeoutMs);
+      try {
+        counters.increment('provider_requests_total', { provider: this.provider });
+        const response = await this.fetchImpl(url, {
+          method: options.method ?? 'GET',
+          headers: {
+            accept: responseType === 'json' ? 'application/json' : 'text/csv, text/plain, */*',
+            ...(options.body ? { 'content-type': 'application/json' } : {}),
+            ...options.headers,
+          },
+          ...(options.body ? { body: JSON.stringify(options.body) } : {}),
+          signal: controller.signal,
+        });
+
+        const text = await response.text();
+        if (!response.ok) {
+          const errorClass = classifyHttpStatus(response.status, text);
+          const retryAfterMs = parseRetryAfter(response.headers);
+          lastError = new ProviderError({
+            provider: this.provider,
+            errorClass,
+            httpStatus: response.status,
+            retryable: isRetryableClass(errorClass),
+            ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+            message: `${this.provider} responded ${response.status}`,
+            userMessage: userMessageFor(this.provider, errorClass, response.status),
+            // Truncated body only; provider errors can echo request parameters.
+            context: { bodyPreview: text.slice(0, 300) },
+          });
+          counters.increment('provider_errors_total', {
+            provider: this.provider,
+            class: errorClass,
+          });
+          if (!lastError.retryable || attempt >= this.maxAttempts) throw lastError;
+          await this.sleep(backoffDelayMs(attempt, retryAfterMs));
+          continue;
+        }
+
+        const body = (
+          responseType === 'json' ? (text.length ? JSON.parse(text) : null) : text
+        ) as T;
+        return {
+          status: response.status,
+          body,
+          headers: safeHeaders(response.headers),
+          attempts: attempt,
+        };
+      } catch (error) {
+        clearTimeout(timeout);
+        if (error instanceof ProviderError) {
+          if (!error.retryable || attempt >= this.maxAttempts) throw error;
+          lastError = error;
+          await this.sleep(backoffDelayMs(attempt, error.retryAfterMs));
+          continue;
+        }
+        const aborted = error instanceof Error && error.name === 'AbortError';
+        const errorClass: ProviderErrorClass = aborted ? 'timeout' : 'provider_unavailable';
+        lastError = new ProviderError({
+          provider: this.provider,
+          errorClass,
+          retryable: true,
+          message: aborted
+            ? `${this.provider} request timed out`
+            : `${this.provider} request failed`,
+          userMessage: userMessageFor(this.provider, errorClass),
+          cause: error,
+        });
+        counters.increment('provider_errors_total', {
+          provider: this.provider,
+          class: errorClass,
+        });
+        getLogger().warn(
+          { provider: this.provider, attempt, errorClass },
+          'provider request failed, will retry if attempts remain',
+        );
+        if (attempt >= this.maxAttempts) throw lastError;
+        await this.sleep(backoffDelayMs(attempt));
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+
+    throw (
+      lastError ??
+      new ProviderError({
+        provider: this.provider,
+        errorClass: 'unknown_error',
+        message: `${this.provider} request failed`,
+        retryable: false,
+      })
+    );
+  }
+}
+
+/** Response headers minus anything that could carry credentials. */
+function safeHeaders(headers: Headers): Record<string, string> {
+  const allowed = ['content-type', 'x-request-id', 'retry-after', 'x-ratelimit-remaining'];
+  const out: Record<string, string> = {};
+  for (const key of allowed) {
+    const value = headers.get(key);
+    if (value) out[key] = value;
+  }
+  return out;
+}
+
+/**
+ * User-facing message: actionable, and free of API internals.
+ * "Meta access token expired - reconnect the integration" beats a raw payload.
+ */
+export function userMessageFor(
+  provider: string,
+  errorClass: ProviderErrorClass,
+  status?: number,
+): string {
+  const name = PROVIDER_DISPLAY_NAMES[provider] ?? provider;
+  switch (errorClass) {
+    case 'authentication_error':
+      return `${name} rejected the stored credential. Reconnect the integration with a valid token.`;
+    case 'expired_credential':
+      return `The ${name} credential has expired. Reconnect the integration to continue syncing.`;
+    case 'authorization_error':
+      return `The ${name} credential does not have permission for this data. Check the token's scopes and account access.`;
+    case 'rate_limited':
+      return `${name} is rate limiting MART. The sync will retry automatically.`;
+    case 'provider_unavailable':
+      return `${name} is temporarily unavailable${status ? ` (HTTP ${status})` : ''}. The sync will retry automatically.`;
+    case 'timeout':
+      return `${name} did not respond in time. The sync will retry automatically.`;
+    case 'invalid_request':
+      return `${name} rejected the request. This usually means the selected account or date range is not available to this credential.`;
+    case 'schema_change':
+      return `${name} returned an unexpected response shape. MART stopped rather than storing data it cannot interpret.`;
+    default:
+      return `The ${name} sync failed. See the sync run details for the classified error.`;
+  }
+}
+
+const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
+  meta_ads: 'Meta Ads',
+  appsflyer: 'AppsFlyer',
+  tenjin: 'Tenjin',
+};

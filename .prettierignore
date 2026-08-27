@@ -1,0 +1,6 @@
+node_modules
+dist
+.next
+coverage
+pnpm-lock.yaml
+smart-marketing-intelligence-platform.json

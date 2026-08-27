@@ -1,0 +1,24 @@
+{
+  "name": "@mart/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/worker.js",
+  "scripts": {
+    "build": "tsc -b",
+    "dev": "tsx watch src/worker.ts",
+    "start": "node dist/worker.js",
+    "clean": "rm -rf dist *.tsbuildinfo"
+  },
+  "dependencies": {
+    "@mart/config": "workspace:*",
+    "@mart/db": "workspace:*",
+    "@mart/integrations": "workspace:*",
+    "@mart/observability": "workspace:*",
+    "@mart/shared": "workspace:*",
+    "fastify": "^5.2.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2"
+  }
+}

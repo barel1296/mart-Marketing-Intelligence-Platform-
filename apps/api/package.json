@@ -1,0 +1,28 @@
+{
+  "name": "@mart/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/server.js",
+  "scripts": {
+    "build": "tsc -b",
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js",
+    "clean": "rm -rf dist *.tsbuildinfo"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.0.1",
+    "@mart/auth": "workspace:*",
+    "@mart/config": "workspace:*",
+    "@mart/db": "workspace:*",
+    "@mart/integrations": "workspace:*",
+    "@mart/metrics": "workspace:*",
+    "@mart/observability": "workspace:*",
+    "@mart/shared": "workspace:*",
+    "fastify": "^5.2.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2"
+  }
+}

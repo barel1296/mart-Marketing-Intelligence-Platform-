@@ -1,0 +1,19 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "rootDir": "src",
+    "outDir": "dist",
+    "tsBuildInfoFile": "dist/.tsbuildinfo"
+  },
+  "include": ["src/**/*"],
+  "references": [
+    { "path": "../../packages/shared" },
+    { "path": "../../packages/config" },
+    { "path": "../../packages/observability" },
+    { "path": "../../packages/db" },
+    { "path": "../../packages/auth" },
+    { "path": "../../packages/integrations" },
+    { "path": "../../packages/metrics" }
+  ]
+}
