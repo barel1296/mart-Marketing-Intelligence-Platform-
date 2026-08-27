@@ -737,3 +737,41 @@ button.danger {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* ------------------------------------------------------- data provenance -- */
+/*
+ * Shown whenever a bound provider's requests are configured to go somewhere
+ * other than that provider's real service. It is deliberately loud: a chart
+ * built from a development endpoint must never be mistaken for live data.
+ */
+.provenance-banner {
+  border: 1px solid var(--status-serious);
+  border-left-width: 4px;
+  border-radius: var(--radius);
+  background: var(--status-serious-soft);
+  padding: 12px 14px;
+  margin-bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.provenance-banner strong {
+  color: var(--status-serious);
+  font-size: 13px;
+  letter-spacing: 0.01em;
+}
+.provenance-banner p {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.provenance-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}

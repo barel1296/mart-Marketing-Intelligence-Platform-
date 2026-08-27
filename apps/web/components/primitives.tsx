@@ -123,3 +123,46 @@ export function Card({
     </section>
   );
 }
+
+export type DataSource = {
+  role: string;
+  providerKey: string;
+  account: string | null;
+  accountName: string | null;
+  configuredBaseUrl: string | null;
+  productionBaseUrl: string | null;
+  origin: 'live_provider' | 'non_production_endpoint' | 'unknown';
+};
+
+/**
+ * Where the numbers on this page came from.
+ *
+ * MART lets an operator repoint a provider's base URL - that is how the local
+ * fixture server is used. The moment that happens everything downstream is
+ * development data, so the dashboard says so in the loudest place on the page
+ * rather than letting a fixture chart pass for a live one.
+ */
+export function DataSourceBanner({ sources }: { sources: DataSource[] }) {
+  const nonProduction = sources.filter((source) => source.origin === 'non_production_endpoint');
+  if (nonProduction.length === 0) return null;
+
+  return (
+    <div className="provenance-banner" role="status">
+      <strong>DEVELOPMENT FIXTURE DATA — NOT LIVE PROVIDER DATA</strong>
+      <p>
+        {nonProduction.length === sources.length ? 'Every figure' : 'Some figures'} on this page
+        came from a development endpoint, not from the real provider API. These numbers are
+        synthetic. Do not use them for reporting or for a spending decision.
+      </p>
+      <ul className="provenance-list">
+        {nonProduction.map((source) => (
+          <li key={`${source.role}-${source.providerKey}`}>
+            <span className="mono">{source.providerKey}</span> reads from{' '}
+            <span className="mono">{source.configuredBaseUrl}</span> instead of{' '}
+            <span className="mono">{source.productionBaseUrl}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}

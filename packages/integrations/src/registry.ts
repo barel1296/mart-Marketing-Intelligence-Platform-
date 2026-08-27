@@ -229,3 +229,52 @@ export function buildCredentials(
       throw new AppError('validation_failed', 'Unsupported credential kind');
   }
 }
+
+/**
+ * Where MART will actually send this provider's requests.
+ *
+ * Base URLs are configurable so a developer can point an adapter at the local
+ * fixture server. That is exactly why the dashboard needs to be able to say so:
+ * a number fetched from a fixture endpoint must never be presented as if it came
+ * from the provider. `isProduction` compares the configured origin against the
+ * provider's real one, so the answer is derived from configuration rather than
+ * from a flag someone could forget to set.
+ */
+export type ProviderEndpointInfo = {
+  providerKey: string;
+  configuredBaseUrl: string;
+  productionBaseUrl: string;
+  isProduction: boolean;
+};
+
+const PRODUCTION_BASE_URLS: Partial<Record<ProviderKey, string>> = {
+  meta_ads: 'https://graph.facebook.com',
+  appsflyer: 'https://hq1.appsflyer.com',
+  tenjin: 'https://reporting.tenjin.com',
+};
+
+function originOf(url: string): string {
+  try {
+    return new URL(url).origin.toLowerCase();
+  } catch {
+    return url.trim().toLowerCase();
+  }
+}
+
+export function providerEndpointInfo(providerKey: string): ProviderEndpointInfo | null {
+  const production = PRODUCTION_BASE_URLS[providerKey as ProviderKey];
+  if (!production) return null;
+  const config = getConfig();
+  const configured =
+    providerKey === 'meta_ads'
+      ? config.META_GRAPH_BASE_URL
+      : providerKey === 'appsflyer'
+        ? config.APPSFLYER_BASE_URL
+        : config.TENJIN_BASE_URL;
+  return {
+    providerKey,
+    configuredBaseUrl: configured,
+    productionBaseUrl: production,
+    isProduction: originOf(configured) === originOf(production),
+  };
+}

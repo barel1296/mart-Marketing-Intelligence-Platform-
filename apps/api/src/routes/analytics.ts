@@ -2,7 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { addDays, AppError, toIsoDate, MAPPING_STATUSES } from '@mart/shared';
 import { auditRepo, dataQualityRepo, integrationsRepo, mappingsRepo, syncRepo } from '@mart/db';
-import { campaignCoverage, reconcileCampaigns } from '@mart/integrations';
+import { campaignCoverage, providerEndpointInfo, reconcileCampaigns } from '@mart/integrations';
 import {
   computeMetricValues,
   listMetricDefinitions,
@@ -423,9 +423,31 @@ export async function registerAnalyticsRoutes(server: FastifyInstance): Promise<
         limit: 5,
       });
 
+      // Provenance for every number on this page: which provider account it came
+      // from, and whether that provider's requests go to the real service or to a
+      // development endpoint. Fixture data must never look like live data.
+      const dataSources = bindings.map((b) => {
+        const endpoint = providerEndpointInfo(b.provider_key);
+        return {
+          role: b.role,
+          providerKey: b.provider_key,
+          account: b.external_account_id,
+          accountName: b.account_name,
+          configuredBaseUrl: endpoint?.configuredBaseUrl ?? null,
+          productionBaseUrl: endpoint?.productionBaseUrl ?? null,
+          origin:
+            endpoint === null
+              ? 'unknown'
+              : endpoint.isProduction
+                ? 'live_provider'
+                : 'non_production_endpoint',
+        };
+      });
+
       return {
         app,
         range,
+        dataSources,
         dataHealth: {
           integrations: bindings.map((b) => ({
             role: b.role,

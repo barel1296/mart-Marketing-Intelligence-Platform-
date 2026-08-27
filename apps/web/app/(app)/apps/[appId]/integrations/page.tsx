@@ -1,6 +1,12 @@
 import Link from 'next/link';
 import { apiGet } from '../../../../../lib/api';
-import { Card, EmptyState, StatusChip } from '../../../../../components/primitives';
+import {
+  Card,
+  DataSourceBanner,
+  EmptyState,
+  StatusChip,
+  type DataSource,
+} from '../../../../../components/primitives';
 import { SyncButton } from '../../../../../components/actions';
 import {
   AttributionProviderChooser,
@@ -62,6 +68,9 @@ type IntegrationCard = {
   } | null;
   capabilities: Capability[];
   credentialConfigured: boolean;
+  configuredBaseUrl: string | null;
+  productionBaseUrl: string | null;
+  origin: DataSource['origin'];
 };
 
 type FreshnessRow = {
@@ -214,6 +223,18 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ a
           </Link>
         </div>
       </header>
+
+      <DataSourceBanner
+        sources={integrations.map((card) => ({
+          role: card.role,
+          providerKey: card.providerKey,
+          account: card.account?.externalAccountId ?? null,
+          accountName: card.account?.name ?? null,
+          configuredBaseUrl: card.configuredBaseUrl,
+          productionBaseUrl: card.productionBaseUrl,
+          origin: card.origin,
+        }))}
+      />
 
       <Card title="Setup" hint="Each step is required before the Command Center can show a number.">
         <ol className="step-list">
@@ -373,6 +394,15 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ a
                       {card.credentialConfigured
                         ? 'stored (encrypted)'
                         : 'missing — reconnect required'}
+                    </dd>
+                    <dt>Reads from</dt>
+                    <dd>
+                      <span className="mono">{card.configuredBaseUrl ?? 'unknown'}</span>{' '}
+                      {card.origin === 'live_provider' ? (
+                        <StatusChip status="connected" label="live provider" />
+                      ) : (
+                        <StatusChip status="serious" label="development endpoint" />
+                      )}
                     </dd>
                   </dl>
 

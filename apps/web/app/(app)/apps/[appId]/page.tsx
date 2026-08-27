@@ -2,9 +2,11 @@ import Link from 'next/link';
 import { apiGet } from '../../../../lib/api';
 import {
   Card,
+  DataSourceBanner,
   EmptyState,
   MetricTile,
   StatusChip,
+  type DataSource,
   type MetricValue,
 } from '../../../../components/primitives';
 import { SmallMultiple } from '../../../../components/charts';
@@ -115,6 +117,7 @@ type CommandCenter = {
     observed_date: string | null;
     entity_ref: string | null;
   }>;
+  dataSources: DataSource[];
   emptyStates: Array<{ key: string; title: string; message: string; action?: string }>;
 };
 
@@ -239,6 +242,8 @@ export default async function CommandCenterPage({
         </div>
         <button type="submit">Apply</button>
       </form>
+
+      <DataSourceBanner sources={data.dataSources} />
 
       {data.emptyStates.length > 0 ? (
         <div className="stack" style={{ marginBottom: 18 }}>

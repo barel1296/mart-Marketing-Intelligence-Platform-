@@ -63,6 +63,7 @@ export function statusTone(status: string | null | undefined): string {
     case 'stale':
     case 'degraded':
     case 'ambiguous':
+    case 'serious':
       return 'chip-serious';
     case 'error':
     case 'failed':

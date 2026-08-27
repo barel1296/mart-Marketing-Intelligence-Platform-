@@ -12,6 +12,7 @@ import {
   isImplemented,
   isMarketingNetworkProvider,
   listImplementedProviders,
+  providerEndpointInfo,
 } from '@mart/integrations';
 import { setNoStore, withApp, withOrganization } from '../context.js';
 import { mutationLimiter } from '../rateLimit.js';
@@ -457,6 +458,7 @@ export async function registerIntegrationRoutes(server: FastifyInstance): Promis
             binding.integration_account_id,
           );
           const credential = await credentialStore.metadata(binding.connection_id);
+          const endpoint = providerEndpointInfo(binding.provider_key);
           return {
             bindingId: binding.id,
             role: binding.role,
@@ -480,6 +482,17 @@ export async function registerIntegrationRoutes(server: FastifyInstance): Promis
               detail: c.detail,
             })),
             credentialConfigured: Boolean(credential),
+            // Where this connection's requests actually go. A repointed base URL
+            // means everything it imported is development data, and the UI has to
+            // be able to say so.
+            configuredBaseUrl: endpoint?.configuredBaseUrl ?? null,
+            productionBaseUrl: endpoint?.productionBaseUrl ?? null,
+            origin:
+              endpoint === null
+                ? 'unknown'
+                : endpoint.isProduction
+                  ? 'live_provider'
+                  : 'non_production_endpoint',
           };
         }),
     );
