@@ -1,0 +1,43 @@
+{
+  "name": "MART Phase 0A",
+  "image": "mcr.microsoft.com/devcontainers/typescript-node:22-bookworm",
+
+  // postCreate runs once: PostgreSQL, dependencies, .env, build, migrations.
+  // postStart runs on every resume: bring the five processes back up.
+  "postCreateCommand": "bash .devcontainer/postCreate.sh",
+  "postStartCommand": "bash .devcontainer/start.sh",
+
+  "forwardPorts": [3000],
+
+  // Only the web app is public. The API, the worker health endpoint and the
+  // fixture provider stay private: the browser never talks to them directly -
+  // Next.js proxies /api server-side from inside the container.
+  "portsAttributes": {
+    "3000": {
+      "label": "MART web app (public)",
+      "visibility": "public",
+      "onAutoForward": "notify"
+    },
+    "4000": {
+      "label": "MART API (internal)",
+      "visibility": "private",
+      "onAutoForward": "silent"
+    },
+    "4001": {
+      "label": "MART worker health (internal)",
+      "visibility": "private",
+      "onAutoForward": "silent"
+    },
+    "4900": {
+      "label": "Fixture provider - synthetic data, dev only (internal)",
+      "visibility": "private",
+      "onAutoForward": "silent"
+    }
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": ["dbaeumer.vscode-eslint", "esbenp.prettier-vscode"]
+    }
+  }
+}
