@@ -405,17 +405,28 @@ export async function registerAnalyticsRoutes(server: FastifyInstance): Promise<
 
       const metrics = computeMetricValues({ context: metricContext, marketing, attribution });
 
-      const [series, campaigns, coverage, discrepancies] = await Promise.all([
+      const [series, campaigns, coverage, discrepancies, ambiguous] = await Promise.all([
         loadTimeseries(filters),
         state.marketingProviderKey
           ? loadCampaignTable({ ...filters, limit: 25 })
           : Promise.resolve({ rows: [], total: 0 }),
         state.marketingProviderKey
-          ? campaignCoverage(context.organizationId, app.id, state.marketingProviderKey)
+          ? campaignCoverage(context.organizationId, app.id, state.marketingProviderKey, {
+              from: range.from,
+              to: range.to,
+              attributionProviderKey: state.attributionProviderKey,
+            })
           : Promise.resolve(null),
         state.marketingProviderKey && state.attributionProviderKey
           ? loadReconciliationDiscrepancies(filters, 10)
           : Promise.resolve([]),
+        // Ambiguous mappings carry their candidates, so a person can resolve
+        // what MART refused to guess.
+        mappingsRepo.listMappings(context.organizationId, app.id, {
+          entityType: 'campaign',
+          status: 'ambiguous',
+          limit: 25,
+        }),
       ]);
 
       // Active and resolved are separated rather than merged: an error a later
@@ -476,7 +487,11 @@ export async function registerAnalyticsRoutes(server: FastifyInstance): Promise<
         metrics,
         timeseries: series,
         campaigns,
-        reconciliation: { coverage, discrepancies },
+        reconciliation: {
+          coverage,
+          discrepancies,
+          ambiguous: ambiguous.filter((m) => m.source_provider === state.marketingProviderKey),
+        },
         dataQuality: quality,
         emptyStates: buildEmptyStates(state, {
           marketingRows: marketing.rows,

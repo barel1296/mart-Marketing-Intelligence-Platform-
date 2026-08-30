@@ -10,7 +10,11 @@ import {
   type MetricValue,
 } from '../../../../components/primitives';
 import { SmallMultiple } from '../../../../components/charts';
-import { RecomputeReconciliationButton, SyncButton } from '../../../../components/actions';
+import {
+  RecomputeReconciliationButton,
+  ResolveAmbiguousMapping,
+  SyncButton,
+} from '../../../../components/actions';
 import { formatMetric, relativeTime } from '../../../../lib/format';
 
 type Me = { organizations: Array<{ id: string; name: string; role: string }> };
@@ -38,6 +42,27 @@ type CoverageSummary = {
   authoritativeCoveragePct: number | null;
   operationalCoveragePct: number | null;
   coveragePct: number | null;
+  eligible?: {
+    from: string;
+    to: string;
+    eligibleCampaigns: number;
+    mappedCampaigns: number;
+    ambiguousCampaigns: number;
+    unmappedCampaigns: number;
+    historicalCampaigns: number;
+    totalSpend: number;
+    mappedSpend: number;
+    ambiguousSpend: number;
+    unmappedSpend: number;
+    spendPct: number | null;
+    totalPaidInstalls: number;
+    mappedPaidInstalls: number;
+    ambiguousPaidInstalls: number;
+    unmappedPaidInstalls: number;
+    organicInstalls: number;
+    installPct: number | null;
+    campaignPct: number | null;
+  };
 };
 
 type CommandCenter = {
@@ -113,6 +138,13 @@ type CommandCenter = {
   };
   reconciliation: {
     coverage: CoverageSummary | null;
+    ambiguous: Array<{
+      id: string;
+      source_name: string | null;
+      source_external_id: string;
+      candidates: Array<{ externalCampaignId?: string | null; campaignName?: string | null }>;
+      evidence: Record<string, unknown>;
+    }>;
     discrepancies: Array<{
       kind: string;
       externalCampaignId: string | null;
@@ -205,6 +237,9 @@ export default async function CommandCenterPage({
     'blended_cpi',
     'attributed_revenue',
     'mapped_attributed_revenue',
+    'campaign_operational_coverage',
+    'spend_coverage',
+    'attribution_coverage',
     'mapping_coverage',
     'operational_mapping_coverage',
     'cohort_roas',
@@ -597,6 +632,101 @@ export default async function CommandCenterPage({
                 </div>
               ))}
             </div>
+
+            {data.reconciliation.coverage.eligible ? (
+              <>
+                <h3 style={{ marginTop: 18 }}>
+                  This period ({data.reconciliation.coverage.eligible.from} —{' '}
+                  {data.reconciliation.coverage.eligible.to})
+                </h3>
+                <p className="muted">
+                  Three separate numbers, never blended. Campaigns with no delivery in the period
+                  are excluded: one that stopped running last quarter is not a current gap.
+                </p>
+                <div className="tile-grid">
+                  {(
+                    [
+                      [
+                        'Campaign coverage',
+                        data.reconciliation.coverage.eligible.campaignPct,
+                        `${data.reconciliation.coverage.eligible.mappedCampaigns} of ${data.reconciliation.coverage.eligible.eligibleCampaigns} campaigns that delivered`,
+                      ],
+                      [
+                        'Spend coverage',
+                        data.reconciliation.coverage.eligible.spendPct,
+                        `${formatMetric(data.reconciliation.coverage.eligible.mappedSpend, 'currency', currency)} of ${formatMetric(data.reconciliation.coverage.eligible.totalSpend, 'currency', currency)}`,
+                      ],
+                      [
+                        'Attribution coverage',
+                        data.reconciliation.coverage.eligible.installPct,
+                        `${data.reconciliation.coverage.eligible.mappedPaidInstalls} of ${data.reconciliation.coverage.eligible.totalPaidInstalls} paid installs (organic excluded)`,
+                      ],
+                    ] as Array<[string, number | null, string]>
+                  ).map(([label, pct, meta]) => (
+                    <div className="tile" key={label}>
+                      <div className="tile-label">{label}</div>
+                      <div className="tile-value">{pct === null ? '—' : `${pct}%`}</div>
+                      <div className="tile-meta">
+                        <span>{meta}</span>
+                      </div>
+                    </div>
+                  ))}
+                  <div className="tile">
+                    <div className="tile-label">Ambiguous spend</div>
+                    <div className="tile-value">
+                      {formatMetric(
+                        data.reconciliation.coverage.eligible.ambiguousSpend,
+                        'currency',
+                        currency,
+                      )}
+                    </div>
+                    <div className="tile-meta">
+                      <span>
+                        {data.reconciliation.coverage.eligible.ambiguousCampaigns} campaign(s) with
+                        more than one candidate
+                      </span>
+                    </div>
+                  </div>
+                  <div className="tile">
+                    <div className="tile-label">Historical / no delivery</div>
+                    <div className="tile-value">
+                      {data.reconciliation.coverage.eligible.historicalCampaigns}
+                    </div>
+                    <div className="tile-meta">
+                      <span>excluded from this period</span>
+                    </div>
+                  </div>
+                </div>
+              </>
+            ) : null}
+
+            {data.reconciliation.ambiguous.length > 0 ? (
+              <div className="stack" style={{ marginTop: 18 }}>
+                <h3>Resolve ambiguous mappings</h3>
+                <p className="muted">
+                  MART found more than one candidate and will not pick one. A choice made here is
+                  recorded as manually verified: it survives later reconciliation, overrides any
+                  computed mapping, and is written to the audit log with who made it and when.
+                </p>
+                {data.reconciliation.ambiguous.map((mapping) => (
+                  <ResolveAmbiguousMapping
+                    key={mapping.id}
+                    organizationId={organization.id}
+                    appId={appId}
+                    mapping={{
+                      id: mapping.id,
+                      sourceName: mapping.source_name,
+                      sourceExternalId: mapping.source_external_id,
+                      candidates: mapping.candidates,
+                      reason:
+                        typeof mapping.evidence['reason'] === 'string'
+                          ? mapping.evidence['reason']
+                          : null,
+                    }}
+                  />
+                ))}
+              </div>
+            ) : null}
 
             {data.reconciliation.discrepancies.length > 0 ? (
               <div className="table-wrap" style={{ marginTop: 14 }}>

@@ -744,3 +744,55 @@ export function isOrganicSource(source: string | null | undefined): boolean {
   if (!source) return true;
   return normalizeMediaSource(source) === 'organic';
 }
+
+// ------------------------------------------- attribution campaign directory --
+
+export type AttributionCampaignUpsert = {
+  externalCampaignId: string;
+  name: string | null;
+  remoteCampaignId: string | null;
+  channelId: string | null;
+  channelName: string | null;
+};
+
+/**
+ * Store the MMP's campaign directory.
+ *
+ * This is provider metadata, not a fact table: it is refreshed wholesale each
+ * sync and carries no measures, so there is no restatement to track. What it
+ * does carry is `remote_campaign_id` - the ad network's own campaign id - which
+ * is what lets reconciliation match on an identifier instead of a name.
+ */
+export async function upsertAttributionCampaigns(
+  scope: FactScope,
+  campaigns: readonly AttributionCampaignUpsert[],
+  client?: Queryable,
+): Promise<number> {
+  for (const campaign of campaigns) {
+    await query(
+      `INSERT INTO attribution_campaigns
+         (organization_id, app_id, connection_id, provider_key, external_campaign_id,
+          name, remote_campaign_id, channel_id, channel_name, observed_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, now())
+       ON CONFLICT (connection_id, app_id, external_campaign_id) DO UPDATE SET
+         name = EXCLUDED.name,
+         remote_campaign_id = EXCLUDED.remote_campaign_id,
+         channel_id = EXCLUDED.channel_id,
+         channel_name = EXCLUDED.channel_name,
+         observed_at = now()`,
+      [
+        scope.organizationId,
+        scope.appId,
+        scope.connectionId,
+        scope.providerKey,
+        campaign.externalCampaignId,
+        campaign.name,
+        campaign.remoteCampaignId,
+        campaign.channelId,
+        campaign.channelName,
+      ],
+      client,
+    );
+  }
+  return campaigns.length;
+}

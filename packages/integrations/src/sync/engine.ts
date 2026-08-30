@@ -214,6 +214,24 @@ export async function runSync(run: SyncRunRow, request: SyncRequest): Promise<Sy
           checkMarketingBatch(qualityCtx, result.batch),
         );
       } else if (isAttributionProvider(provider)) {
+        // Refresh the MMP's campaign directory alongside installs. It carries
+        // the ad network's own campaign id, which turns reconciliation from a
+        // name comparison into an identifier match - so it must be current
+        // before reconciliation runs.
+        if (provider.listCampaigns && request.dataType === 'attribution_installs') {
+          try {
+            const directory = await provider.listCampaigns(request.externalAccountId);
+            await factsRepo.upsertAttributionCampaigns(scope, directory);
+          } catch (error) {
+            // A directory MART could not refresh is a degraded match, not a
+            // failed sync: the rows themselves are unaffected.
+            summary.warnings.push(
+              `Could not refresh the ${request.providerKey} campaign directory; reconciliation will fall back to names. ${
+                isProviderError(error) ? error.userMessage : String(error)
+              }`,
+            );
+          }
+        }
         const result =
           request.dataType === 'attribution_events'
             ? await provider.syncEvents(params)

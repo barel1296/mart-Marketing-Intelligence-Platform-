@@ -102,6 +102,7 @@ export async function buildMetricContext(
           total: coverage.total,
           authoritative: coverage.authoritative,
           operational: coverage.operational,
+          ...(coverage.eligible ? { eligible: coverage.eligible } : {}),
         }
       : undefined,
   };

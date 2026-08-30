@@ -261,6 +261,34 @@ unreachable there). Whatever the API does, MART reports what it received.
   Phase 0A does not import cohort data — declaring a capability is not the same as
   using it, and cohort ROAS remains unavailable (see [METRICS.md](METRICS.md)).
 
+### The campaign directory settles what names cannot
+
+`GET /v2/campaigns?app_id={uuid}` returns each Tenjin campaign with a
+`remote_campaign_id`: **the ad network's own campaign id**, as Tenjin resolved
+it. Reporting rows do not carry it, which is why reconciliation began with
+names.
+
+It matters because names are not unique. A real account has pairs of Meta
+campaigns with byte-identical names — the static and the video variant of one
+launch — and both appear inside Tenjin campaign names in parentheses. No name
+rule can tell them apart, and MART correctly refuses to guess. The directory
+does tell them apart:
+
+```
+CPI_Broad_US_static (FB_Reveal_Rush_CPI_Broad_US_26/08/26) -> 120254846425720119
+CPI_Broad_US_video  (FB_Reveal_Rush_CPI_Broad_US_26/08/26) -> 120254846425690119
+```
+
+MART refreshes the directory alongside the installs sync and matches on it
+first. A match through it is `explicit_provider_mapping` at confidence 1 and
+status `matched_exact` — **authoritative**, because it is an identifier the
+provider published, not an inference MART made. Names are only consulted where
+no id was published. A directory refresh that fails degrades matching to names
+with a warning; it never fails the sync.
+
+On the account this was built against this moved spend coverage from 9.9% to
+100%, and authoritative coverage from 0% to a real number for the first time.
+
 ### Events are `not_implemented`, not fresh
 
 The user-acquisition report has no in-app event breakdown, and MART has not built

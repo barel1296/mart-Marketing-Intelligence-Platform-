@@ -876,10 +876,11 @@ describe('reconciliation', () => {
         [ctx.appId],
       );
       const spendFinding = findings.find(
-        (f) => f.check_key === 'reconciliation.paid_spend_without_mapping',
+        (f) => f.check_key === 'reconciliation.current_period_spend_unmapped',
       );
+      // Severity follows the money: live spend nothing is attributed to.
       expect(spendFinding?.severity).toBe('error');
-      expect(spendFinding?.message).toMatch(/no campaign maps to attribution/i);
+      expect(spendFinding?.message).toMatch(/current-period spend is not attributed/i);
 
       // Now give the MMP the embedded name and reconcile again: the finding
       // describes the current join, so it must not linger.
@@ -897,7 +898,7 @@ describe('reconciliation', () => {
 
       const after = await queryRows<{ check_key: string }>(
         `SELECT check_key FROM data_quality_findings
-          WHERE app_id = $1 AND check_key = 'reconciliation.paid_spend_without_mapping'`,
+          WHERE app_id = $1 AND check_key = 'reconciliation.current_period_spend_unmapped'`,
         [ctx.appId],
       );
       expect(after).toHaveLength(0);
@@ -1041,6 +1042,315 @@ describe('reconciliation', () => {
       expect(String(mappings[0]?.evidence['reason'])).toMatch(/share this name/i);
     });
 
+    it('resolves duplicate Meta names by the network id the MMP publishes', async () => {
+      // The real shape: two Meta campaigns with the SAME name (a static and a
+      // video variant of one launch), and two Tenjin campaigns whose names
+      // embed that one shared name. No name rule can tell them apart.
+      controls.marketingRows = [
+        {
+          reportDate: '2026-08-28',
+          campaignId: '120254846425720119',
+          campaignName: META_A,
+          spend: 100,
+          impressions: 8000,
+          clicks: 700,
+        },
+        {
+          reportDate: '2026-08-28',
+          campaignId: '120254846425690119',
+          campaignName: META_A,
+          spend: 40,
+          impressions: 2000,
+          clicks: 200,
+        },
+      ];
+      controls.attributionRows = [
+        {
+          installDate: '2026-08-28',
+          campaignId: 'b47f71fd-4c12-48ba-b49a-f78e5d7a7fa3',
+          campaignName: `CPI_Broad_US_static (${META_A})`,
+          installs: 300,
+          revenue: 90,
+        },
+        {
+          installDate: '2026-08-28',
+          campaignId: '3f4f0f78-ae3b-4233-8a73-12a3e3a44265',
+          campaignName: `CPI_Broad_US_video (${META_A})`,
+          installs: 100,
+          revenue: 30,
+        },
+      ];
+      // Tenjin's own directory publishes the Meta campaign id per campaign.
+      controls.attributionCampaigns = [
+        {
+          externalCampaignId: 'b47f71fd-4c12-48ba-b49a-f78e5d7a7fa3',
+          name: `CPI_Broad_US_static (${META_A})`,
+          remoteCampaignId: '120254846425720119',
+          channelId: '3',
+          channelName: 'Meta',
+        },
+        {
+          externalCampaignId: '3f4f0f78-ae3b-4233-8a73-12a3e3a44265',
+          name: `CPI_Broad_US_video (${META_A})`,
+          remoteCampaignId: '120254846425690119',
+          channelId: '3',
+          channelName: 'Meta',
+        },
+      ];
+
+      const ctx = await setup();
+      await triggerSync(ctx, '2026-08-28', '2026-08-28');
+      const summary = await reconcile(ctx.user.organizationId, ctx.appId);
+
+      // An identifier beats every name rule, so nothing is ambiguous and
+      // nothing rests on a name.
+      expect(summary.ambiguous).toBe(0);
+      expect(summary.matchedExact).toBe(2);
+      expect(summary.matchedNameEmbedded).toBe(0);
+
+      const mappings = await queryRows<{
+        source_external_id: string;
+        target_external_id: string;
+        status: string;
+        mapping_method: string;
+        mapping_confidence: string;
+      }>(
+        `SELECT source_external_id, target_external_id, status, mapping_method,
+                mapping_confidence::text
+           FROM provider_entity_mappings
+          WHERE app_id = $1 AND source_provider = 'meta_ads'
+          ORDER BY source_external_id`,
+        [ctx.appId],
+      );
+      expect(mappings).toHaveLength(2);
+      // Each Meta campaign gets the Tenjin campaign that named its id, not the
+      // other one, and not both.
+      expect(mappings[0]?.target_external_id).toBe('3f4f0f78-ae3b-4233-8a73-12a3e3a44265');
+      expect(mappings[1]?.target_external_id).toBe('b47f71fd-4c12-48ba-b49a-f78e5d7a7fa3');
+      for (const mapping of mappings) {
+        expect(mapping.status).toBe('matched_exact');
+        expect(mapping.mapping_method).toBe('explicit_provider_mapping');
+        expect(Number(mapping.mapping_confidence)).toBe(1);
+      }
+
+      // And this is authoritative coverage, not operational-only.
+      const coverage = await campaignCoverage(ctx.user.organizationId, ctx.appId, 'meta_ads');
+      expect(coverage.authoritativeCoveragePct).toBe(100);
+    });
+
+    it('reports campaign, spend and attribution coverage as three separate numbers', async () => {
+      const ctx = await setupRealShape();
+      await reconcile(ctx.user.organizationId, ctx.appId);
+      const coverage = await campaignCoverage(ctx.user.organizationId, ctx.appId, 'meta_ads', {
+        from: '2026-08-28',
+        to: '2026-08-28',
+        attributionProviderKey: 'appsflyer',
+      });
+      const eligible = coverage.eligible;
+      expect(eligible).toBeDefined();
+      // Everything that delivered is mapped.
+      expect(eligible?.eligibleCampaigns).toBe(2);
+      expect(eligible?.campaignPct).toBe(100);
+      expect(eligible?.spendPct).toBe(100);
+      expect(eligible?.totalSpend).toBeCloseTo(140, 10);
+      // Organic is out of the paid denominator.
+      expect(eligible?.totalPaidInstalls).toBe(460);
+      expect(eligible?.organicInstalls).toBe(79);
+      expect(eligible?.installPct).toBe(100);
+    });
+
+    it('excludes campaigns with no delivery in the period from current coverage', async () => {
+      controls.marketingRows = [
+        {
+          reportDate: '2026-08-28',
+          campaignId: 'live',
+          campaignName: META_A,
+          spend: 123,
+          impressions: 9000,
+          clicks: 800,
+        },
+        // Delivered nothing in the window: not a current-period gap.
+        {
+          reportDate: '2026-08-28',
+          campaignId: 'dormant',
+          campaignName: 'FB_Reveal_Rush_Old_Campaign_01/01/26',
+          spend: 0,
+          impressions: 0,
+          clicks: 0,
+        },
+      ];
+      controls.attributionRows = [
+        {
+          installDate: '2026-08-28',
+          campaignId: 'b47f71fd-4c12-48ba-b49a-f78e5d7a7fa3',
+          campaignName: `CPI_Broad_US_static (${META_A})`,
+          installs: 300,
+          revenue: 90,
+        },
+      ];
+      const ctx = await setup();
+      await triggerSync(ctx, '2026-08-28', '2026-08-28');
+      await reconcile(ctx.user.organizationId, ctx.appId);
+
+      const coverage = await campaignCoverage(ctx.user.organizationId, ctx.appId, 'meta_ads', {
+        from: '2026-08-28',
+        to: '2026-08-28',
+        attributionProviderKey: 'appsflyer',
+      });
+      // One eligible campaign, mapped: the dormant one does not drag it down.
+      expect(coverage.eligible?.eligibleCampaigns).toBe(1);
+      expect(coverage.eligible?.campaignPct).toBe(100);
+      expect(coverage.eligible?.spendPct).toBe(100);
+      expect(coverage.eligible?.historicalCampaigns).toBe(1);
+      // All-structure coverage still counts it, and is labelled as such.
+      expect(coverage.operationalCoveragePct).toBe(50);
+
+      const findings = await queryRows<{ check_key: string; severity: string }>(
+        `SELECT check_key, severity FROM data_quality_findings
+          WHERE app_id = $1 AND check_key LIKE 'reconciliation.%'`,
+        [ctx.appId],
+      );
+      // A dormant campaign is informational, never an error beside live spend.
+      const historical = findings.find(
+        (f) => f.check_key === 'reconciliation.historical_campaigns_without_activity',
+      );
+      expect(historical?.severity).toBe('info');
+      expect(findings.map((f) => f.check_key)).not.toContain(
+        'reconciliation.current_period_spend_unmapped',
+      );
+    });
+
+    it('raises an error when material current-period spend is ambiguous', async () => {
+      controls.marketingRows = [
+        {
+          reportDate: '2026-08-28',
+          campaignId: 'dup-1',
+          campaignName: META_A,
+          spend: 123,
+          impressions: 9000,
+          clicks: 800,
+        },
+        {
+          reportDate: '2026-08-28',
+          campaignId: 'dup-2',
+          campaignName: META_A,
+          spend: 34,
+          impressions: 1000,
+          clicks: 100,
+        },
+      ];
+      controls.attributionRows = [
+        {
+          installDate: '2026-08-28',
+          campaignId: 'b47f71fd-4c12-48ba-b49a-f78e5d7a7fa3',
+          campaignName: `CPI_Broad_US_static (${META_A})`,
+          installs: 300,
+          revenue: 90,
+        },
+      ];
+      const ctx = await setup();
+      await triggerSync(ctx, '2026-08-28', '2026-08-28');
+      await reconcile(ctx.user.organizationId, ctx.appId);
+
+      const coverage = await campaignCoverage(ctx.user.organizationId, ctx.appId, 'meta_ads', {
+        from: '2026-08-28',
+        to: '2026-08-28',
+        attributionProviderKey: 'appsflyer',
+      });
+      // The number that makes the problem obvious: nearly all of the spend.
+      expect(coverage.eligible?.ambiguousSpend).toBeCloseTo(157, 10);
+      expect(coverage.eligible?.spendPct).toBe(0);
+
+      const findings = await queryRows<{ check_key: string; severity: string; message: string }>(
+        `SELECT check_key, severity, message FROM data_quality_findings
+          WHERE app_id = $1 AND check_key LIKE 'reconciliation.%'`,
+        [ctx.appId],
+      );
+      const spendFinding = findings.find(
+        (f) => f.check_key === 'reconciliation.current_period_spend_unmapped',
+      );
+      expect(spendFinding?.severity).toBe('error');
+      expect(spendFinding?.message).toMatch(/ambiguous/i);
+    });
+
+    it('keeps a human decision over every later recomputation', async () => {
+      controls.marketingRows = [
+        {
+          reportDate: '2026-08-28',
+          campaignId: 'dup-1',
+          campaignName: META_A,
+          spend: 100,
+          impressions: 8000,
+          clicks: 700,
+        },
+        {
+          reportDate: '2026-08-28',
+          campaignId: 'dup-2',
+          campaignName: META_A,
+          spend: 40,
+          impressions: 2000,
+          clicks: 200,
+        },
+      ];
+      controls.attributionRows = [
+        {
+          installDate: '2026-08-28',
+          campaignId: 'b47f71fd-4c12-48ba-b49a-f78e5d7a7fa3',
+          campaignName: `CPI_Broad_US_static (${META_A})`,
+          installs: 300,
+          revenue: 90,
+        },
+      ];
+      const ctx = await setup();
+      await triggerSync(ctx, '2026-08-28', '2026-08-28');
+      await reconcile(ctx.user.organizationId, ctx.appId);
+
+      const ambiguous = await queryRows<{ id: string }>(
+        `SELECT id FROM provider_entity_mappings
+          WHERE app_id = $1 AND source_external_id = 'dup-1' AND status = 'ambiguous'`,
+        [ctx.appId],
+      );
+      const mappingId = ambiguous[0]?.id;
+      expect(mappingId).toBeDefined();
+
+      const verified = await request(
+        ctx.user,
+        'POST',
+        `/api/v1/organizations/${ctx.user.organizationId}/apps/${ctx.appId}/mappings/${mappingId}/verify`,
+        {
+          decision: 'verify',
+          targetExternalId: 'b47f71fd-4c12-48ba-b49a-f78e5d7a7fa3',
+          targetName: `CPI_Broad_US_static (${META_A})`,
+        },
+      );
+      expect(verified.statusCode).toBe(200);
+
+      // Recompute: the decision must survive, and it must win.
+      await reconcile(ctx.user.organizationId, ctx.appId);
+      const after = await queryRows<{
+        status: string;
+        target_external_id: string | null;
+        verified_by_user_id: string | null;
+        verified_at: string | null;
+      }>(
+        `SELECT status, target_external_id, verified_by_user_id, verified_at::text
+           FROM provider_entity_mappings
+          WHERE app_id = $1 AND source_external_id = 'dup-1'`,
+        [ctx.appId],
+      );
+      expect(after).toHaveLength(1);
+      expect(after[0]?.status).toBe('manually_verified');
+      expect(after[0]?.target_external_id).toBe('b47f71fd-4c12-48ba-b49a-f78e5d7a7fa3');
+      // Auditable: who and when.
+      expect(after[0]?.verified_by_user_id).not.toBeNull();
+      expect(after[0]?.verified_at).not.toBeNull();
+
+      // And it counts as authoritative, not merely operational.
+      const coverage = await campaignCoverage(ctx.user.organizationId, ctx.appId, 'meta_ads');
+      expect(coverage.manuallyVerified).toBe(1);
+      expect(coverage.authoritative).toBe(1);
+    });
+
     it('does not raise a finding for organic alone', async () => {
       const ctx = await setupRealShape();
       await reconcile(ctx.user.organizationId, ctx.appId);
@@ -1051,7 +1361,7 @@ describe('reconciliation', () => {
       );
       // Everything paid is mapped; organic is not a problem to report.
       expect(findings.map((f) => f.check_key)).not.toContain(
-        'reconciliation.paid_spend_without_mapping',
+        'reconciliation.current_period_spend_unmapped',
       );
       expect(findings.every((f) => !/organic/i.test(f.message))).toBe(true);
     });

@@ -114,12 +114,34 @@ export interface MarketingNetworkProvider extends ProviderBase {
  * that differs between them - endpoints, auth, report shapes, field names, CSV
  * vs JSON - is confined to the adapter.
  */
+/**
+ * One campaign as the MMP's own directory describes it.
+ *
+ * `remoteCampaignId` is the ad network's campaign id, declared by the MMP. It
+ * is a stable cross-provider identifier - the only thing that can tell two
+ * network campaigns with identical names apart.
+ */
+export type AttributionCampaignRef = {
+  externalCampaignId: string;
+  name: string | null;
+  remoteCampaignId: string | null;
+  channelId: string | null;
+  channelName: string | null;
+};
+
 export interface AttributionProvider extends ProviderBase {
   readonly category: 'attribution_mmp';
   listApps(): Promise<ProviderAccount[]>;
   syncInstalls(params: SyncParams): Promise<SyncResult<CanonicalAttributionBatch>>;
   syncEvents(params: SyncParams): Promise<SyncResult<CanonicalAttributionBatch>>;
   syncRevenue(params: SyncParams): Promise<SyncResult<CanonicalAttributionBatch>>;
+  /**
+   * The provider's campaign directory, when it publishes one.
+   *
+   * Optional because not every MMP exposes the network's campaign id. Where it
+   * does, reconciliation gets a stable identifier instead of a name.
+   */
+  listCampaigns?(externalAccountId: string): Promise<AttributionCampaignRef[]>;
 }
 
 export type AnyProvider = MarketingNetworkProvider | AttributionProvider;

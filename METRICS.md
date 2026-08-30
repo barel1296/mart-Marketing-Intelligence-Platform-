@@ -134,7 +134,30 @@ Reconciliation reports coverage twice, and they are never averaged into one:
 | Authoritative coverage | stable id + manually verified                              | whether MART will state identity     |
 | Operational coverage   | authoritative + deterministic high-confidence name matches | whether MART will state a mapped CPI |
 
-Both are counted **per campaign, not per mapping row**. A marketing campaign
+### Period coverage: three numbers, never blended
+
+Whole-structure coverage answers "how much of everything MART knows about is
+linked". It is the wrong question for a dashboard showing last month, because
+campaigns that stopped running years ago sit in its denominator. The Command
+Center therefore reports coverage over the selected window, three ways:
+
+| Number               | Denominator                            | Answers                            |
+| -------------------- | -------------------------------------- | ---------------------------------- |
+| Campaign coverage    | campaigns that delivered in the window | how many live campaigns are linked |
+| **Spend coverage**   | network spend in the window            | **is the money accounted for**     |
+| Attribution coverage | paid attributed installs in the window | is the attribution accounted for   |
+
+They are never averaged. Spend coverage is the one that exposes a single large
+campaign sitting unmapped: on the account this was built against, campaign
+coverage read 50% while spend coverage read **9.9%**, because one campaign
+carried $141.50 of $157.00. A blended percentage would have hidden that.
+
+A campaign with no delivery in the window is excluded from all three and
+counted separately as historical. Nine dormant campaigns are an informational
+note, not a reconciliation failure — and ranking them beside live unmapped
+spend is how a data-quality panel gets ignored.
+
+Both whole-structure numbers are counted **per campaign, not per mapping row**. A marketing campaign
 with three attribution children is one campaign that is mapped, not three;
 counting rows would let a well-mapped campaign raise coverage simply by having
 more creatives beneath it, which measures the opposite of what coverage means.

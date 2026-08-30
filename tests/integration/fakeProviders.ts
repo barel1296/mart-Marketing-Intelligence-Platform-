@@ -1,9 +1,15 @@
-import type { CanonicalAttributionBatch, CanonicalMarketingBatch, IsoDate } from '@mart/shared';
+import type {
+  AttributionCampaignRef,
+  CanonicalAttributionBatch,
+  CanonicalMarketingBatch,
+  IsoDate,
+} from '@mart/shared';
 import { ProviderError } from '@mart/shared';
 import {
   clearProviderOverrides,
   declare,
   setProviderOverride,
+  type AttributionCampaignRef,
   type AttributionProvider,
   type CapabilityDeclaration,
   type ConnectionHealth,
@@ -47,6 +53,8 @@ export type FakeControls = {
   /** Count of provider calls, to assert idempotent re-runs actually re-fetch. */
   calls: { structure: number; performance: number; installs: number; revenue: number };
   attributionCapabilities: Partial<Record<string, boolean>>;
+  /** The MMP's campaign directory, carrying the ad network's campaign id. */
+  attributionCampaigns: AttributionCampaignRef[];
 };
 
 export const controls: FakeControls = {
@@ -55,6 +63,7 @@ export const controls: FakeControls = {
   failWindows: new Set(),
   failureClass: 'invalid_request',
   calls: { structure: 0, performance: 0, installs: 0, revenue: 0 },
+  attributionCampaigns: [],
   attributionCapabilities: {},
 };
 
@@ -65,6 +74,7 @@ export function resetControls(): void {
   controls.failureClass = 'invalid_request';
   controls.calls = { structure: 0, performance: 0, installs: 0, revenue: 0 };
   controls.attributionCapabilities = {};
+  controls.attributionCampaigns = [];
 }
 
 function windowKey(params: SyncParams): string {
@@ -300,6 +310,10 @@ class FakeAttributionProvider implements AttributionProvider {
       warnings: [],
       latestDataDate: latest,
     };
+  }
+
+  async listCampaigns(): Promise<AttributionCampaignRef[]> {
+    return controls.attributionCampaigns;
   }
 
   /** Mirrors the real Tenjin adapter: no event source, and it says so. */

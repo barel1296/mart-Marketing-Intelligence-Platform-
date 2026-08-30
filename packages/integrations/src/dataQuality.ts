@@ -232,24 +232,42 @@ export type ReconciliationHealthInput = {
   connectionId: string | null;
   syncRunId: string | null;
   observedDate: IsoDate;
-  /** Marketing spend in the window under review. */
+  /** Spend on campaigns that delivered in the reviewed window. */
   spend: number;
-  /** Paid marketing campaigns MART knows about. */
-  marketingCampaigns: number;
-  /** Coverage counts from campaignCoverage(). */
-  operationalCoveragePct: number | null;
-  authoritativeCoveragePct: number | null;
-  /** Paid attribution campaigns with no mapping to a marketing campaign. */
-  unmappedPaidCampaigns: number;
+  mappedSpend: number;
+  ambiguousSpend: number;
+  unmappedSpend: number;
+  /** Campaigns that delivered in the window. */
+  eligibleCampaigns: number;
   ambiguousCampaigns: number;
+  /** Known to the structure sync but with no delivery in the window. */
+  historicalCampaigns: number;
+  /** Paid attributed installs in the window, organic excluded. */
+  paidInstalls: number;
+  mappedPaidInstalls: number;
 };
 
 /**
- * Below this share of mapped campaigns, spend-derived per-install figures stop
- * describing the account and start describing whichever slice happened to map.
+ * Share of current-period spend that must resolve to attribution before
+ * spend-derived metrics describe the account rather than a slice of it.
  */
-export const MINIMUM_OPERATIONAL_COVERAGE_PCT = 80;
+export const MINIMUM_SPEND_COVERAGE_PCT = 80;
 
+/**
+ * Reconciliation gaps that make dashboard numbers misleading.
+ *
+ * These are not row-level assertions about a fetched payload; they are about
+ * the join between two providers, which is where a plausible-looking wrong
+ * number comes from.
+ *
+ * Severity follows the money, not the campaign count. Nine campaigns that
+ * stopped running last quarter are an informational note; one live campaign
+ * carrying most of the period's spend with nothing attributed to it is an
+ * error. Ranking them the same way trains people to ignore the panel.
+ *
+ * Organic is never a finding. Unpaid traffic belongs to no campaign by
+ * definition.
+ */
 export function checkReconciliationHealth(input: ReconciliationHealthInput): DataQualityFinding[] {
   const findings: DataQualityFinding[] = [];
   const base = {
@@ -262,40 +280,45 @@ export function checkReconciliationHealth(input: ReconciliationHealthInput): Dat
     observedDate: input.observedDate,
   } as const;
 
-  const coverage = input.operationalCoveragePct;
+  const spendCoveragePct = input.spend > 0 ? (input.mappedSpend / input.spend) * 100 : null;
+  const unresolvedSpend = input.ambiguousSpend + input.unmappedSpend;
 
-  if (
-    input.spend > 0 &&
-    input.marketingCampaigns > 0 &&
-    (coverage ?? 0) < MINIMUM_OPERATIONAL_COVERAGE_PCT
-  ) {
+  if (input.spend > 0 && (spendCoveragePct ?? 0) < MINIMUM_SPEND_COVERAGE_PCT) {
     findings.push({
       ...base,
-      checkKey: 'reconciliation.paid_spend_without_mapping',
-      // The highest severity available, because every spend-derived metric on
-      // the dashboard is affected while this holds.
+      checkKey: 'reconciliation.current_period_spend_unmapped',
+      // The highest severity available: every spend-derived metric on the
+      // dashboard is affected while this holds.
       severity: 'error',
       message:
-        coverage === null || coverage === 0
-          ? `Spend of ${input.spend.toFixed(2)} is recorded but no campaign maps to attribution. Per-install and per-revenue figures cannot describe these campaigns.`
-          : `Operational mapping coverage is ${coverage}%, below the ${MINIMUM_OPERATIONAL_COVERAGE_PCT}% needed for spend-derived metrics to describe the whole account.`,
+        `${unresolvedSpend.toFixed(2)} of ${input.spend.toFixed(2)} in current-period spend is not attributed to a mapped campaign` +
+        (input.ambiguousSpend > 0
+          ? ` (${input.ambiguousSpend.toFixed(2)} of it ambiguous - MART found more than one candidate and will not pick one)`
+          : '') +
+        `. Spend coverage is ${spendCoveragePct === null ? 'unknown' : `${spendCoveragePct.toFixed(1)}%`}, below the ${MINIMUM_SPEND_COVERAGE_PCT}% needed for per-install figures to describe the account.`,
       detail: {
         spend: input.spend,
-        marketingCampaigns: input.marketingCampaigns,
-        operationalCoveragePct: coverage,
-        authoritativeCoveragePct: input.authoritativeCoveragePct,
-        threshold: MINIMUM_OPERATIONAL_COVERAGE_PCT,
+        mappedSpend: input.mappedSpend,
+        ambiguousSpend: input.ambiguousSpend,
+        unmappedSpend: input.unmappedSpend,
+        spendCoveragePct,
+        threshold: MINIMUM_SPEND_COVERAGE_PCT,
       },
     });
   }
 
-  if (input.unmappedPaidCampaigns > 0) {
+  const unmappedInstalls = input.paidInstalls - input.mappedPaidInstalls;
+  if (unmappedInstalls > 0) {
     findings.push({
       ...base,
-      checkKey: 'reconciliation.attributed_campaigns_unmapped',
+      checkKey: 'reconciliation.paid_installs_unmapped',
       severity: 'warning',
-      message: `${input.unmappedPaidCampaigns} paid attribution campaign(s) have no marketing campaign mapping, so their installs and revenue are outside every mapped figure.`,
-      detail: { unmappedPaidCampaigns: input.unmappedPaidCampaigns },
+      message: `${unmappedInstalls} paid attributed install(s) are on campaigns MART cannot map, so they are outside every mapped figure.`,
+      detail: {
+        paidInstalls: input.paidInstalls,
+        mappedPaidInstalls: input.mappedPaidInstalls,
+        unmappedInstalls,
+      },
     });
   }
 
@@ -304,8 +327,24 @@ export function checkReconciliationHealth(input: ReconciliationHealthInput): Dat
       ...base,
       checkKey: 'reconciliation.ambiguous_campaigns',
       severity: 'warning',
-      message: `${input.ambiguousCampaigns} campaign(s) matched more than one candidate by name and were left unmapped rather than joined arbitrarily.`,
-      detail: { ambiguousCampaigns: input.ambiguousCampaigns },
+      message: `${input.ambiguousCampaigns} campaign(s) matched more than one candidate and were left unmapped rather than joined arbitrarily. They can be resolved by hand on the reconciliation screen.`,
+      detail: {
+        ambiguousCampaigns: input.ambiguousCampaigns,
+        ambiguousSpend: input.ambiguousSpend,
+      },
+    });
+  }
+
+  if (input.historicalCampaigns > 0) {
+    findings.push({
+      ...base,
+      checkKey: 'reconciliation.historical_campaigns_without_activity',
+      // Informational on purpose: a campaign that stopped running is not a
+      // reconciliation problem, and ranking it beside live unmapped spend
+      // would bury the finding that matters.
+      severity: 'info',
+      message: `${input.historicalCampaigns} marketing campaign(s) have no delivery in the selected period. They are excluded from current-period coverage.`,
+      detail: { historicalCampaigns: input.historicalCampaigns },
     });
   }
 

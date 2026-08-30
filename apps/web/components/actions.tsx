@@ -204,3 +204,104 @@ export function RecomputeReconciliationButton({
     </span>
   );
 }
+
+/**
+ * Resolve one ambiguous mapping by hand.
+ *
+ * MART refuses to pick between candidates it cannot tell apart. A person can,
+ * and their decision is recorded as `manually_verified`: it survives every
+ * later reconciliation, overrides any computed fallback, is written to the
+ * audit log with who and when, and can be undone here.
+ *
+ * Nothing is preselected. A default choice is a guess wearing a person's name.
+ */
+export function ResolveAmbiguousMapping({
+  organizationId,
+  appId,
+  mapping,
+}: {
+  organizationId: string;
+  appId: string;
+  mapping: {
+    id: string;
+    sourceName: string | null;
+    sourceExternalId: string;
+    candidates: Array<{ externalCampaignId?: string | null; campaignName?: string | null }>;
+    reason: string | null;
+  };
+}) {
+  const router = useRouter();
+  const [choice, setChoice] = useState<string>('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = async (decision: 'verify' | 'reject'): Promise<void> => {
+    setBusy(true);
+    setError(null);
+    const candidate = mapping.candidates.find((c) => c.externalCampaignId === choice);
+    const result = await apiMutate(
+      `/api/v1/organizations/${organizationId}/apps/${appId}/mappings/${mapping.id}/verify`,
+      decision === 'verify'
+        ? {
+            decision,
+            targetExternalId: choice,
+            ...(candidate?.campaignName ? { targetName: candidate.campaignName } : {}),
+          }
+        : { decision },
+    );
+    setBusy(false);
+    if (!result.ok) {
+      setError(result.error.message);
+      return;
+    }
+    router.refresh();
+  };
+
+  return (
+    <div className="stack" style={{ gap: 6 }}>
+      <div>
+        <strong>{mapping.sourceName ?? mapping.sourceExternalId}</strong>
+      </div>
+      {mapping.reason ? <div className="muted">{mapping.reason}</div> : null}
+      <label className="muted" htmlFor={`resolve-${mapping.id}`}>
+        Which attribution campaign is this?
+      </label>
+      <select
+        id={`resolve-${mapping.id}`}
+        value={choice}
+        disabled={busy}
+        onChange={(event) => setChoice(event.target.value)}
+      >
+        <option value="">Select a candidate…</option>
+        {mapping.candidates.map((candidate, index) => (
+          <option
+            key={candidate.externalCampaignId ?? index}
+            value={candidate.externalCampaignId ?? ''}
+          >
+            {candidate.campaignName ?? candidate.externalCampaignId ?? 'unnamed'}
+            {candidate.externalCampaignId ? ` — ${candidate.externalCampaignId}` : ''}
+          </option>
+        ))}
+      </select>
+      <div className="inline-meta">
+        <button
+          type="button"
+          className="button"
+          disabled={busy || choice === ''}
+          onClick={() => void submit('verify')}
+        >
+          {busy ? 'Saving…' : 'Save verified mapping'}
+        </button>
+        <button
+          type="button"
+          className="button secondary"
+          disabled={busy}
+          onClick={() => void submit('reject')}
+        >
+          None of these
+        </button>
+      </div>
+      {error ? <span className="error-text">{error}</span> : null}
+    </div>
+  );
+}

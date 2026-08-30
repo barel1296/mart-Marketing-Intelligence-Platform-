@@ -142,6 +142,32 @@ export async function reconcileCampaigns(input: ReconcileInput): Promise<Reconci
     [input.organizationId, input.appId, input.attributionProviderKey],
   );
 
+  // The MMP's own campaign directory: its campaign id alongside the ad
+  // network's campaign id, as the MMP resolved it. This is a stable
+  // cross-provider identifier, so a match through it is authoritative - and it
+  // is the only thing that can tell two network campaigns with identical names
+  // apart.
+  const directory = await queryRows<{
+    external_campaign_id: string;
+    remote_campaign_id: string | null;
+  }>(
+    `SELECT external_campaign_id, remote_campaign_id
+       FROM attribution_campaigns
+      WHERE organization_id = $1 AND app_id = $2 AND provider_key = $3
+        AND remote_campaign_id IS NOT NULL`,
+    [input.organizationId, input.appId, input.attributionProviderKey],
+  );
+  /** Ad-network campaign id -> the MMP campaign ids that declare it. */
+  const byRemoteId = new Map<string, string[]>();
+  /** MMP campaign id -> the network campaign id it declares. */
+  const declaredRemoteFor = new Map<string, string>();
+  for (const row of directory) {
+    const remote = row.remote_campaign_id;
+    if (!remote) continue;
+    byRemoteId.set(remote, [...(byRemoteId.get(remote) ?? []), row.external_campaign_id]);
+    declaredRemoteFor.set(row.external_campaign_id, remote);
+  }
+
   const organic = allAttribution.filter((row) => isOrganicSource(row.media_source));
   const attribution = allAttribution.filter(
     (row) =>
@@ -173,6 +199,17 @@ export async function reconcileCampaigns(input: ReconcileInput): Promise<Reconci
     }
   }
 
+  // Campaigns a person has already decided. Recomputing them would put a
+  // freshly computed row beside the human's, and a decision that has to be
+  // re-made after every sync is not a decision.
+  const decided = await queryRows<{ source_external_id: string }>(
+    `SELECT DISTINCT source_external_id FROM provider_entity_mappings
+      WHERE organization_id = $1 AND app_id = $2 AND entity_type = 'campaign'
+        AND status IN ('manually_verified', 'rejected')`,
+    [input.organizationId, input.appId],
+  );
+  const humanDecided = new Set(decided.map((row) => row.source_external_id));
+
   const mappings: MappingUpsert[] = [];
   const summary: ReconcileSummary = {
     entityType: 'campaign',
@@ -189,6 +226,39 @@ export async function reconcileCampaigns(input: ReconcileInput): Promise<Reconci
   };
 
   for (const campaign of marketing) {
+    if (humanDecided.has(campaign.external_campaign_id)) continue;
+    // The MMP declared this network campaign id itself. An identifier beats
+    // every name rule, so it is checked first and recorded as authoritative.
+    const declared = (byRemoteId.get(campaign.external_campaign_id) ?? [])
+      .map((id) => attributionById.get(id))
+      .filter((row): row is AttributionCampaign => row !== undefined);
+    if (declared.length > 0) {
+      for (const candidate of declared) {
+        summary.matchedExact += 1;
+        mappings.push({
+          entityType: 'campaign',
+          sourceProvider: input.marketingProviderKey,
+          sourceExternalId: campaign.external_campaign_id,
+          sourceName: campaign.name,
+          targetProvider: input.attributionProviderKey,
+          targetExternalId: candidate.external_campaign_id,
+          targetName: candidate.campaign_name,
+          // The MMP published the network's id for this campaign: an explicit
+          // provider-supplied link, not something MART inferred.
+          mappingMethod: 'explicit_provider_mapping',
+          mappingConfidence: 1,
+          status: 'matched_exact',
+          candidates: declared.map(toCandidate),
+          evidence: {
+            matchedOn: 'remote_campaign_id',
+            remoteCampaignId: campaign.external_campaign_id,
+            note: 'The attribution provider published this network campaign id for its own campaign. A stable identifier, not a name.',
+          },
+        });
+      }
+      continue;
+    }
+
     const byId = attributionById.get(campaign.external_campaign_id);
     if (byId) {
       summary.matchedExact += 1;
@@ -210,7 +280,16 @@ export async function reconcileCampaigns(input: ReconcileInput): Promise<Reconci
     }
 
     const key = nameKey(campaign.name);
-    const nameCandidates = key ? (attributionByName.get(key) ?? []) : [];
+    // A candidate that already declares a different network campaign id is not
+    // a candidate for this one, whatever the names say. This is what resolves
+    // two network campaigns with identical names: the MMP already told MART
+    // which of them each of its campaigns belongs to.
+    const nameCandidates = (key ? (attributionByName.get(key) ?? []) : []).filter((candidate) => {
+      const declaredFor = candidate.external_campaign_id
+        ? declaredRemoteFor.get(candidate.external_campaign_id)
+        : undefined;
+      return declaredFor === undefined || declaredFor === campaign.external_campaign_id;
+    });
 
     // Several marketing campaigns sharing one name is the mirror image of the
     // many-to-one case and is NOT aggregation: an attribution campaign naming
@@ -349,8 +428,17 @@ export async function reconcileCampaigns(input: ReconcileInput): Promise<Reconci
 
   // Reverse direction, so attribution campaigns with no marketing counterpart
   // stay visible instead of disappearing from the reconciliation view.
+  const declaredAttributionIds = new Set(
+    [...byRemoteId.entries()]
+      .filter(([remote]) => marketingById.has(remote))
+      .flatMap(([, ids]) => ids),
+  );
+
   for (const row of attribution) {
     const id = row.external_campaign_id;
+    // Already linked by identifier from the other direction.
+    if (id && declaredAttributionIds.has(id)) continue;
+    if (id && humanDecided.has(id)) continue;
     const keys = attributionNameKeys(row.campaign_name);
     const matchedById = id ? marketingById.has(id) : false;
     const marketingMatches = keys.flatMap((key) => marketingByName.get(key) ?? []);
@@ -446,9 +534,14 @@ export async function reconcileCampaigns(input: ReconcileInput): Promise<Reconci
 
 /** Check keys this module owns and recomputes on every run. */
 const RECONCILIATION_CHECK_KEYS = [
+  'reconciliation.current_period_spend_unmapped',
+  'reconciliation.paid_installs_unmapped',
+  'reconciliation.ambiguous_campaigns',
+  'reconciliation.historical_campaigns_without_activity',
+  // Retired keys, cleared so a stale finding from an earlier release cannot
+  // linger on the dashboard as if it were current.
   'reconciliation.paid_spend_without_mapping',
   'reconciliation.attributed_campaigns_unmapped',
-  'reconciliation.ambiguous_campaigns',
 ] as const;
 
 /**
@@ -462,32 +555,44 @@ async function recordReconciliationFindings(
   input: ReconcileInput,
   summary: ReconcileSummary,
 ): Promise<void> {
+  // The window the findings describe. Reconciliation has no reporting range of
+  // its own, so it reviews the trailing 30 days - the period a dashboard is
+  // usually looking at, and the one where "is today's spend accounted for?"
+  // is a live question.
+  const to = new Date();
+  const from = new Date(to.getTime() - 29 * 86400000);
+  const window = {
+    from: from.toISOString().slice(0, 10) as IsoDate,
+    to: to.toISOString().slice(0, 10) as IsoDate,
+    attributionProviderKey: input.attributionProviderKey,
+  };
+
   const coverage = await campaignCoverage(
     input.organizationId,
     input.appId,
     input.marketingProviderKey,
+    window,
   );
-
-  const spendRows = await queryRows<{ spend: string | null; latest: string | null }>(
-    `SELECT SUM(spend)::text AS spend, MAX(report_date)::text AS latest
-       FROM marketing_daily_metrics
-      WHERE organization_id = $1 AND app_id = $2 AND provider_key = $3`,
-    [input.organizationId, input.appId, input.marketingProviderKey],
-  );
+  const eligible = coverage.eligible;
+  if (!eligible) return;
 
   const findings = checkReconciliationHealth({
     organizationId: input.organizationId,
     appId: input.appId,
     connectionId: null,
     syncRunId: null,
-    observedDate: (spendRows[0]?.latest ?? new Date().toISOString().slice(0, 10)) as IsoDate,
-    spend: Number(spendRows[0]?.spend ?? 0),
-    marketingCampaigns: summary.marketingEntities,
-    operationalCoveragePct: coverage.operationalCoveragePct,
-    authoritativeCoveragePct: coverage.authoritativeCoveragePct,
-    unmappedPaidCampaigns: summary.unmatchedAttribution,
-    ambiguousCampaigns: summary.ambiguous,
+    observedDate: window.to,
+    spend: eligible.totalSpend,
+    mappedSpend: eligible.mappedSpend,
+    ambiguousSpend: eligible.ambiguousSpend,
+    unmappedSpend: eligible.unmappedSpend,
+    eligibleCampaigns: eligible.eligibleCampaigns,
+    ambiguousCampaigns: eligible.ambiguousCampaigns,
+    historicalCampaigns: eligible.historicalCampaigns,
+    paidInstalls: eligible.totalPaidInstalls,
+    mappedPaidInstalls: eligible.mappedPaidInstalls,
   });
+  void summary;
 
   // Replaced rather than appended: these describe the join as it stands now.
   await dataQualityRepo.clearDataQualityFindings(
@@ -544,12 +649,60 @@ export type CoverageSummary = {
    * authoritative coverage: the stricter of the two is the safe default.
    */
   coveragePct: number | null;
+  /** Present when a reporting window was given; see EligibleCoverage. */
+  eligible?: EligibleCoverage;
 };
+
+/**
+ * Coverage restricted to what the selected reporting window is about.
+ *
+ * Three separate numbers, never combined - they answer different questions and
+ * a single blended percentage would hide the one that matters:
+ *
+ *  - **campaignPct**  how many of the campaigns that actually delivered in the
+ *    window are mapped. A campaign that spent nothing in the window is not a
+ *    current-period gap, so it is out of this denominator.
+ *  - **spendPct**     how much of the money is accounted for. This is the one
+ *    that exposes a single large campaign sitting unmapped: nine dormant
+ *    campaigns cannot drag it down, and one live one can.
+ *  - **installPct**   how much of the paid attribution is accounted for.
+ *    Organic is excluded: it belongs to no campaign.
+ */
+export type EligibleCoverage = {
+  from: IsoDate;
+  to: IsoDate;
+  /** Campaigns with spend, impressions or clicks in the window. */
+  eligibleCampaigns: number;
+  mappedCampaigns: number;
+  ambiguousCampaigns: number;
+  unmappedCampaigns: number;
+  /** Known to the structure sync but with no delivery in the window. */
+  historicalCampaigns: number;
+  campaignPct: number | null;
+
+  totalSpend: number;
+  mappedSpend: number;
+  ambiguousSpend: number;
+  unmappedSpend: number;
+  spendPct: number | null;
+
+  totalPaidInstalls: number;
+  mappedPaidInstalls: number;
+  ambiguousPaidInstalls: number;
+  unmappedPaidInstalls: number;
+  organicInstalls: number;
+  installPct: number | null;
+};
+
+/** SQL for "this mapping is strong enough to operate on". */
+const OPERATIONAL_MAPPING = `(m.status IN ('matched_exact', 'matched_confident', 'manually_verified')
+  OR (m.status = 'matched_fallback' AND m.mapping_confidence >= ${OPERATIONAL_MAPPING_CONFIDENCE}))`;
 
 export async function campaignCoverage(
   organizationId: string,
   appId: string,
   marketingProviderKey: string,
+  window?: { from: IsoDate; to: IsoDate; attributionProviderKey?: string | null },
 ): Promise<CoverageSummary> {
   // One row per campaign, not per mapping. A marketing campaign with three
   // attribution children is one campaign that is mapped, not three - counting
@@ -601,10 +754,10 @@ export async function campaignCoverage(
     .reduce((sum, [, count]) => sum + count, 0);
   const authoritative = get('matched_exact') + get('matched_confident') + get('manually_verified');
   const operational = authoritative + operationalFallback;
-  const pct = (value: number): number | null =>
-    total === 0 ? null : Number(((value / total) * 100).toFixed(1));
+  const pct = (value: number, denominator: number): number | null =>
+    denominator === 0 ? null : Number(((value / denominator) * 100).toFixed(1));
 
-  return {
+  const summary: CoverageSummary = {
     total,
     matchedExact: get('matched_exact'),
     matchedConfident: get('matched_confident'),
@@ -617,8 +770,162 @@ export async function campaignCoverage(
     notApplicable: get('not_applicable'),
     authoritative,
     operational,
-    authoritativeCoveragePct: pct(authoritative),
-    operationalCoveragePct: pct(operational),
-    coveragePct: pct(authoritative),
+    authoritativeCoveragePct: pct(authoritative, total),
+    operationalCoveragePct: pct(operational, total),
+    coveragePct: pct(authoritative, total),
+  };
+
+  if (!window) return summary;
+  return {
+    ...summary,
+    eligible: await eligibleCoverage(organizationId, appId, marketingProviderKey, window),
+  };
+}
+
+/**
+ * Coverage over the selected reporting window.
+ *
+ * Nine campaigns that stopped running last quarter are not a current-period
+ * reconciliation gap, and counting them as one makes today's coverage look
+ * broken while hiding the one live campaign that really is unmapped.
+ */
+async function eligibleCoverage(
+  organizationId: string,
+  appId: string,
+  marketingProviderKey: string,
+  window: { from: IsoDate; to: IsoDate; attributionProviderKey?: string | null },
+): Promise<EligibleCoverage> {
+  // Each query binds exactly the parameters it references: Postgres rejects a
+  // bind carrying more than the statement uses.
+  const campaignParams = [organizationId, appId, marketingProviderKey, window.from, window.to];
+  const installParams = [
+    organizationId,
+    appId,
+    window.from,
+    window.to,
+    window.attributionProviderKey ?? null,
+  ];
+
+  const campaigns = await queryRows<{
+    state: 'mapped' | 'ambiguous' | 'unmapped';
+    campaigns: string;
+    spend: string;
+  }>(
+    // Eligible = delivered something in the window. A campaign with no spend,
+    // impressions or clicks had nothing to attribute.
+    `WITH delivered AS (
+       SELECT external_campaign_id,
+              SUM(spend) AS spend
+       FROM marketing_daily_metrics
+       WHERE organization_id = $1 AND app_id = $2 AND provider_key = $3
+         AND report_date BETWEEN $4 AND $5
+         AND external_campaign_id IS NOT NULL
+       GROUP BY external_campaign_id
+       HAVING SUM(spend) > 0 OR SUM(impressions) > 0 OR SUM(clicks) > 0
+     ),
+     state AS (
+       SELECT d.external_campaign_id, d.spend,
+              CASE
+                WHEN EXISTS (
+                  SELECT 1 FROM provider_entity_mappings m
+                  WHERE m.organization_id = $1 AND m.app_id = $2
+                    AND m.entity_type = 'campaign' AND m.source_provider = $3
+                    AND m.source_external_id = d.external_campaign_id
+                    AND m.target_external_id IS NOT NULL AND ${OPERATIONAL_MAPPING}
+                ) THEN 'mapped'
+                WHEN EXISTS (
+                  SELECT 1 FROM provider_entity_mappings m
+                  WHERE m.organization_id = $1 AND m.app_id = $2
+                    AND m.entity_type = 'campaign' AND m.source_provider = $3
+                    AND m.source_external_id = d.external_campaign_id
+                    AND m.status = 'ambiguous'
+                ) THEN 'ambiguous'
+                ELSE 'unmapped'
+              END AS state
+       FROM delivered d
+     )
+     SELECT state, count(*)::text AS campaigns, COALESCE(SUM(spend), 0)::text AS spend
+     FROM state GROUP BY state`,
+    campaignParams,
+  );
+
+  const known = await queryRows<{ count: string }>(
+    `SELECT count(DISTINCT external_campaign_id)::text AS count
+       FROM marketing_campaigns
+      WHERE organization_id = $1 AND app_id = $2 AND provider_key = $3`,
+    [organizationId, appId, marketingProviderKey],
+  );
+
+  const installs = await queryRows<{
+    state: 'mapped' | 'ambiguous' | 'unmapped' | 'organic';
+    installs: string;
+  }>(
+    `SELECT CASE
+              WHEN COALESCE(a.normalized_media_source, 'organic') = 'organic' THEN 'organic'
+              WHEN EXISTS (
+                SELECT 1 FROM provider_entity_mappings m
+                WHERE m.organization_id = $1 AND m.app_id = $2
+                  AND m.entity_type = 'campaign' AND m.target_provider = a.provider_key
+                  AND m.target_external_id = a.external_campaign_id AND ${OPERATIONAL_MAPPING}
+              ) THEN 'mapped'
+              WHEN EXISTS (
+                SELECT 1 FROM provider_entity_mappings m
+                WHERE m.organization_id = $1 AND m.app_id = $2
+                  AND m.entity_type = 'campaign' AND m.status = 'ambiguous'
+                  AND m.candidates::text LIKE '%' || a.external_campaign_id || '%'
+              ) THEN 'ambiguous'
+              ELSE 'unmapped'
+            END AS state,
+            COALESCE(SUM(a.attributed_installs), 0)::text AS installs
+       FROM attribution_daily_metrics a
+      WHERE a.organization_id = $1 AND a.app_id = $2
+        AND a.install_date BETWEEN $3 AND $4
+        AND ($5::text IS NULL OR a.provider_key = $5)
+      GROUP BY state`,
+    installParams,
+  );
+
+  const campaignBy = (state: string): { campaigns: number; spend: number } => {
+    const row = campaigns.find((r) => r.state === state);
+    return { campaigns: Number(row?.campaigns ?? 0), spend: Number(row?.spend ?? 0) };
+  };
+  const installsBy = (state: string): number =>
+    Number(installs.find((r) => r.state === state)?.installs ?? 0);
+
+  const mapped = campaignBy('mapped');
+  const ambiguous = campaignBy('ambiguous');
+  const unmapped = campaignBy('unmapped');
+  const eligibleCampaigns = mapped.campaigns + ambiguous.campaigns + unmapped.campaigns;
+  const totalSpend = mapped.spend + ambiguous.spend + unmapped.spend;
+
+  const mappedInstalls = installsBy('mapped');
+  const ambiguousInstalls = installsBy('ambiguous');
+  const unmappedInstalls = installsBy('unmapped');
+  const organicInstalls = installsBy('organic');
+  const totalPaidInstalls = mappedInstalls + ambiguousInstalls + unmappedInstalls;
+
+  const pct = (value: number, denominator: number): number | null =>
+    denominator === 0 ? null : Number(((value / denominator) * 100).toFixed(1));
+
+  return {
+    from: window.from,
+    to: window.to,
+    eligibleCampaigns,
+    mappedCampaigns: mapped.campaigns,
+    ambiguousCampaigns: ambiguous.campaigns,
+    unmappedCampaigns: unmapped.campaigns,
+    historicalCampaigns: Math.max(0, Number(known[0]?.count ?? 0) - eligibleCampaigns),
+    campaignPct: pct(mapped.campaigns, eligibleCampaigns),
+    totalSpend,
+    mappedSpend: mapped.spend,
+    ambiguousSpend: ambiguous.spend,
+    unmappedSpend: unmapped.spend,
+    spendPct: pct(mapped.spend, totalSpend),
+    totalPaidInstalls,
+    mappedPaidInstalls: mappedInstalls,
+    ambiguousPaidInstalls: ambiguousInstalls,
+    unmappedPaidInstalls: unmappedInstalls,
+    organicInstalls,
+    installPct: pct(mappedInstalls, totalPaidInstalls),
   };
 }

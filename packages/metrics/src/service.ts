@@ -58,7 +58,29 @@ export type MetricContext = {
   supportedCapabilities: Set<string>;
   marketingFreshness?: { status: string; latestDataDate: string | null } | undefined;
   attributionFreshness?: { status: string; latestDataDate: string | null } | undefined;
-  mappingCoverage?: { total: number; authoritative: number; operational: number } | undefined;
+  mappingCoverage?:
+    | {
+        total: number;
+        authoritative: number;
+        operational: number;
+        /** Restricted to the selected reporting window; absent when unknown. */
+        eligible?: {
+          eligibleCampaigns: number;
+          mappedCampaigns: number;
+          ambiguousCampaigns: number;
+          unmappedCampaigns: number;
+          historicalCampaigns: number;
+          totalSpend: number;
+          mappedSpend: number;
+          ambiguousSpend: number;
+          unmappedSpend: number;
+          totalPaidInstalls: number;
+          mappedPaidInstalls: number;
+          ambiguousPaidInstalls: number;
+          unmappedPaidInstalls: number;
+        };
+      }
+    | undefined;
 };
 
 export type MarketingAggregate = {
@@ -512,6 +534,52 @@ function buildMetricValue(
           : value;
       }
       return value;
+    }
+    case 'spend_coverage':
+    case 'attribution_coverage':
+    case 'campaign_operational_coverage': {
+      const eligible = context.mappingCoverage?.eligible;
+      if (!eligible) {
+        return {
+          ...base,
+          availability: 'unavailable',
+          reason:
+            'Period coverage needs a reconciled mapping set for the selected window. Run a sync for both providers, then recompute mappings.',
+        };
+      }
+      // Three separate questions, never blended: how many campaigns, how much
+      // money, how much attribution.
+      const [numerator, denominator, ambiguousShare] =
+        definition.metricKey === 'spend_coverage'
+          ? [eligible.mappedSpend, eligible.totalSpend, eligible.ambiguousSpend]
+          : definition.metricKey === 'attribution_coverage'
+            ? [
+                eligible.mappedPaidInstalls,
+                eligible.totalPaidInstalls,
+                eligible.ambiguousPaidInstalls,
+              ]
+            : [eligible.mappedCampaigns, eligible.eligibleCampaigns, eligible.ambiguousCampaigns];
+
+      if (denominator === 0) {
+        return {
+          ...base,
+          numerator,
+          denominator,
+          availability: 'unavailable',
+          reason: 'Nothing delivered in the selected period for this to be a share of.',
+        };
+      }
+      const ratio = safeRatio(numerator, denominator, definition.minimumDenominator);
+      const value = finishRatio(base, withFreshness, ratio, numerator, denominator);
+      // An ambiguous slice is not merely missing: MART found candidates and
+      // refused to guess, and a person can resolve it.
+      return value.availability === 'available' && ambiguousShare > 0
+        ? {
+            ...value,
+            availability: 'partial',
+            reason: `${ambiguousShare} of the denominator is ambiguous: MART found more than one candidate and will not pick one. Resolve it on the reconciliation screen.`,
+          }
+        : value;
     }
     case 'mapping_coverage':
     case 'operational_mapping_coverage': {

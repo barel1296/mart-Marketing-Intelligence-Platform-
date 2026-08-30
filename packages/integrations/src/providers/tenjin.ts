@@ -10,6 +10,7 @@ import { ProviderHttpClient, userMessageFor } from '../http.js';
 import { declare, type CapabilityDeclaration } from '../capabilities.js';
 import {
   emptyAttributionBatch,
+  type AttributionCampaignRef,
   type AttributionProvider,
   type ConnectionHealth,
   type ProviderAccount,
@@ -51,6 +52,8 @@ export type TenjinProviderOptions = {
 export type TenjinEndpoints = {
   /** Saved report definitions. */
   savedReports: string;
+  /** The campaign directory, which carries the ad network's campaign id. */
+  campaigns: string;
   /** Report data. The saved report UUID is appended: /reports/{id}. */
   reports: string;
   apps: string;
@@ -70,6 +73,7 @@ export type TenjinEndpoints = {
  */
 const DEFAULT_ENDPOINTS: Omit<TenjinEndpoints, 'dataExportsApps'> = {
   savedReports: '/saved_reports',
+  campaigns: '/campaigns',
   // Report data is addressed by saved report UUID: /reports/{id}. There is no
   // report named for its family - asking for /reports/user_acquisition makes
   // Tenjin read "user_acquisition" as an id and answer 400 "Saved report not
@@ -795,6 +799,50 @@ export class TenjinAttributionProvider implements AttributionProvider {
         })),
       },
     });
+  }
+
+  /**
+   * The account's campaign directory.
+   *
+   * Reporting rows carry only Tenjin's own campaign UUID, which can never equal
+   * a Meta campaign id. This endpoint carries `remote_campaign_id`: the ad
+   * network's real campaign id, as Tenjin resolved it. That is a stable
+   * identifier rather than a name, and it is the only thing that can tell two
+   * network campaigns with identical names apart.
+   *
+   * Tracking URLs are deliberately not read: they carry click identifiers MART
+   * has no use for and should not store.
+   */
+  async listCampaigns(externalAccountId: string): Promise<AttributionCampaignRef[]> {
+    const out: AttributionCampaignRef[] = [];
+    let cursor: string | undefined;
+
+    for (let page = 1; page <= MAX_REPORT_PAGES; page += 1) {
+      const body = await this.get<unknown>(this.endpoints.campaigns, {
+        app_id: externalAccountId,
+        ...(cursor ? { cursor } : {}),
+      });
+
+      for (const resource of this.extractResources(body)) {
+        const attributes = resource.attributes;
+        const id = str(attributes['id']) ?? resource.id;
+        if (!id) continue;
+        out.push({
+          externalCampaignId: id,
+          name: str(attributes['name']),
+          remoteCampaignId: str(attributes['remote_campaign_id']),
+          channelId: str(attributes['channel_id']),
+          channelName: str(attributes['channel_name']),
+        });
+      }
+
+      const envelope = (body ?? {}) as Record<string, unknown>;
+      if (envelope['has_more'] !== true) break;
+      cursor = readCursor(envelope);
+      if (!cursor) break;
+    }
+
+    return out;
   }
 
   async syncInstalls(params: SyncParams): Promise<SyncResult<CanonicalAttributionBatch>> {

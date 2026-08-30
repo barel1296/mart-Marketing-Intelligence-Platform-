@@ -264,6 +264,95 @@ async function auditApp(organizationId: string, appId: string, appName: string):
     );
   }
 
+  // ------------------------------------------------------- ambiguous ---
+  // The cases MART refused to guess. Every field a person needs to decide is
+  // printed, including which discriminator was available and which was not.
+  const ambiguous = mappings.filter((m) => m.status === 'ambiguous');
+  heading(`AMBIGUOUS (${ambiguous.length})`);
+  for (const mapping of ambiguous) {
+    const source = marketing.find((m) => m.external_campaign_id === mapping.source_external_id);
+    const candidates = await queryRows<{
+      external_campaign_id: string;
+      name: string | null;
+      effective_status: string | null;
+      status: string | null;
+      provider_created_at: string | null;
+      spend: string | null;
+      installs: string | null;
+      revenue: string | null;
+      remote_campaign_id: string | null;
+    }>(
+      `SELECT c.external_campaign_id, c.name, c.effective_status, c.status,
+              c.provider_created_at::text AS provider_created_at,
+              (SELECT SUM(m.spend)::text FROM marketing_daily_metrics m
+                WHERE m.app_id = c.app_id AND m.external_campaign_id = c.external_campaign_id)
+                AS spend,
+              NULL AS installs, NULL AS revenue,
+              NULL AS remote_campaign_id
+         FROM marketing_campaigns c
+        WHERE c.organization_id = $1 AND c.app_id = $2
+          AND c.name = (SELECT name FROM marketing_campaigns
+                         WHERE app_id = $2 AND external_campaign_id = $3 LIMIT 1)
+        ORDER BY c.external_campaign_id`,
+      [organizationId, appId, mapping.source_external_id],
+    );
+
+    process.stdout.write('\n');
+    line('AMBIGUOUS MAPPING ID:', mapping.source_external_id);
+    line('MARKETING CAMPAIGN NAME:', mapping.source_name ?? source?.name ?? '(not stored)');
+    line('CANDIDATES CONSIDERED:', candidates.length);
+    let candidateIndex = 0;
+    for (const candidate of candidates) {
+      candidateIndex += 1;
+      process.stdout.write(`  META CANDIDATE ${candidateIndex}:\n`);
+      process.stdout.write(`    campaign id      ${candidate.external_campaign_id}\n`);
+      process.stdout.write(`    exact name       ${candidate.name ?? '(not stored)'}\n`);
+      process.stdout.write(`    status           ${candidate.status ?? '(not stored)'}\n`);
+      process.stdout.write(
+        `    effective_status ${candidate.effective_status ?? '(not stored)'}\n`,
+      );
+      process.stdout.write(
+        `    created_time     ${candidate.provider_created_at ?? '(not stored)'}\n`,
+      );
+      process.stdout.write(`    spend (all time) ${candidate.spend ?? '0'}\n`);
+    }
+
+    // The discriminator that settles it, when the MMP published one.
+    const declared = await queryRows<{
+      external_campaign_id: string;
+      name: string | null;
+      remote_campaign_id: string;
+    }>(
+      `SELECT external_campaign_id, name, remote_campaign_id
+         FROM attribution_campaigns
+        WHERE organization_id = $1 AND app_id = $2 AND remote_campaign_id = ANY($3)`,
+      [organizationId, appId, candidates.map((c) => c.external_campaign_id)],
+    );
+    line(
+      'DETERMINISTIC DISCRIMINATOR:',
+      declared.length > 0
+        ? `remote_campaign_id published by the MMP for ${declared.length} of them`
+        : 'none available - the MMP published no network campaign id',
+    );
+    for (const row of declared) {
+      process.stdout.write(
+        `    ${row.remote_campaign_id} <- ${row.name ?? row.external_campaign_id}\n`,
+      );
+    }
+    line(
+      'WHY AMBIGUOUS:',
+      String(mapping.source_name ?? '') && candidates.length > 1
+        ? `${candidates.length} marketing campaigns carry this exact name, so a name cannot say which one an attribution campaign belongs to`
+        : 'more than one candidate matched and none could be preferred deterministically',
+    );
+    line(
+      'RESOLUTION:',
+      declared.length > 0
+        ? 'Re-run reconciliation: the published network campaign id settles it without a human.'
+        : 'Resolve by hand on the reconciliation screen. MART will not pick on spend, recency, or any other proxy.',
+    );
+  }
+
   // ------------------------------------------------ unmatched marketing ---
   const unmatchedMarketing = marketing.filter(
     (row) => !mappedMarketingIds.has(row.external_campaign_id),
