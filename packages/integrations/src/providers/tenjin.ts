@@ -4,7 +4,7 @@ import type {
   CanonicalAttributionRevenueMetric,
   IsoDate,
 } from '@mart/shared';
-import { ProviderError } from '@mart/shared';
+import { ProviderError, SENSITIVE_KEY_PATTERN } from '@mart/shared';
 import { ProviderHttpClient, userMessageFor } from '../http.js';
 import { declare, type CapabilityDeclaration } from '../capabilities.js';
 import {
@@ -207,18 +207,39 @@ export class TenjinAttributionProvider implements AttributionProvider {
         // per-app keys, and an id is displayed in the UI and stored in the
         // database. A row with no real id is skipped rather than labelled with
         // something key-shaped.
-        const id = str(row['id'] ?? row['app_id']);
-        if (!id) return null;
+        const id = pick(row, ID_KEYS);
+        if (!id.value) return null;
+
+        const name = pick(row, NAME_KEYS);
+        const bundleId = pick(row, BUNDLE_KEYS);
+        const platform = pick(row, PLATFORM_KEYS);
+
         return {
-          externalAccountId: id,
-          name: str(row['name'] ?? row['app_name']) ?? id,
+          externalAccountId: id.value,
+          // Falling back to the id keeps the required field populated, but
+          // nameSource records that no real name came back, so the UI can say
+          // so instead of presenting a UUID as if it were a title.
+          name: name.value ?? id.value,
           accountType: 'mmp_app' as const,
           currency: null,
           timezone: str(row['timezone']),
           status: str(row['status']),
           metadata: {
-            bundleId: str(row['bundle_id'] ?? row['package_name']),
-            platform: str(row['platform']),
+            bundleId: bundleId.value,
+            platform: platform.value ? normalizeTenjinPlatform(platform.value) : null,
+            tenjinAppId: id.value,
+            // Which field each value actually came from, and every other
+            // non-secret field the response carried. Tenjin's app payload is
+            // not verified against live documentation, so nothing identifying
+            // is discarded: whatever it returns is available for display and
+            // for working out the real contract from a single run.
+            fieldSources: {
+              id: id.key,
+              name: name.key,
+              bundleId: bundleId.key,
+              platform: platform.key,
+            },
+            raw: safeRow(row),
           },
         };
       })
@@ -440,4 +461,74 @@ function platform(value: string | null): string | null {
   if (lower.includes('ios')) return 'ios';
   if (lower.includes('android')) return 'android';
   return lower;
+}
+
+/**
+ * Candidate field names for each identifying attribute, most specific first.
+ *
+ * These are aliases MART looks for, not an invented schema: whichever one the
+ * response actually carries is used, the key it came from is recorded, and if
+ * none is present the value stays null rather than being derived from the id.
+ */
+const ID_KEYS = ['id', 'app_id', 'application_id', 'uuid'] as const;
+const NAME_KEYS = [
+  'name',
+  'app_name',
+  'title',
+  'display_name',
+  'label',
+  'application_name',
+] as const;
+const BUNDLE_KEYS = [
+  'bundle_id',
+  'bundleId',
+  'package_name',
+  'packageName',
+  'store_id',
+  'storeId',
+  'app_store_id',
+  'store_app_id',
+  'app_identifier',
+  'identifier',
+] as const;
+const PLATFORM_KEYS = ['platform', 'os', 'device_platform', 'app_platform', 'store'] as const;
+
+/** First present value plus the key it came from, so provenance is reportable. */
+function pick(
+  row: Record<string, unknown>,
+  keys: readonly string[],
+): { value: string | null; key: string | null } {
+  for (const key of keys) {
+    const value = str(row[key] as string | number | null | undefined);
+    if (value) return { value, key };
+  }
+  return { value: null, key: null };
+}
+
+/** ios / android / amazon as the provider spells them, lowercased. */
+function normalizeTenjinPlatform(value: string): string {
+  const lower = value.trim().toLowerCase();
+  if (lower.includes('ios') || lower.includes('iphone') || lower.includes('apple')) return 'ios';
+  if (lower.includes('android') || lower.includes('google') || lower.includes('play')) {
+    return 'android';
+  }
+  return lower;
+}
+
+/**
+ * Every scalar field from the row except anything secret-shaped.
+ *
+ * Tenjin app payloads can include a per-app SDK key; that must not be stored in
+ * the database or rendered in the dashboard just because it arrived alongside
+ * the fields we do want.
+ */
+function safeRow(row: Record<string, unknown>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(row)) {
+    if (SENSITIVE_KEY_PATTERN.test(key)) continue;
+    if (value === null || value === undefined) continue;
+    if (typeof value === 'object') continue;
+    out[key] = String(value);
+  }
+  return out;
 }

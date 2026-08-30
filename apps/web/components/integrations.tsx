@@ -4,7 +4,7 @@ import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { apiMutate, apiRead } from '../lib/client';
 import { StatusChip } from './primitives';
-import { formatDateTime } from '../lib/format';
+import { accountLabel, accountSecondary, formatDateTime } from '../lib/format';
 
 export type CredentialField = {
   name: string;
@@ -35,6 +35,8 @@ export type AccountRow = {
   currency: string | null;
   timezone: string | null;
   status: string | null;
+  /** Whatever identifying fields the provider returned: bundleId, platform, … */
+  metadata?: Record<string, unknown> | null;
 };
 
 export type ConnectionRow = {
@@ -326,7 +328,8 @@ export function ConnectionPanel({
               <option value="">Choose…</option>
               {connection.accounts.map((account) => (
                 <option key={account.id} value={account.id}>
-                  {account.name} ({account.external_account_id})
+                  {accountLabel(account)}
+                  {accountSecondary(account) ? ` · ${accountSecondary(account)}` : ''}
                 </option>
               ))}
             </select>

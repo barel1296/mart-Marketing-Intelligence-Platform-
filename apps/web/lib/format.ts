@@ -75,3 +75,46 @@ export function statusTone(status: string | null | undefined): string {
       return 'chip-neutral';
   }
 }
+
+export type ProviderAccountLike = {
+  external_account_id: string;
+  name: string;
+  metadata?: Record<string, unknown> | null;
+};
+
+function metaString(
+  metadata: Record<string, unknown> | null | undefined,
+  key: string,
+): string | null {
+  const value = metadata?.[key];
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
+}
+
+/**
+ * How a provider account reads in a picker: "<Name> — <Platform> — <Bundle ID>".
+ *
+ * Only fields the provider actually returned are used. When a provider sends no
+ * name - Tenjin identifies apps by UUID - the id is shown as the id rather than
+ * dressed up as a title, because a UUID that looks like a name is worse than a
+ * UUID that admits it is one.
+ */
+export function accountLabel(account: ProviderAccountLike): string {
+  const platform = metaString(account.metadata, 'platform');
+  const bundleId = metaString(account.metadata, 'bundleId');
+  const hasRealName =
+    account.name.trim().length > 0 && account.name !== account.external_account_id;
+
+  const parts = [hasRealName ? account.name : null, platform, bundleId].filter(
+    (part): part is string => part !== null,
+  );
+
+  if (parts.length === 0) return account.external_account_id;
+  if (!hasRealName) return `${parts.join(' \u2014 ')} (${account.external_account_id})`;
+  return parts.join(' \u2014 ');
+}
+
+/** The provider's own id, shown as secondary metadata beside the label. */
+export function accountSecondary(account: ProviderAccountLike): string {
+  const label = accountLabel(account);
+  return label.includes(account.external_account_id) ? '' : account.external_account_id;
+}

@@ -118,10 +118,33 @@ async function main(): Promise<void> {
     }
     line('accounts returned', accounts.length);
     for (const account of accounts) {
+      const meta = account.metadata ?? {};
+      const metaStr = (key: string): string => {
+        const value = meta[key];
+        return typeof value === 'string' && value.length > 0 ? value : '(not returned)';
+      };
+      const hasName = account.name !== account.externalAccountId;
+      process.stdout.write('\n');
+      process.stdout.write(`  NAME:      ${hasName ? account.name : '(not returned)'}\n`);
+      process.stdout.write(`  PLATFORM:  ${metaStr('platform')}\n`);
+      process.stdout.write(`  BUNDLE ID: ${metaStr('bundleId')}\n`);
       process.stdout.write(
-        `  - ${account.externalAccountId}  ${account.name}` +
-          `${account.currency ? `  ${account.currency}` : ''}\n`,
+        `  ${providerKey === 'tenjin' ? 'TENJIN ID' : 'PROVIDER ID'}: ${account.externalAccountId}\n`,
       );
+      // Which response field each value came from, so the real contract can be
+      // read off one run instead of guessed.
+      const sources = meta['fieldSources'];
+      if (sources && typeof sources === 'object') {
+        process.stdout.write(`  from fields: ${JSON.stringify(sources)}\n`);
+      }
+      // Every other non-secret field the provider sent. This is how a missing
+      // name is traced to the key it actually lives under.
+      const raw = meta['raw'];
+      if (raw && typeof raw === 'object') {
+        const keys = Object.keys(raw as Record<string, unknown>);
+        process.stdout.write(`  all fields returned: ${keys.join(', ') || '(none)'}\n`);
+        process.stdout.write(`  values: ${JSON.stringify(raw)}\n`);
+      }
     }
     if (accounts.length === 0) {
       process.stdout.write(

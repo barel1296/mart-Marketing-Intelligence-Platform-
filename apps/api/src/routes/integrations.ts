@@ -496,6 +496,7 @@ export async function registerIntegrationRoutes(server: FastifyInstance): Promis
                   externalAccountId: binding.external_account_id,
                   name: binding.account_name,
                   currency: binding.account_currency,
+                  metadata: binding.account_metadata,
                 }
               : null,
             capabilities: capabilities.map((c) => ({

@@ -307,6 +307,7 @@ export type BindingWithConnection = BindingRow & {
   external_account_id: string | null;
   account_name: string | null;
   account_currency: string | null;
+  account_metadata: Record<string, unknown> | null;
 };
 
 export async function listAppBindings(
@@ -320,7 +321,8 @@ export async function listAppBindings(
                     b.role, b.status, b.created_at,
                     c.provider_key, c.category, c.status AS connection_status,
                     c.display_name AS connection_display_name,
-                    a.external_account_id, a.name AS account_name, a.currency AS account_currency
+                    a.external_account_id, a.name AS account_name, a.currency AS account_currency,
+                    a.metadata AS account_metadata
              FROM integration_app_bindings b
              JOIN integration_connections c ON c.id = b.connection_id
              LEFT JOIN integration_accounts a ON a.id = b.integration_account_id

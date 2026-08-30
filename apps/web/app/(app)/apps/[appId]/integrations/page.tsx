@@ -15,7 +15,7 @@ import {
   type ConnectionRow,
   type ProviderCatalogueEntry,
 } from '../../../../../components/integrations';
-import { formatDateTime, relativeTime } from '../../../../../lib/format';
+import { accountLabel, formatDateTime, relativeTime } from '../../../../../lib/format';
 
 type Me = { organizations: Array<{ id: string; name: string; role: string }> };
 
@@ -65,6 +65,7 @@ type IntegrationCard = {
     externalAccountId: string;
     name: string;
     currency: string | null;
+    metadata?: Record<string, unknown> | null;
   } | null;
   capabilities: Capability[];
   credentialConfigured: boolean;
@@ -338,9 +339,16 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ a
                     <dd>
                       {card.account ? (
                         <>
-                          {card.account.name}{' '}
-                          <span className="mono">({card.account.externalAccountId})</span>
+                          {accountLabel({
+                            external_account_id: card.account.externalAccountId,
+                            name: card.account.name,
+                            metadata: card.account.metadata ?? null,
+                          })}
                           {card.account.currency ? ` · ${card.account.currency}` : ''}
+                          <span className="cell-note mono">
+                            {card.providerKey === 'tenjin' ? 'Tenjin app id' : 'provider id'}:{' '}
+                            {card.account.externalAccountId}
+                          </span>
                         </>
                       ) : (
                         'not selected'
