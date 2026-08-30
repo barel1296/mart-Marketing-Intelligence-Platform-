@@ -1351,6 +1351,115 @@ describe('reconciliation', () => {
       expect(coverage.authoritative).toBe(1);
     });
 
+    it('never lets an unusable directory declaration veto a name match', async () => {
+      // The regression this guards, seen on a real account: the MMP publishes
+      // network campaign ids for an ad account MART is not bound to. Those ids
+      // match nothing in MART's structure, so they cannot discriminate between
+      // the campaigns MART does hold - and must not suppress the name evidence
+      // that was working. Treating them as a veto unmatched everything.
+      controls.marketingRows = [
+        {
+          reportDate: '2026-08-28',
+          campaignId: '120250007656600649',
+          campaignName: META_A,
+          spend: 100,
+          impressions: 8000,
+          clicks: 700,
+        },
+      ];
+      controls.attributionRows = [
+        {
+          installDate: '2026-08-28',
+          campaignId: 'b47f71fd-4c12-48ba-b49a-f78e5d7a7fa3',
+          campaignName: `CPI_Broad_US_static (${META_A})`,
+          installs: 300,
+          revenue: 90,
+        },
+      ];
+      // A real id, for a campaign in a different ad account.
+      controls.attributionCampaigns = [
+        {
+          externalCampaignId: 'b47f71fd-4c12-48ba-b49a-f78e5d7a7fa3',
+          name: `CPI_Broad_US_static (${META_A})`,
+          remoteCampaignId: '120254846425720119',
+          channelId: '3',
+          channelName: 'Meta',
+        },
+      ];
+
+      const ctx = await setup();
+      await triggerSync(ctx, '2026-08-28', '2026-08-28');
+      const summary = await reconcile(ctx.user.organizationId, ctx.appId);
+
+      expect(summary.matchedNameEmbedded).toBe(1);
+      expect(summary.unmatchedMarketing).toBe(0);
+      // Reported rather than silently ignored: the MMP said something MART
+      // cannot use, which is not the same as saying nothing.
+      expect(summary.declarationsOutsideStructure).toBe(1);
+
+      const coverage = await campaignCoverage(ctx.user.organizationId, ctx.appId, 'meta_ads', {
+        from: '2026-08-28',
+        to: '2026-08-28',
+        attributionProviderKey: 'appsflyer',
+      });
+      expect(coverage.eligible?.spendPct).toBe(100);
+      expect(coverage.eligible?.mappedPaidInstalls).toBe(300);
+    });
+
+    it('still prefers the declaration when MART holds the campaign it names', async () => {
+      controls.marketingRows = [
+        {
+          reportDate: '2026-08-28',
+          campaignId: '120254846425720119',
+          campaignName: META_A,
+          spend: 100,
+          impressions: 8000,
+          clicks: 700,
+        },
+        {
+          reportDate: '2026-08-28',
+          campaignId: '120254846425690119',
+          campaignName: META_A,
+          spend: 40,
+          impressions: 2000,
+          clicks: 200,
+        },
+      ];
+      controls.attributionRows = [
+        {
+          installDate: '2026-08-28',
+          campaignId: 'b47f71fd-4c12-48ba-b49a-f78e5d7a7fa3',
+          campaignName: `CPI_Broad_US_static (${META_A})`,
+          installs: 300,
+          revenue: 90,
+        },
+      ];
+      controls.attributionCampaigns = [
+        {
+          externalCampaignId: 'b47f71fd-4c12-48ba-b49a-f78e5d7a7fa3',
+          name: `CPI_Broad_US_static (${META_A})`,
+          remoteCampaignId: '120254846425720119',
+          channelId: '3',
+          channelName: 'Meta',
+        },
+      ];
+
+      const ctx = await setup();
+      await triggerSync(ctx, '2026-08-28', '2026-08-28');
+      const summary = await reconcile(ctx.user.organizationId, ctx.appId);
+
+      // The id MART holds wins, and the duplicate-named sibling gets nothing.
+      expect(summary.matchedExact).toBe(1);
+      expect(summary.declarationsOutsideStructure).toBe(0);
+      const mappings = await queryRows<{ source_external_id: string; status: string }>(
+        `SELECT source_external_id, status FROM provider_entity_mappings
+          WHERE app_id = $1 AND source_provider = 'meta_ads' AND target_external_id IS NOT NULL`,
+        [ctx.appId],
+      );
+      expect(mappings).toHaveLength(1);
+      expect(mappings[0]?.source_external_id).toBe('120254846425720119');
+    });
+
     it('does not raise a finding for organic alone', async () => {
       const ctx = await setupRealShape();
       await reconcile(ctx.user.organizationId, ctx.appId);

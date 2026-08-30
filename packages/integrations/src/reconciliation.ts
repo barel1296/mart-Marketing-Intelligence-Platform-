@@ -32,6 +32,13 @@ export type ReconcileSummary = {
   /** Paid attribution campaigns for this network. Organic is counted apart. */
   attributionEntities: number;
   organicEntities: number;
+  /**
+   * Campaign ids the MMP published that MART's marketing structure does not
+   * contain - usually a different ad account, or a structure sync that has not
+   * reached them. Reported rather than silently ignored: it is the difference
+   * between "the MMP said nothing" and "the MMP said something MART cannot use".
+   */
+  declarationsOutsideStructure: number;
   matchedExact: number;
   /** Deterministic matches found inside the MMP's own campaign name. */
   matchedNameEmbedded: number;
@@ -128,6 +135,7 @@ export async function reconcileCampaigns(input: ReconcileInput): Promise<Reconci
        AND external_campaign_id IS NOT NULL`,
     [input.organizationId, input.appId, input.marketingProviderKey],
   );
+  const marketingIds = new Set(marketing.map((row) => row.external_campaign_id));
 
   // Every attribution campaign, with its media source, so organic rows can be
   // recorded as explicitly not-applicable rather than silently dropped. Only
@@ -159,13 +167,24 @@ export async function reconcileCampaigns(input: ReconcileInput): Promise<Reconci
   );
   /** Ad-network campaign id -> the MMP campaign ids that declare it. */
   const byRemoteId = new Map<string, string[]>();
-  /** MMP campaign id -> the network campaign id it declares. */
+  /**
+   * MMP campaign id -> the network campaign id it declares, kept ONLY where
+   * that network campaign is one MART actually holds.
+   *
+   * A declaration naming a campaign MART does not have cannot discriminate
+   * between the campaigns it does have, so it must not be allowed to veto the
+   * name evidence. Treating it as a veto is fail-closed: it silently unmatched
+   * every campaign on an account whose MMP tracks a different ad account than
+   * the one MART is bound to.
+   */
   const declaredRemoteFor = new Map<string, string>();
+  let declarationsOutsideStructure = 0;
   for (const row of directory) {
     const remote = row.remote_campaign_id;
     if (!remote) continue;
     byRemoteId.set(remote, [...(byRemoteId.get(remote) ?? []), row.external_campaign_id]);
-    declaredRemoteFor.set(row.external_campaign_id, remote);
+    if (marketingIds.has(remote)) declaredRemoteFor.set(row.external_campaign_id, remote);
+    else declarationsOutsideStructure += 1;
   }
 
   const organic = allAttribution.filter((row) => isOrganicSource(row.media_source));
@@ -223,6 +242,7 @@ export async function reconcileCampaigns(input: ReconcileInput): Promise<Reconci
     unmatchedMarketing: 0,
     unmatchedAttribution: 0,
     notApplicable: 0,
+    declarationsOutsideStructure: 0,
   };
 
   for (const campaign of marketing) {
@@ -284,6 +304,10 @@ export async function reconcileCampaigns(input: ReconcileInput): Promise<Reconci
     // a candidate for this one, whatever the names say. This is what resolves
     // two network campaigns with identical names: the MMP already told MART
     // which of them each of its campaigns belongs to.
+    // A candidate that already declares a DIFFERENT network campaign MART
+    // holds is not a candidate for this one, whatever the names say: that is
+    // what separates two network campaigns with identical names. A declaration
+    // MART cannot resolve is not in this map at all, so it never vetoes.
     const nameCandidates = (key ? (attributionByName.get(key) ?? []) : []).filter((candidate) => {
       const declaredFor = candidate.external_campaign_id
         ? declaredRemoteFor.get(candidate.external_campaign_id)
@@ -520,6 +544,8 @@ export async function reconcileCampaigns(input: ReconcileInput): Promise<Reconci
       },
     });
   }
+
+  summary.declarationsOutsideStructure = declarationsOutsideStructure;
 
   await mappingsRepo.upsertMappings(input.organizationId, input.appId, mappings);
   await mappingsRepo.pruneStaleMappings(

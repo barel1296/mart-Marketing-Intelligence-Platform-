@@ -286,8 +286,17 @@ provider published, not an inference MART made. Names are only consulted where
 no id was published. A directory refresh that fails degrades matching to names
 with a warning; it never fails the sync.
 
-On the account this was built against this moved spend coverage from 9.9% to
-100%, and authoritative coverage from 0% to a real number for the first time.
+**A declaration MART cannot resolve never vetoes a name match.** If the MMP
+publishes an id for a campaign MART's structure does not contain — a different
+ad account, or a structure sync that has not reached it — that id cannot
+discriminate between the campaigns MART does hold, so the name evidence stands.
+Treating it as a veto is fail-closed and unmatched every campaign on exactly
+that configuration; `declarationsOutsideStructure` on the reconcile summary
+counts them, and the audit CLI prints the directory-to-marketing join so the
+two cases are told apart rather than guessed at.
+
+Where the published ids do resolve, this moves spend coverage from 9.9% to
+100% and gives authoritative coverage a real value for the first time.
 
 ### Events are `not_implemented`, not fresh
 

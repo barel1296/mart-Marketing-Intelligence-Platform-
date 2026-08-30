@@ -180,6 +180,93 @@ async function auditApp(organizationId: string, appId: string, appName: string):
   line('Mapping rows', mappings.length);
   line('Mapped Meta campaigns', mappedMarketingIds.size);
 
+  // ------------------------------------------- the campaign directory ---
+  // Everything needed to tell "the MMP published nothing" from "the MMP
+  // published something MART cannot use" - which look identical on a
+  // dashboard and have completely different fixes.
+  heading('TENJIN CAMPAIGN DIRECTORY');
+  const dirRows = await queryRows<{
+    external_campaign_id: string;
+    name: string | null;
+    remote_campaign_id: string | null;
+    provider_key: string;
+    app_id: string;
+    observed_at: string;
+    meta_hit: string;
+    attribution_hit: string;
+  }>(
+    `SELECT d.external_campaign_id, d.name, d.remote_campaign_id, d.provider_key,
+            d.app_id::text AS app_id, d.observed_at::text AS observed_at,
+            (SELECT count(*)::text FROM marketing_campaigns m
+              WHERE m.organization_id = d.organization_id AND m.app_id = d.app_id
+                AND m.external_campaign_id = d.remote_campaign_id) AS meta_hit,
+            (SELECT count(*)::text FROM attribution_daily_metrics a
+              WHERE a.organization_id = d.organization_id AND a.app_id = d.app_id
+                AND a.provider_key = d.provider_key
+                AND a.external_campaign_id = d.external_campaign_id) AS attribution_hit
+       FROM attribution_campaigns d
+      WHERE d.organization_id = $1 AND d.app_id = $2
+      ORDER BY d.name`,
+    [organizationId, appId],
+  );
+
+  line('rows', dirRows.length);
+  if (dirRows.length === 0) {
+    line('REMOTE IDS PRESENT', 'no - the directory is empty');
+    process.stdout.write(
+      '  The installs sync refreshes it. If it is empty after a sync, either the\n' +
+        '  provider has no /campaigns endpoint, or the refresh failed - check the\n' +
+        '  sync run warnings for "campaign directory".\n',
+    );
+  }
+  for (const row of dirRows.slice(0, 20)) {
+    process.stdout.write('\n');
+    process.stdout.write(`  tenjinCampaignId  ${row.external_campaign_id}\n`);
+    process.stdout.write(`  name              ${row.name ?? '(none)'}\n`);
+    process.stdout.write(`  remoteCampaignId  ${row.remote_campaign_id ?? '(none published)'}\n`);
+    process.stdout.write(`  provider          ${row.provider_key}\n`);
+    process.stdout.write(`  app_id            ${row.app_id}\n`);
+    process.stdout.write(`  refreshed         ${row.observed_at}\n`);
+    process.stdout.write(
+      `  joins to a Meta campaign MART holds?  ${Number(row.meta_hit) > 0 ? 'YES' : 'NO'}\n`,
+    );
+    process.stdout.write(
+      `  joins to attribution rows?            ${Number(row.attribution_hit) > 0 ? 'YES' : 'NO'}\n`,
+    );
+  }
+
+  const withRemote = dirRows.filter((r) => r.remote_campaign_id !== null);
+  const joinToMeta = dirRows.filter((r) => Number(r.meta_hit) > 0);
+  const joinToAttribution = dirRows.filter((r) => Number(r.attribution_hit) > 0);
+
+  process.stdout.write('\n');
+  line('REMOTE IDS PRESENT', withRemote.length > 0 ? `yes (${withRemote.length})` : 'no');
+  line(
+    'ATTRIBUTION <-> DIRECTORY JOIN',
+    dirRows.length === 0
+      ? 'n/a - directory empty'
+      : joinToAttribution.length > 0
+        ? `works (${joinToAttribution.length} of ${dirRows.length})`
+        : 'DOES NOT WORK - no directory campaign id appears in the attribution rows',
+  );
+  line(
+    'DIRECTORY <-> META JOIN',
+    withRemote.length === 0
+      ? 'n/a - no remote ids published'
+      : joinToMeta.length > 0
+        ? `works (${joinToMeta.length} of ${withRemote.length})`
+        : 'DOES NOT WORK - no published id matches a Meta campaign MART holds',
+  );
+  if (withRemote.length > 0 && joinToMeta.length === 0) {
+    process.stdout.write(
+      '\n  The MMP is publishing network campaign ids for campaigns MART does not\n' +
+        '  have. Usually the MMP tracks a different ad account than the one MART is\n' +
+        '  bound to, or the marketing structure sync has not reached them. MART falls\n' +
+        '  back to name matching in this case; a declaration it cannot resolve is\n' +
+        '  never allowed to suppress one.\n',
+    );
+  }
+
   // ---------------------------------------------- unmatched attribution ---
   const organic = attribution.filter((row) => (row.media_source ?? '').toLowerCase() === 'organic');
   const paid = attribution.filter((row) => !organic.includes(row));
