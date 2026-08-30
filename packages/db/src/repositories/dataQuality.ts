@@ -43,6 +43,29 @@ export async function recordDataQualityFindings(
   }
 }
 
+/**
+ * Remove findings for a set of check keys before recomputing them.
+ *
+ * Sync-time findings are an event log: each one belongs to the run that
+ * produced it and is never touched. Reconciliation findings are different -
+ * they describe the *current* state of the join, so re-running reconciliation
+ * must replace them rather than stack another copy of the same sentence.
+ */
+export async function clearDataQualityFindings(
+  organizationId: string,
+  appId: string,
+  checkKeys: readonly string[],
+  client?: Queryable,
+): Promise<void> {
+  if (checkKeys.length === 0) return;
+  await query(
+    `DELETE FROM data_quality_findings
+      WHERE organization_id = $1 AND app_id = $2 AND check_key = ANY($3)`,
+    [organizationId, appId, [...checkKeys]],
+    client,
+  );
+}
+
 export type DataQualityRow = {
   id: string;
   check_key: string;

@@ -15,6 +15,31 @@ import { formatMetric, relativeTime } from '../../../../lib/format';
 
 type Me = { organizations: Array<{ id: string; name: string; role: string }> };
 
+type SyncErrorRow = {
+  error_class: string;
+  user_message: string | null;
+  message: string;
+  occurred_at: string;
+};
+
+/** Mirrors CoverageSummary from @mart/integrations. */
+type CoverageSummary = {
+  total: number;
+  matchedExact: number;
+  matchedConfident: number;
+  matchedNameEmbedded: number;
+  matchedFallback: number;
+  ambiguous: number;
+  unmatched: number;
+  manuallyVerified: number;
+  notApplicable: number;
+  authoritative: number;
+  operational: number;
+  authoritativeCoveragePct: number | null;
+  operationalCoveragePct: number | null;
+  coveragePct: number | null;
+};
+
 type CommandCenter = {
   app: {
     id: string;
@@ -50,13 +75,9 @@ type CommandCenter = {
       created_at: string;
       error_message: string | null;
     }>;
-    recentErrors: Array<{
-      error_class: string;
-      user_message: string | null;
-      message: string;
-      occurred_at: string;
-    }>;
-    mappingCoverage: { coveragePct: number | null; total: number } | null;
+    activeErrors: SyncErrorRow[];
+    resolvedErrors: SyncErrorRow[];
+    mappingCoverage: CoverageSummary | null;
   };
   metrics: MetricValue[];
   timeseries: {
@@ -91,16 +112,7 @@ type CommandCenter = {
     }>;
   };
   reconciliation: {
-    coverage: {
-      total: number;
-      matchedExact: number;
-      matchedConfident: number;
-      matchedFallback: number;
-      ambiguous: number;
-      unmatched: number;
-      manuallyVerified: number;
-      coveragePct: number | null;
-    } | null;
+    coverage: CoverageSummary | null;
     discrepancies: Array<{
       kind: string;
       externalCampaignId: string | null;
@@ -177,6 +189,8 @@ export default async function CommandCenterPage({
   );
 
   const metricByKey = new Map(data.metrics.map((m) => [m.metricKey, m]));
+  // Ordered so the honest denominators sit beside the ratios computed from
+  // them: total installs, then the mapped subset, then the CPI each supports.
   const primaryOrder = [
     'spend',
     'impressions',
@@ -185,9 +199,14 @@ export default async function CommandCenterPage({
     'cpm',
     'cpc',
     'attributed_installs',
-    'reported_cpi',
+    'mapped_paid_installs',
+    'organic_installs',
+    'mapped_cpi',
+    'blended_cpi',
     'attributed_revenue',
+    'mapped_attributed_revenue',
     'mapping_coverage',
+    'operational_mapping_coverage',
     'cohort_roas',
   ];
 
@@ -326,10 +345,12 @@ export default async function CommandCenterPage({
           </table>
         </div>
 
-        {data.dataHealth.recentErrors.length > 0 ? (
+        {/* Active issues only. An error a later successful sync superseded is
+            history and is shown as such, below and clearly labelled. */}
+        {data.dataHealth.activeErrors.length > 0 ? (
           <div className="stack" style={{ marginTop: 12 }}>
-            <h3>Latest sync errors</h3>
-            {data.dataHealth.recentErrors.map((error, index) => (
+            <h3>Active issues</h3>
+            {data.dataHealth.activeErrors.map((error, index) => (
               <div key={index} className="inline-meta">
                 <StatusChip status="error" label={error.error_class} />
                 <span>{error.user_message ?? error.message}</span>
@@ -337,6 +358,26 @@ export default async function CommandCenterPage({
               </div>
             ))}
           </div>
+        ) : (
+          <p className="muted" style={{ marginTop: 12 }}>
+            No active sync issues for this app.
+          </p>
+        )}
+
+        {data.dataHealth.resolvedErrors.length > 0 ? (
+          <details className="stack" style={{ marginTop: 12 }}>
+            <summary>
+              Recently resolved issues ({data.dataHealth.resolvedErrors.length}) — kept for audit,
+              superseded by a later successful sync
+            </summary>
+            {data.dataHealth.resolvedErrors.map((error, index) => (
+              <div key={index} className="inline-meta">
+                <StatusChip status="completed" label={`resolved: ${error.error_class}`} />
+                <span>{error.user_message ?? error.message}</span>
+                <span>{relativeTime(error.occurred_at)}</span>
+              </div>
+            ))}
+          </details>
         ) : null}
       </Card>
 
@@ -493,28 +534,53 @@ export default async function CommandCenterPage({
           />
         ) : (
           <>
+            {/* Two coverage numbers, never averaged into one: they answer
+                different questions and mixing them would let name evidence
+                inflate what MART claims as identity. */}
             <div className="tile-grid">
               <div className="tile">
-                <div className="tile-label">Mapping coverage</div>
+                <div className="tile-label">Authoritative coverage</div>
                 <div className="tile-value">
-                  {data.reconciliation.coverage.coveragePct === null
+                  {data.reconciliation.coverage.authoritativeCoveragePct === null
                     ? '—'
-                    : `${data.reconciliation.coverage.coveragePct}%`}
+                    : `${data.reconciliation.coverage.authoritativeCoveragePct}%`}
                 </div>
                 <div className="tile-meta">
-                  <span>authoritative links only (stable id or verified)</span>
+                  <span>stable id or manually verified</span>
+                </div>
+              </div>
+              <div className="tile">
+                <div className="tile-label">Operational coverage</div>
+                <div className="tile-value">
+                  {data.reconciliation.coverage.operationalCoveragePct === null
+                    ? '—'
+                    : `${data.reconciliation.coverage.operationalCoveragePct}%`}
+                </div>
+                <div className="tile-meta">
+                  <span>+ deterministic high-confidence name matches</span>
                 </div>
               </div>
               {(
                 [
-                  ['Exact id matches', data.reconciliation.coverage.matchedExact, 'matched_exact'],
+                  ['Stable ID matches', data.reconciliation.coverage.matchedExact, 'matched_exact'],
+                  [
+                    'High-confidence name matches',
+                    data.reconciliation.coverage.matchedNameEmbedded,
+                    'matched_fallback',
+                  ],
                   [
                     'Name fallback candidates',
-                    data.reconciliation.coverage.matchedFallback,
+                    data.reconciliation.coverage.matchedFallback -
+                      data.reconciliation.coverage.matchedNameEmbedded,
                     'matched_fallback',
                   ],
                   ['Ambiguous', data.reconciliation.coverage.ambiguous, 'ambiguous'],
                   ['Unmatched', data.reconciliation.coverage.unmatched, 'unmatched'],
+                  [
+                    'Organic / not applicable',
+                    data.reconciliation.coverage.notApplicable,
+                    'not_applicable',
+                  ],
                   [
                     'Manually verified',
                     data.reconciliation.coverage.manuallyVerified,

@@ -8,20 +8,25 @@ where it came from, what date grain it is expressed in, and how fresh it is.
 
 ## The registry
 
-| Key                   | Formula                                                                    | Grain            | Sources                     |
-| --------------------- | -------------------------------------------------------------------------- | ---------------- | --------------------------- |
-| `spend`               | `SUM(spend)`                                                               | report date      | marketing network           |
-| `impressions`         | `SUM(impressions)`                                                         | report date      | marketing network           |
-| `clicks`              | `SUM(clicks)`                                                              | report date      | marketing network           |
-| `link_clicks`         | `SUM(link_clicks)`                                                         | report date      | marketing network           |
-| `ctr`                 | `SUM(clicks) / SUM(impressions)`                                           | report date      | marketing network           |
-| `cpm`                 | `SUM(spend) / SUM(impressions) * 1000`                                     | report date      | marketing network           |
-| `cpc`                 | `SUM(spend) / SUM(clicks)`                                                 | report date      | marketing network           |
-| `attributed_installs` | `SUM(attributed_installs)`                                                 | **install date** | MMP                         |
-| `attributed_revenue`  | `SUM(revenue) WHERE grain = event_date`                                    | **event date**   | MMP                         |
-| `reported_cpi`        | `SUM(spend)[report_date] / SUM(attributed_installs)[install_date]`         | **mixed**        | both                        |
-| `mapping_coverage`    | `(matched_exact + matched_confident + manually_verified) / total_mappings` | n/a              | reconciliation              |
-| `cohort_roas`         | `cumulative_cohort_revenue / cohort_allocated_spend`                       | cohort date      | **unavailable in Phase 0A** |
+| Key                            | Formula                                                                    | Grain            | Sources                     |
+| ------------------------------ | -------------------------------------------------------------------------- | ---------------- | --------------------------- |
+| `spend`                        | `SUM(spend)`                                                               | report date      | marketing network           |
+| `impressions`                  | `SUM(impressions)`                                                         | report date      | marketing network           |
+| `clicks`                       | `SUM(clicks)`                                                              | report date      | marketing network           |
+| `link_clicks`                  | `SUM(link_clicks)`                                                         | report date      | marketing network           |
+| `ctr`                          | `SUM(clicks) / SUM(impressions)`                                           | report date      | marketing network           |
+| `cpm`                          | `SUM(spend) / SUM(impressions) * 1000`                                     | report date      | marketing network           |
+| `cpc`                          | `SUM(spend) / SUM(clicks)`                                                 | report date      | marketing network           |
+| `attributed_installs`          | `SUM(attributed_installs)` — organic included                              | **install date** | MMP                         |
+| `mapped_paid_installs`         | `SUM(attributed_installs)` on mapped campaigns, organic excluded           | **install date** | MMP + reconciliation        |
+| `organic_installs`             | `SUM(attributed_installs) WHERE media_source = organic`                    | **install date** | MMP                         |
+| `attributed_revenue`           | `SUM(revenue) WHERE grain = event_date` — organic included                 | **event date**   | MMP                         |
+| `mapped_attributed_revenue`    | `SUM(revenue)` on mapped campaigns, organic excluded                       | **event date**   | MMP + reconciliation        |
+| `mapped_cpi`                   | `SUM(mapped spend)[report_date] / SUM(mapped installs)[install_date]`      | **mixed**        | both                        |
+| `blended_cpi`                  | `SUM(spend)[report_date] / SUM(all attributed installs)[install_date]`     | **mixed**        | both                        |
+| `mapping_coverage`             | `(matched_exact + matched_confident + manually_verified) / total_mappings` | n/a              | reconciliation              |
+| `operational_mapping_coverage` | `(authoritative + high-confidence name matches) / total_mappings`          | n/a              | reconciliation              |
+| `cohort_roas`                  | `cumulative_cohort_revenue / cohort_allocated_spend`                       | cohort date      | **unavailable in Phase 0A** |
 
 ## Four rules
 
@@ -30,8 +35,22 @@ where it came from, what date grain it is expressed in, and how fresh it is.
 `ctr` over a 30-day range is `SUM(clicks) / SUM(impressions)` over the whole
 range. It is not the mean of thirty daily CTRs. Averaging ratios weights a day
 with 100 impressions the same as a day with 10 million, which is simply a
-different (and wrong) statistic. The same applies to CPM, CPC and reported CPI,
-and to every row of the campaign table.
+different (and wrong) statistic. The same applies to CPM, CPC and both CPI
+figures, and to every row of the campaign table.
+
+### 1a. A ratio's two sides must describe the same population
+
+`mapped_cpi` divides spend on mapped campaigns by installs attributed to those
+same campaigns. `blended_cpi` divides _all_ spend by _all_ attributed installs —
+organic and unmapped included — and is named for what it is. The difference is
+not cosmetic: on a real account with 539 attributed installs of which 79 were
+organic, the two figures were $0.30 and $0.26. The second is a fine blended
+number and a badly wrong CPI, because the denominator contains installs the
+numerator did not buy.
+
+MART therefore never ships a metric called simply "CPI". Every tile says which
+population it describes, and `blended_cpi` renders as `partial` with the organic
+and unmapped counts stated on it whenever they are non-zero.
 
 ### 2. A ratio with a tiny denominator is withheld
 
@@ -105,6 +124,26 @@ division would produce a figure that moves for reasons unrelated to return —
 a spend spike on day 30 makes "ROAS" fall even if every cohort is performing
 identically — and an incorrect ROAS tile is worse than no ROAS tile, because
 someone will spend money on it.
+
+## Two coverage numbers
+
+Reconciliation reports coverage twice, and they are never averaged into one:
+
+| Number                 | Counts                                                     | Used for                             |
+| ---------------------- | ---------------------------------------------------------- | ------------------------------------ |
+| Authoritative coverage | stable id + manually verified                              | whether MART will state identity     |
+| Operational coverage   | authoritative + deterministic high-confidence name matches | whether MART will state a mapped CPI |
+
+The gap between them is the point. On the account this was built against,
+authoritative coverage is 0% — Tenjin campaign ids are Tenjin UUIDs and can
+never equal Meta's — while operational coverage is 100%, because every Tenjin
+campaign name carries the Meta campaign name verbatim in parentheses. A mapped
+CPI is computable and correct; a claim that the two providers share an identity
+is not, and MART makes neither claim on the other's evidence.
+
+Organic is excluded from both denominators. Unpaid traffic belongs to no
+campaign, so counting it as an unmapped gap would make a healthy account look
+broken.
 
 ## Attribution figures in the campaign table
 

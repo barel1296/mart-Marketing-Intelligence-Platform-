@@ -271,11 +271,18 @@ export async function runSync(run: SyncRunRow, request: SyncRequest): Promise<Sy
   }
 
   const status: SyncRunStatus =
-    summary.windowsFailed === 0
-      ? 'completed'
-      : summary.windowsCompleted > 0
+    summary.windowsFailed > 0
+      ? summary.windowsCompleted > 0
         ? 'partially_completed'
-        : 'failed';
+        : 'failed'
+      : // A stream the adapter does not implement, or the provider does not
+        // offer, made no request and moved no rows. Recording it as
+        // 'completed' with zero rows reads as a successful sync of an empty
+        // day, which is not what happened. Freshness keeps the two apart;
+        // for the run, neither is an ingestion.
+        support
+        ? 'not_implemented'
+        : 'completed';
   summary.status = status;
 
   const failure = fatal ? classify(fatal, request.providerKey) : null;
@@ -326,6 +333,18 @@ export async function runSync(run: SyncRunRow, request: SyncRequest): Promise<Sy
     }),
     lastErrorClass: failure?.errorClass ?? null,
   });
+
+  // A successful run supersedes the open errors for this stream. The rows stay
+  // for audit; they simply stop being reported as current problems.
+  if (status === 'completed' || status === 'partially_completed') {
+    await syncRepo.resolveOpenSyncErrors({
+      organizationId: request.organizationId,
+      appId: request.appId,
+      connectionId: request.connectionId,
+      dataType: request.dataType,
+      syncRunId: run.id,
+    });
+  }
 
   if (request.syncJobId) await syncRepo.setSyncJobStatus(request.syncJobId, status);
 

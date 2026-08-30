@@ -38,6 +38,8 @@ export type FakeControls = {
     installs: number;
     country?: string | null;
     revenue?: number;
+    /** Defaults to the paid network. Set 'Organic' to exercise unpaid traffic. */
+    mediaSource?: string;
   }>;
   /** Windows (from..to) that should fail, to exercise partial completion. */
   failWindows: Set<string>;
@@ -273,7 +275,7 @@ class FakeAttributionProvider implements AttributionProvider {
       if (!latest || row.installDate > latest) latest = row.installDate;
       return {
         installDate: row.installDate,
-        mediaSource: 'facebook',
+        mediaSource: row.mediaSource ?? 'facebook',
         externalCampaignId: row.campaignId,
         campaignName: row.campaignName,
         externalAdGroupId: null,
@@ -300,14 +302,16 @@ class FakeAttributionProvider implements AttributionProvider {
     };
   }
 
+  /** Mirrors the real Tenjin adapter: no event source, and it says so. */
   async syncEvents(): Promise<SyncResult<CanonicalAttributionBatch>> {
     return {
       batch: { installs: [], events: [], revenue: [] },
       pagesFetched: 0,
       rowsFetched: 0,
       rowsRejected: 0,
-      warnings: [],
+      warnings: ['This fake provider implements no in-app event source.'],
       latestDataDate: null,
+      support: 'not_implemented',
     };
   }
 
@@ -322,7 +326,7 @@ class FakeAttributionProvider implements AttributionProvider {
       // Event-date grain: revenue on the day it happened, never cohort LTV.
       grain: 'event_date' as const,
       revenueType: 'iap' as const,
-      mediaSource: 'facebook',
+      mediaSource: row.mediaSource ?? 'facebook',
       externalCampaignId: row.campaignId,
       campaignName: row.campaignName,
       country: row.country ?? null,

@@ -134,8 +134,9 @@ export const METRIC_DEFINITIONS: readonly MetricDefinition[] = [
   },
   {
     metricKey: 'attributed_installs',
-    displayName: 'Attributed installs',
-    description: 'Installs attributed by the app primary attribution provider.',
+    displayName: 'Total attributed installs',
+    description:
+      'Every install the attribution provider attributed, organic included. This is the whole denominator, not the paid one.',
     formula: 'SUM(attributed_installs)',
     grain: {
       primary: 'install_date',
@@ -149,9 +150,9 @@ export const METRIC_DEFINITIONS: readonly MetricDefinition[] = [
   },
   {
     metricKey: 'attributed_revenue',
-    displayName: 'Attributed revenue',
+    displayName: 'Total attributed revenue',
     description:
-      'Revenue attributed by the MMP, recognized on the date it occurred. This is not cohort LTV.',
+      'All revenue attributed by the MMP, organic included, recognized on the date it occurred. This is not cohort LTV, and it must not be read as revenue from the marketing network.',
     formula: 'SUM(revenue) WHERE grain = event_date',
     grain: {
       primary: 'event_date',
@@ -164,16 +165,63 @@ export const METRIC_DEFINITIONS: readonly MetricDefinition[] = [
     maxAcceptableStalenessMinutes: 48 * 60,
   },
   {
-    metricKey: 'reported_cpi',
-    displayName: 'Reported CPI',
+    metricKey: 'mapped_paid_installs',
+    displayName: 'Mapped paid installs',
     description:
-      'Network spend divided by MMP-attributed installs over the same calendar dates. The numerator is report-date grain and the denominator is install-date grain, so this is a reported figure, not cohort CPI.',
+      'Installs on attribution campaigns that resolve to a campaign in the marketing network, by stable id, human verification, or a deterministic high-confidence name match. Organic is excluded.',
+    formula: 'SUM(attributed_installs) WHERE campaign is mapped AND media_source <> organic',
+    grain: {
+      primary: 'install_date',
+      note: 'Install-date grain, restricted to campaigns with a usable mapping.',
+    },
+    sources: ['attribution', 'mapping'],
+    requiredCapabilities: ['attributed_installs'],
+    minimumDenominator: 0,
+    format: 'integer',
+    maxAcceptableStalenessMinutes: 24 * 60,
+  },
+  {
+    metricKey: 'organic_installs',
+    displayName: 'Organic installs',
+    description:
+      'Installs the attribution provider reported as organic. Unpaid traffic: never part of a paid campaign CPI or ROAS, and never a mapping gap.',
+    formula: 'SUM(attributed_installs) WHERE media_source = organic',
+    grain: { primary: 'install_date', note: 'Install-date grain.' },
+    sources: ['attribution'],
+    requiredCapabilities: ['attributed_installs'],
+    minimumDenominator: 0,
+    format: 'integer',
+    maxAcceptableStalenessMinutes: 24 * 60,
+  },
+  {
+    metricKey: 'mapped_cpi',
+    displayName: 'Mapped CPI',
+    description:
+      'Spend on mapped marketing campaigns divided by the installs attributed to those same campaigns. Both sides describe the same set of campaigns, which is what makes this a CPI rather than a ratio of two unrelated totals.',
     formula:
-      'SUM(marketing.spend) [report_date] / SUM(attribution.attributed_installs) [install_date]',
+      'SUM(marketing.spend WHERE campaign mapped) [report_date] / SUM(attribution.attributed_installs WHERE campaign mapped) [install_date]',
     grain: {
       primary: 'report_date',
       mixed: ['report_date', 'install_date'],
-      note: 'Mixed grain. Numerator is report-date spend; denominator is install-date attributed installs. Valid as a reported operational figure only - not cohort CPI.',
+      note: 'Mixed grain. Numerator is report-date spend; denominator is install-date attributed installs. An operational figure, not cohort CPI.',
+    },
+    sources: ['marketing', 'attribution', 'mapping'],
+    requiredCapabilities: ['cost_data', 'attributed_installs'],
+    minimumDenominator: 25,
+    format: 'currency',
+    maxAcceptableStalenessMinutes: 24 * 60,
+  },
+  {
+    metricKey: 'blended_cpi',
+    displayName: 'Blended CPI (incl. organic/unmapped)',
+    description:
+      'All network spend divided by ALL attributed installs, including organic and installs on campaigns MART cannot map. Useful as a blended figure and not comparable to a campaign CPI: the denominator contains installs the numerator did not buy.',
+    formula:
+      'SUM(marketing.spend) [report_date] / SUM(attribution.attributed_installs, organic included) [install_date]',
+    grain: {
+      primary: 'report_date',
+      mixed: ['report_date', 'install_date'],
+      note: 'Mixed grain, and a mixed population: the denominator includes organic and unmapped installs. This is not cohort CPI, and it is not campaign CPI either - never present it as CPI.',
     },
     sources: ['marketing', 'attribution'],
     requiredCapabilities: ['cost_data', 'attributed_installs'],
@@ -182,11 +230,43 @@ export const METRIC_DEFINITIONS: readonly MetricDefinition[] = [
     maxAcceptableStalenessMinutes: 24 * 60,
   },
   {
-    metricKey: 'mapping_coverage',
-    displayName: 'Mapping coverage',
+    metricKey: 'mapped_attributed_revenue',
+    displayName: 'Mapped attributed revenue',
     description:
-      'Share of marketing-network campaigns linked to an attribution campaign by stable id or human verification. Name-based fallbacks are excluded.',
+      'Revenue on attribution campaigns that resolve to a marketing campaign. Organic and unmapped revenue are excluded, so this is the only revenue figure that may be compared against network spend.',
+    formula: 'SUM(revenue) WHERE grain = event_date AND campaign is mapped AND not organic',
+    grain: {
+      primary: 'event_date',
+      note: 'Event-date grain: revenue recorded on the day it happened, restricted to mapped campaigns.',
+    },
+    sources: ['attribution', 'mapping'],
+    requiredCapabilities: ['attributed_revenue'],
+    minimumDenominator: 0,
+    format: 'currency',
+    maxAcceptableStalenessMinutes: 48 * 60,
+  },
+  {
+    metricKey: 'mapping_coverage',
+    displayName: 'Authoritative mapping coverage',
+    description:
+      'Share of marketing-network campaigns linked to an attribution campaign by stable id or human verification. Every name-based match is excluded, however deterministic.',
     formula: '(matched_exact + matched_confident + manually_verified) / total_campaign_mappings',
+    grain: {
+      primary: 'report_date',
+      note: 'Not a time-series metric; computed over current entities.',
+    },
+    sources: ['mapping'],
+    requiredCapabilities: [],
+    minimumDenominator: 1,
+    format: 'percent',
+    maxAcceptableStalenessMinutes: 24 * 60,
+  },
+  {
+    metricKey: 'operational_mapping_coverage',
+    displayName: 'Operational mapping coverage',
+    description:
+      'Authoritative mappings plus deterministic high-confidence name matches - the share of campaigns MART can report a mapped CPI for. Reported separately from authoritative coverage and never merged with it.',
+    formula: '(authoritative + high_confidence_name_matches) / total_campaign_mappings',
     grain: {
       primary: 'report_date',
       note: 'Not a time-series metric; computed over current entities.',

@@ -29,6 +29,7 @@ function context(overrides: Partial<MetricContext> = {}): MetricContext {
 
 const marketing = {
   spend: 1000,
+  mappedSpend: 800,
   impressions: 500_000,
   clicks: 10_000,
   linkClicks: 8_000,
@@ -40,6 +41,11 @@ const marketing = {
 const attribution = {
   attributedInstalls: 400,
   attributedRevenue: 250,
+  mappedPaidInstalls: 300,
+  mappedAttributedRevenue: 180,
+  organicInstalls: 100,
+  organicRevenue: 70,
+  unmappedPaidInstalls: 0,
   rows: 20,
   latestInstallDate: '2026-08-26',
   latestRevenueDate: '2026-08-26',
@@ -73,8 +79,62 @@ describe('metric arithmetic', () => {
     expect(metric('cpc').value).toBeCloseTo(1000 / 10_000, 10);
   });
 
-  it('computes reported CPI as spend / attributed installs', () => {
-    expect(metric('reported_cpi').value).toBeCloseTo(1000 / 400, 10);
+  it('computes blended CPI as all spend / all attributed installs', () => {
+    expect(metric('blended_cpi').value).toBeCloseTo(1000 / 400, 10);
+  });
+
+  /**
+   * The regression this guards: dividing network spend by every attributed
+   * install - organic included - and calling the result CPI. Both sides of a
+   * mapped CPI must describe the same campaigns.
+   */
+  it('computes mapped CPI from mapped spend over mapped paid installs only', () => {
+    expect(metric('mapped_cpi').value).toBeCloseTo(800 / 300, 10);
+    expect(metric('mapped_cpi').value).not.toBeCloseTo(1000 / 400, 10);
+  });
+
+  it('never lets organic installs into a mapped figure', () => {
+    const mapped = metric('mapped_paid_installs');
+    expect(mapped.value).toBe(300);
+    expect(metric('organic_installs').value).toBe(100);
+    expect(metric('attributed_installs').value).toBe(400);
+  });
+
+  it('labels blended CPI as blended, and says what is in the denominator', () => {
+    const blended = metric('blended_cpi', context(), marketing, {
+      ...attribution,
+      unmappedPaidInstalls: 20,
+    });
+    expect(blended.displayName).toMatch(/blended/i);
+    expect(blended.availability).toBe('partial');
+    expect(blended.reason).toMatch(/organic/i);
+    expect(blended.reason).toMatch(/unmapped/i);
+  });
+
+  it('refuses a mapped CPI when nothing is mapped, and says why', () => {
+    const cpi = metric('mapped_cpi', context(), marketing, {
+      ...attribution,
+      mappedPaidInstalls: 0,
+      unmappedPaidInstalls: 300,
+    });
+    expect(cpi.value).toBeNull();
+    expect(cpi.availability).toBe('unavailable');
+    expect(cpi.reason).toMatch(/no attribution campaign is mapped/i);
+  });
+
+  it('marks a mapped CPI partial while paid installs remain unmapped', () => {
+    const cpi = metric('mapped_cpi', context(), marketing, {
+      ...attribution,
+      unmappedPaidInstalls: 40,
+    });
+    expect(cpi.value).toBeCloseTo(800 / 300, 10);
+    expect(cpi.availability).toBe('partial');
+    expect(cpi.reason).toMatch(/40 paid install/i);
+  });
+
+  it('keeps total and mapped revenue apart', () => {
+    expect(metric('attributed_revenue').value).toBe(250);
+    expect(metric('mapped_attributed_revenue').value).toBe(180);
   });
 
   /**
@@ -112,8 +172,8 @@ describe('metric arithmetic', () => {
     expect(cpc.reason).toMatch(/zero/i);
   });
 
-  it('reports reported CPI as unavailable below the install minimum', () => {
-    const cpi = metric('reported_cpi', context(), marketing, {
+  it('reports blended CPI as unavailable below the install minimum', () => {
+    const cpi = metric('blended_cpi', context(), marketing, {
       ...attribution,
       attributedInstalls: 5,
     });
@@ -123,11 +183,13 @@ describe('metric arithmetic', () => {
 });
 
 describe('grain safety', () => {
-  it('labels reported CPI as a mixed-grain figure and not cohort CPI', () => {
-    const definition = getMetricDefinition('reported_cpi');
-    expect(definition?.grain.mixed).toEqual(['report_date', 'install_date']);
-    expect(definition?.grain.note).toMatch(/not cohort CPI/i);
-    expect(definition?.displayName).not.toMatch(/cohort/i);
+  it('labels both CPI figures as mixed-grain and not cohort CPI', () => {
+    for (const key of ['mapped_cpi', 'blended_cpi']) {
+      const definition = getMetricDefinition(key);
+      expect(definition?.grain.mixed, key).toEqual(['report_date', 'install_date']);
+      expect(definition?.grain.note, key).toMatch(/not cohort CPI/i);
+      expect(definition?.displayName, key).not.toMatch(/cohort/i);
+    }
   });
 
   it('never returns a cohort ROAS value in this phase', () => {
@@ -195,7 +257,7 @@ describe('availability gating', () => {
   it('carries provider provenance on every value', () => {
     expect(metric('spend').providers).toEqual(['meta_ads']);
     expect(metric('attributed_installs').providers).toEqual(['appsflyer']);
-    expect(metric('reported_cpi').providers).toEqual(['meta_ads', 'appsflyer']);
+    expect(metric('blended_cpi').providers).toEqual(['meta_ads', 'appsflyer']);
   });
 });
 

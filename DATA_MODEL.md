@@ -115,18 +115,41 @@ fact table, and the same uniqueness rule.
 
 ```
 entity_type, source_provider, source_external_id, target_provider, target_external_id,
-method (stable_external_id | tracking_parameter | name_fallback | manual),
+method (stable_external_id | tracking_parameter | explicit_provider_mapping |
+        provider_name_embedding | name_fallback | manual | not_applicable),
 confidence, status (see below), candidates jsonb, evidence jsonb,
 verified_by_user_id, verified_at
 ```
 
 Statuses: `matched_exact`, `matched_confident`, `matched_fallback`, `ambiguous`,
-`unmatched`, `manually_verified`, `rejected`. Only the first two plus
-`manually_verified` are treated as authoritative.
+`unmatched`, `manually_verified`, `rejected`, `not_applicable`. Only the first
+two plus `manually_verified` are treated as authoritative.
+
+The uniqueness key includes `target_external_id` (`NULLS NOT DISTINCT`), because
+one marketing campaign legitimately has several attribution campaigns beneath
+it — a static and a video creative of the same Meta campaign. Keying without the
+target let the second overwrite the first, and its installs vanished from every
+mapped figure. Recomputed mappings that a later run no longer produces are
+pruned; `manually_verified` and `rejected` rows are never touched, because they
+record what a person decided rather than what a matcher derived.
+
+`provider_name_embedding` is the deterministic case where one provider's
+campaign name appears verbatim inside the other's — Tenjin names a campaign
+`CPI_Broad_US_static (FB_Reveal_Rush_CPI_Broad_US_26/08/26)`. It is an exact
+substring match after conservative normalization, not a resemblance, so it
+carries high confidence — and it is still a name, so it stays out of
+authoritative coverage. `not_applicable` marks organic attribution: unpaid
+traffic that belongs to no paid campaign and must never become a candidate for
+one.
 
 `data_quality_findings` records deterministic checks run during every sync
 (missing campaign id, spend without delivery, zero-impression spend, currency
-mismatch, gap in a date range), each with a severity and enough detail to act on.
+mismatch, gap in a date range), each with a severity and enough detail to act
+on. Reconciliation adds three of its own (`reconciliation.*`) describing the
+join rather than a payload: paid spend with insufficient mapping coverage,
+attributed campaigns with no marketing mapping, and ambiguous name matches.
+Those three are recomputed on every reconciliation run rather than appended,
+because they describe the current state of the join, not an event.
 
 ## Restatement detection
 

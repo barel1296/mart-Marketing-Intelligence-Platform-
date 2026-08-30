@@ -71,10 +71,11 @@ export function statusTone(status: string | null | undefined): string {
     case 'disconnected':
     case 'unavailable':
       return 'chip-critical';
-    // Neither good nor bad: nobody expects data from these streams. They are
-    // deliberately not green - a stream MART never fetched is not fresh.
+    // Neither good nor bad. Nobody expects data from these streams, and
+    // organic is correctly unmapped rather than a gap.
     case 'unsupported':
     case 'not_implemented':
+    case 'not_applicable':
       return 'chip-neutral';
     default:
       return 'chip-neutral';

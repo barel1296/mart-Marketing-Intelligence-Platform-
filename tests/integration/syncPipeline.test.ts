@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { queryRows, syncRepo, toNumber } from '@mart/db';
+import { campaignCoverage } from '@mart/integrations';
 import {
   closeServer,
   connectProvider,
@@ -650,6 +651,260 @@ describe('reconciliation', () => {
     expect(after[0]?.status).toBe('manually_verified');
     expect(after[0]?.target_external_id).toBe('manual-777');
   });
+
+  /**
+   * The real Reveal Rush shape: two Tenjin creative campaigns naming one Meta
+   * campaign in parentheses, plus organic. Before this, every one of these was
+   * unmatched and mapping coverage was 0%.
+   */
+  describe('real Meta <-> Tenjin campaign names', () => {
+    const META_A = 'FB_Reveal_Rush_CPI_Broad_US_26/08/26';
+    const META_B = 'FB_Reveal_Rush_CPI_Broad_US_NEW_CR__29/08/26';
+
+    async function setupRealShape(): Promise<Awaited<ReturnType<typeof setup>>> {
+      controls.marketingRows = [
+        {
+          reportDate: '2026-08-28',
+          campaignId: '1201',
+          campaignName: META_A,
+          spend: 100,
+          impressions: 8000,
+          clicks: 700,
+        },
+        {
+          reportDate: '2026-08-28',
+          campaignId: '1202',
+          campaignName: META_B,
+          spend: 40,
+          impressions: 2472,
+          clicks: 297,
+        },
+      ];
+      controls.attributionRows = [
+        // Tenjin campaign ids are Tenjin UUIDs: they can never match Meta's.
+        {
+          installDate: '2026-08-28',
+          campaignId: 'b47f71fd-4c12-48ba-b49a-f78e5d7a7fa3',
+          campaignName: `CPI_Broad_US_static (${META_A})`,
+          installs: 300,
+          revenue: 90,
+        },
+        {
+          installDate: '2026-08-28',
+          campaignId: '943503fc-90b2-4d50-b17a-4bdd53b9b887',
+          campaignName: `CPI_Broad_US_video (${META_A})`,
+          installs: 100,
+          revenue: 30,
+        },
+        {
+          installDate: '2026-08-28',
+          campaignId: '3f4f0f78-ae3b-4233-8a73-12a3e3a44265',
+          campaignName: `New App promotion Ad Set (${META_B})`,
+          installs: 60,
+          revenue: 12,
+        },
+        // Organic: Tenjin reports the app's own UUID as the campaign id.
+        {
+          installDate: '2026-08-28',
+          campaignId: 'b6861802-21c7-4e6f-994d-44783bbda367',
+          campaignName: 'Organic',
+          installs: 79,
+          revenue: 20,
+          mediaSource: 'Organic',
+        },
+      ];
+      const ctx = await setup();
+      await triggerSync(ctx, '2026-08-28', '2026-08-28');
+      return ctx;
+    }
+
+    it('maps many Tenjin campaigns to one Meta campaign by embedded name', async () => {
+      const ctx = await setupRealShape();
+      const summary = await reconcile(ctx.user.organizationId, ctx.appId);
+
+      // Two Tenjin campaigns naming META_A plus one naming META_B.
+      expect(summary.matchedNameEmbedded).toBe(3);
+      expect(summary.matchedExact).toBe(0);
+      expect(summary.unmatchedMarketing).toBe(0);
+      expect(summary.ambiguous).toBe(0);
+
+      const mappings = await queryRows<{
+        source_name: string;
+        target_name: string;
+        status: string;
+        mapping_method: string;
+        mapping_confidence: string;
+      }>(
+        `SELECT source_name, target_name, status, mapping_method, mapping_confidence
+           FROM provider_entity_mappings
+          WHERE app_id = $1 AND source_provider = 'meta_ads'
+          ORDER BY source_name, target_name`,
+        [ctx.appId],
+      );
+
+      // Many-to-one is aggregation, not ambiguity: both creatives map.
+      const forA = mappings.filter((m) => m.source_name === META_A);
+      expect(forA).toHaveLength(2);
+      expect(forA.map((m) => m.target_name).sort()).toEqual([
+        `CPI_Broad_US_static (${META_A})`,
+        `CPI_Broad_US_video (${META_A})`,
+      ]);
+
+      for (const mapping of mappings) {
+        expect(mapping.mapping_method).toBe('provider_name_embedding');
+        // High confidence, and deliberately not authoritative.
+        expect(Number(mapping.mapping_confidence)).toBe(0.9);
+        expect(mapping.status).toBe('matched_fallback');
+        expect(mapping.status).not.toBe('matched_exact');
+      }
+    });
+
+    it('never makes organic a candidate for a paid campaign', async () => {
+      const ctx = await setupRealShape();
+      const summary = await reconcile(ctx.user.organizationId, ctx.appId);
+      expect(summary.organicEntities).toBe(1);
+      expect(summary.notApplicable).toBe(1);
+
+      const organic = await queryRows<{
+        status: string;
+        mapping_method: string;
+        target_external_id: string | null;
+      }>(
+        `SELECT status, mapping_method, target_external_id FROM provider_entity_mappings
+          WHERE app_id = $1 AND source_name = 'Organic'`,
+        [ctx.appId],
+      );
+      expect(organic).toHaveLength(1);
+      expect(organic[0]?.status).toBe('not_applicable');
+      expect(organic[0]?.mapping_method).toBe('not_applicable');
+      expect(organic[0]?.target_external_id).toBeNull();
+
+      // And it is nowhere in any Meta campaign's candidate set.
+      const meta = await queryRows<{ target_name: string | null }>(
+        `SELECT target_name FROM provider_entity_mappings
+          WHERE app_id = $1 AND source_provider = 'meta_ads'`,
+        [ctx.appId],
+      );
+      expect(meta.every((m) => m.target_name !== 'Organic')).toBe(true);
+    });
+
+    it('reports authoritative and operational coverage as separate numbers', async () => {
+      const ctx = await setupRealShape();
+      await reconcile(ctx.user.organizationId, ctx.appId);
+      const coverage = await campaignCoverage(ctx.user.organizationId, ctx.appId, 'meta_ads');
+
+      // Nothing shares a stable id, so nothing is authoritative.
+      expect(coverage.authoritativeCoveragePct).toBe(0);
+      // Everything resolves deterministically, so operations can proceed.
+      expect(coverage.operationalCoveragePct).toBe(100);
+      expect(coverage.matchedNameEmbedded).toBe(3);
+      expect(coverage.coveragePct).toBe(coverage.authoritativeCoveragePct);
+    });
+
+    it('keeps organic out of mapped installs, revenue and CPI', async () => {
+      const ctx = await setupRealShape();
+      await reconcile(ctx.user.organizationId, ctx.appId);
+
+      const payload = await request(
+        ctx.user,
+        'GET',
+        `/api/v1/organizations/${ctx.user.organizationId}/apps/${ctx.appId}/command-center?from=2026-08-28&to=2026-08-28`,
+      );
+      const metrics = new Map(
+        (
+          payload.json() as { metrics: Array<{ metricKey: string; value: number | null }> }
+        ).metrics.map((m) => [m.metricKey, m]),
+      );
+
+      // 300 + 100 + 60 paid, 79 organic.
+      expect(metrics.get('attributed_installs')?.value).toBe(539);
+      expect(metrics.get('mapped_paid_installs')?.value).toBe(460);
+      expect(metrics.get('organic_installs')?.value).toBe(79);
+
+      // Mapped CPI divides mapped spend by mapped installs - the same
+      // campaigns on both sides. The blended figure is a different number and
+      // is labelled as one.
+      expect(metrics.get('mapped_cpi')?.value).toBeCloseTo(140 / 460, 10);
+      expect(metrics.get('blended_cpi')?.value).toBeCloseTo(140 / 539, 10);
+
+      // Revenue: 90 + 30 + 12 mapped, 20 organic.
+      expect(metrics.get('attributed_revenue')?.value).toBe(152);
+      expect(metrics.get('mapped_attributed_revenue')?.value).toBe(132);
+    });
+
+    it('raises a data-quality finding while paid spend is unmapped, and clears it once mapped', async () => {
+      controls.marketingRows = [
+        {
+          reportDate: '2026-08-28',
+          campaignId: '1201',
+          campaignName: META_A,
+          spend: 140,
+          impressions: 10472,
+          clicks: 997,
+        },
+      ];
+      // A Tenjin campaign that names no Meta campaign: nothing can map.
+      controls.attributionRows = [
+        {
+          installDate: '2026-08-28',
+          campaignId: 'b47f71fd-4c12-48ba-b49a-f78e5d7a7fa3',
+          campaignName: 'Some unrelated Tenjin campaign',
+          installs: 539,
+          revenue: 152,
+        },
+      ];
+      const ctx = await setup();
+      await triggerSync(ctx, '2026-08-28', '2026-08-28');
+      await reconcile(ctx.user.organizationId, ctx.appId);
+
+      const findings = await queryRows<{ check_key: string; severity: string; message: string }>(
+        `SELECT check_key, severity, message FROM data_quality_findings
+          WHERE app_id = $1 AND check_key LIKE 'reconciliation.%'`,
+        [ctx.appId],
+      );
+      const spendFinding = findings.find(
+        (f) => f.check_key === 'reconciliation.paid_spend_without_mapping',
+      );
+      expect(spendFinding?.severity).toBe('error');
+      expect(spendFinding?.message).toMatch(/no campaign maps to attribution/i);
+
+      // Now give the MMP the embedded name and reconcile again: the finding
+      // describes the current join, so it must not linger.
+      controls.attributionRows = [
+        {
+          installDate: '2026-08-28',
+          campaignId: 'b47f71fd-4c12-48ba-b49a-f78e5d7a7fa3',
+          campaignName: `CPI_Broad_US_static (${META_A})`,
+          installs: 539,
+          revenue: 152,
+        },
+      ];
+      await triggerSync(ctx, '2026-08-28', '2026-08-28');
+      await reconcile(ctx.user.organizationId, ctx.appId);
+
+      const after = await queryRows<{ check_key: string }>(
+        `SELECT check_key FROM data_quality_findings
+          WHERE app_id = $1 AND check_key = 'reconciliation.paid_spend_without_mapping'`,
+        [ctx.appId],
+      );
+      expect(after).toHaveLength(0);
+    });
+
+    it('does not raise a finding for organic alone', async () => {
+      const ctx = await setupRealShape();
+      await reconcile(ctx.user.organizationId, ctx.appId);
+      const findings = await queryRows<{ check_key: string; message: string }>(
+        `SELECT check_key, message FROM data_quality_findings
+          WHERE app_id = $1 AND check_key LIKE 'reconciliation.%'`,
+        [ctx.appId],
+      );
+      // Everything paid is mapped; organic is not a problem to report.
+      expect(findings.map((f) => f.check_key)).not.toContain(
+        'reconciliation.paid_spend_without_mapping',
+      );
+      expect(findings.every((f) => !/organic/i.test(f.message))).toBe(true);
+    });
+  });
 });
 
 describe('dashboard data', () => {
@@ -696,8 +951,8 @@ describe('dashboard data', () => {
     expect(metrics.get('cpm')?.value).toBeCloseTo((250 / 50_000) * 1000, 10);
     expect(metrics.get('cpc')?.value).toBeCloseTo(250 / 900, 10);
     expect(metrics.get('attributed_installs')?.value).toBe(100);
-    expect(metrics.get('reported_cpi')?.value).toBeCloseTo(250 / 100, 10);
-    expect(metrics.get('reported_cpi')?.grain.mixed).toEqual(['report_date', 'install_date']);
+    expect(metrics.get('blended_cpi')?.value).toBeCloseTo(250 / 100, 10);
+    expect(metrics.get('blended_cpi')?.grain.mixed).toEqual(['report_date', 'install_date']);
   });
 
   it('refuses to present cohort ROAS', async () => {
@@ -875,3 +1130,87 @@ async function countFacts(appId: string): Promise<Record<string, number>> {
   }
   return out;
 }
+
+describe('sync run honesty', () => {
+  beforeAll(() => installFakeProviders());
+  afterAll(async () => {
+    removeFakeProviders();
+    await closeServer();
+  });
+  beforeEach(async () => {
+    await truncateAll();
+    resetControls();
+    controls.marketingRows = structuredClone(BASE_MARKETING);
+    controls.attributionRows = structuredClone(BASE_ATTRIBUTION);
+  });
+
+  it('records an unimplemented stream as not_implemented, never as a completed sync', async () => {
+    const ctx = await setup();
+    await triggerSync(ctx, '2026-08-20', '2026-08-21');
+
+    const runs = await queryRows<{ data_type: string; status: string; rows_normalized: string }>(
+      `SELECT data_type, status, rows_normalized::text FROM sync_runs WHERE app_id = $1`,
+      [ctx.appId],
+    );
+    const events = runs.find((r) => r.data_type === 'attribution_events');
+    // The misleading state this replaces: "completed / 0 rows" for a stream
+    // that never made a request.
+    expect(events?.status).toBe('not_implemented');
+    expect(events?.status).not.toBe('completed');
+
+    // Streams that really did ingest are unaffected.
+    expect(runs.find((r) => r.data_type === 'attribution_installs')?.status).toBe('completed');
+
+    const freshness = await queryRows<{ data_type: string; status: string }>(
+      `SELECT data_type, status FROM data_freshness WHERE app_id = $1`,
+      [ctx.appId],
+    );
+    expect(freshness.find((f) => f.data_type === 'attribution_events')?.status).toBe(
+      'not_implemented',
+    );
+  });
+
+  it('stops presenting an error as current once a later sync succeeds, without deleting it', async () => {
+    const ctx = await setup();
+    // First run fails on a window.
+    controls.failWindows = new Set(['2026-08-20..2026-08-21']);
+    controls.failureClass = 'invalid_request';
+    await triggerSync(ctx, '2026-08-20', '2026-08-21');
+
+    const active = await syncRepo.listRecentSyncErrors(ctx.user.organizationId, {
+      appId: ctx.appId,
+      resolved: false,
+    });
+    expect(active.length).toBeGreaterThan(0);
+
+    // Second run succeeds for the same app/provider/stream.
+    controls.failWindows = new Set();
+    await triggerSync(ctx, '2026-08-20', '2026-08-21');
+
+    const stillActive = await syncRepo.listRecentSyncErrors(ctx.user.organizationId, {
+      appId: ctx.appId,
+      resolved: false,
+    });
+    const resolved = await syncRepo.listRecentSyncErrors(ctx.user.organizationId, {
+      appId: ctx.appId,
+      resolved: true,
+    });
+    expect(stillActive).toHaveLength(0);
+    // Audit history is kept: the row moved, it did not disappear.
+    expect(resolved.length).toBeGreaterThan(0);
+    expect(resolved[0]?.resolved_by_sync_run_id).not.toBeNull();
+
+    const payload = await request(
+      ctx.user,
+      'GET',
+      `/api/v1/organizations/${ctx.user.organizationId}/apps/${ctx.appId}/command-center?from=2026-08-20&to=2026-08-21`,
+    );
+    const health = (
+      payload.json() as {
+        dataHealth: { activeErrors: unknown[]; resolvedErrors: unknown[] };
+      }
+    ).dataHealth;
+    expect(health.activeErrors).toHaveLength(0);
+    expect(health.resolvedErrors.length).toBeGreaterThan(0);
+  });
+});

@@ -418,10 +418,21 @@ export async function registerAnalyticsRoutes(server: FastifyInstance): Promise<
           : Promise.resolve([]),
       ]);
 
-      const recentErrors = await syncRepo.listRecentSyncErrors(context.organizationId, {
-        appId: app.id,
-        limit: 5,
-      });
+      // Active and resolved are separated rather than merged: an error a later
+      // successful sync superseded is history, and presenting it beside a
+      // working stream reads as a current outage.
+      const [activeErrors, resolvedErrors] = await Promise.all([
+        syncRepo.listRecentSyncErrors(context.organizationId, {
+          appId: app.id,
+          limit: 5,
+          resolved: false,
+        }),
+        syncRepo.listRecentSyncErrors(context.organizationId, {
+          appId: app.id,
+          limit: 5,
+          resolved: true,
+        }),
+      ]);
 
       // Provenance for every number on this page: which provider account it came
       // from, and whether that provider's requests go to the real service or to a
@@ -458,7 +469,8 @@ export async function registerAnalyticsRoutes(server: FastifyInstance): Promise<
           })),
           freshness,
           recentRuns: runs,
-          recentErrors,
+          activeErrors,
+          resolvedErrors,
           mappingCoverage: coverage,
         },
         metrics,

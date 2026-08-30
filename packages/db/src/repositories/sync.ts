@@ -341,16 +341,19 @@ export type SyncErrorRow = {
   retryable: boolean;
   window_start: string | null;
   window_end: string | null;
+  resolved_at: string | null;
+  resolved_by_sync_run_id: string | null;
 };
 
 export async function listRecentSyncErrors(
   organizationId: string,
-  filter: { appId?: string; limit?: number },
+  filter: { appId?: string; limit?: number; resolved?: boolean },
   client?: Queryable,
 ): Promise<SyncErrorRow[]> {
   const params: unknown[] = [organizationId];
   let sql = `SELECT e.id, e.sync_run_id, e.occurred_at, e.error_class, e.message, e.user_message,
-                    e.retryable, e.window_start, e.window_end
+                    e.retryable, e.window_start, e.window_end,
+                    e.resolved_at, e.resolved_by_sync_run_id
              FROM sync_errors e`;
   if (filter.appId) {
     sql += ' JOIN sync_runs r ON r.id = e.sync_run_id';
@@ -360,9 +363,48 @@ export async function listRecentSyncErrors(
     params.push(filter.appId);
     sql += ` AND r.app_id = $${params.length}`;
   }
+  // An error that a later successful run superseded is history, not a current
+  // problem. It is kept, and told apart.
+  if (filter.resolved === true) sql += ' AND e.resolved_at IS NOT NULL';
+  if (filter.resolved === false) sql += ' AND e.resolved_at IS NULL';
   params.push(Math.min(filter.limit ?? 20, 100));
   sql += ` ORDER BY e.occurred_at DESC LIMIT $${params.length}`;
   return queryRows<SyncErrorRow>(sql, params, client);
+}
+
+/**
+ * Mark every open error for this app/provider/stream as resolved by this run.
+ *
+ * Called when a run succeeds. Audit history is never deleted - the row stays,
+ * with the run that superseded it recorded - so a fixed problem stops being
+ * presented as a current one without the evidence disappearing.
+ */
+export async function resolveOpenSyncErrors(
+  input: {
+    organizationId: string;
+    appId: string;
+    connectionId: string;
+    dataType: SyncDataType;
+    syncRunId: string;
+  },
+  client?: Queryable,
+): Promise<number> {
+  const rows = await queryRows<{ id: string }>(
+    `UPDATE sync_errors e
+        SET resolved_at = now(), resolved_by_sync_run_id = $5
+       FROM sync_runs r
+      WHERE e.sync_run_id = r.id
+        AND e.organization_id = $1
+        AND r.app_id = $2
+        AND r.connection_id = $3
+        AND r.data_type = $4
+        AND e.resolved_at IS NULL
+        AND e.sync_run_id <> $5
+      RETURNING e.id`,
+    [input.organizationId, input.appId, input.connectionId, input.dataType, input.syncRunId],
+    client,
+  );
+  return rows.length;
 }
 
 // ---------------------------------------------------------- sync cursors ----

@@ -212,3 +212,102 @@ export function checkRowCountAnomaly(
     },
   ];
 }
+
+/**
+ * Reconciliation gaps that make dashboard numbers misleading.
+ *
+ * These are not row-level assertions about a fetched payload; they are about
+ * the join between two providers, which is where a plausible-looking wrong
+ * number comes from. Spend that no attribution can be tied to, and attributed
+ * paid installs that belong to no known campaign, both mean the same thing:
+ * a CPI or ROAS computed across them would divide one population by another.
+ *
+ * Organic is never a finding. Unpaid traffic belongs to no campaign by
+ * definition, and flagging it would train people to ignore the panel.
+ */
+export type ReconciliationHealthInput = {
+  organizationId: string;
+  appId: string;
+  /** Null: this describes the join between two connections, not one of them. */
+  connectionId: string | null;
+  syncRunId: string | null;
+  observedDate: IsoDate;
+  /** Marketing spend in the window under review. */
+  spend: number;
+  /** Paid marketing campaigns MART knows about. */
+  marketingCampaigns: number;
+  /** Coverage counts from campaignCoverage(). */
+  operationalCoveragePct: number | null;
+  authoritativeCoveragePct: number | null;
+  /** Paid attribution campaigns with no mapping to a marketing campaign. */
+  unmappedPaidCampaigns: number;
+  ambiguousCampaigns: number;
+};
+
+/**
+ * Below this share of mapped campaigns, spend-derived per-install figures stop
+ * describing the account and start describing whichever slice happened to map.
+ */
+export const MINIMUM_OPERATIONAL_COVERAGE_PCT = 80;
+
+export function checkReconciliationHealth(input: ReconciliationHealthInput): DataQualityFinding[] {
+  const findings: DataQualityFinding[] = [];
+  const base = {
+    organizationId: input.organizationId,
+    appId: input.appId,
+    connectionId: input.connectionId,
+    syncRunId: input.syncRunId,
+    entityType: 'campaign',
+    entityRef: null,
+    observedDate: input.observedDate,
+  } as const;
+
+  const coverage = input.operationalCoveragePct;
+
+  if (
+    input.spend > 0 &&
+    input.marketingCampaigns > 0 &&
+    (coverage ?? 0) < MINIMUM_OPERATIONAL_COVERAGE_PCT
+  ) {
+    findings.push({
+      ...base,
+      checkKey: 'reconciliation.paid_spend_without_mapping',
+      // The highest severity available, because every spend-derived metric on
+      // the dashboard is affected while this holds.
+      severity: 'error',
+      message:
+        coverage === null || coverage === 0
+          ? `Spend of ${input.spend.toFixed(2)} is recorded but no campaign maps to attribution. Per-install and per-revenue figures cannot describe these campaigns.`
+          : `Operational mapping coverage is ${coverage}%, below the ${MINIMUM_OPERATIONAL_COVERAGE_PCT}% needed for spend-derived metrics to describe the whole account.`,
+      detail: {
+        spend: input.spend,
+        marketingCampaigns: input.marketingCampaigns,
+        operationalCoveragePct: coverage,
+        authoritativeCoveragePct: input.authoritativeCoveragePct,
+        threshold: MINIMUM_OPERATIONAL_COVERAGE_PCT,
+      },
+    });
+  }
+
+  if (input.unmappedPaidCampaigns > 0) {
+    findings.push({
+      ...base,
+      checkKey: 'reconciliation.attributed_campaigns_unmapped',
+      severity: 'warning',
+      message: `${input.unmappedPaidCampaigns} paid attribution campaign(s) have no marketing campaign mapping, so their installs and revenue are outside every mapped figure.`,
+      detail: { unmappedPaidCampaigns: input.unmappedPaidCampaigns },
+    });
+  }
+
+  if (input.ambiguousCampaigns > 0) {
+    findings.push({
+      ...base,
+      checkKey: 'reconciliation.ambiguous_campaigns',
+      severity: 'warning',
+      message: `${input.ambiguousCampaigns} campaign(s) matched more than one candidate by name and were left unmapped rather than joined arbitrarily.`,
+      detail: { ambiguousCampaigns: input.ambiguousCampaigns },
+    });
+  }
+
+  return findings;
+}

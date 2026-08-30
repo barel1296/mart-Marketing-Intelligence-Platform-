@@ -100,8 +100,8 @@ export async function buildMetricContext(
     mappingCoverage: coverage
       ? {
           total: coverage.total,
-          authoritative:
-            coverage.matchedExact + coverage.matchedConfident + coverage.manuallyVerified,
+          authoritative: coverage.authoritative,
+          operational: coverage.operational,
         }
       : undefined,
   };

@@ -80,6 +80,12 @@ export const SYNC_RUN_STATUSES = [
   'completed',
   'failed',
   'cancelled',
+  /**
+   * The adapter does not implement this stream, so no request was made and no
+   * rows moved. Distinct from 'completed' with zero rows, which means MART
+   * asked and the provider had nothing.
+   */
+  'not_implemented',
 ] as const;
 export type SyncRunStatus = (typeof SYNC_RUN_STATUSES)[number];
 
@@ -162,8 +168,17 @@ export const MAPPING_METHODS = [
   'stable_external_id',
   'tracking_parameter',
   'explicit_provider_mapping',
+  /**
+   * One provider's campaign name is embedded verbatim inside the other's, the
+   * way an MMP wraps the network's name: `Creative_A (NETWORK_CAMPAIGN_NAME)`.
+   * Deterministic - an exact match of an extracted substring, never a fuzzy
+   * resemblance - but still a name, so it is never authoritative.
+   */
+  'provider_name_embedding',
   'name_fallback',
   'manual',
+  /** No matching applies: organic attribution belongs to no paid campaign. */
+  'not_applicable',
 ] as const;
 export type MappingMethod = (typeof MAPPING_METHODS)[number];
 
@@ -175,6 +190,8 @@ export const MAPPING_STATUSES = [
   'unmatched',
   'manually_verified',
   'rejected',
+  /** Organic and other unpaid traffic: correctly unmapped, not a gap. */
+  'not_applicable',
 ] as const;
 export type MappingStatus = (typeof MAPPING_STATUSES)[number];
 
@@ -184,6 +201,14 @@ export const AUTHORITATIVE_MAPPING_STATUSES: readonly MappingStatus[] = [
   'matched_confident',
   'manually_verified',
 ];
+
+/**
+ * Confidence at or above which a non-authoritative match is trusted for
+ * operational reporting - a mapped CPI, say - while still being excluded from
+ * authoritative coverage. Deterministic name-embedding matches sit here; a
+ * bare shared name (0.5) does not.
+ */
+export const OPERATIONAL_MAPPING_CONFIDENCE = 0.9;
 
 /** Governed-metric availability. `unavailable` always carries a reason. */
 export const METRIC_AVAILABILITY = ['available', 'partial', 'stale', 'unavailable'] as const;

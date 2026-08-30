@@ -48,6 +48,33 @@ export type MappingUpsert = {
  * A manually verified mapping is never overwritten by the automatic
  * reconciliation pass: human judgement outranks the matcher.
  */
+/**
+ * Drop computed mappings that this reconciliation run did not produce.
+ *
+ * Mappings are recomputed wholesale, and a source campaign can hold several
+ * targets, so a link that stopped being true has to be removed rather than
+ * left behind. Human decisions are never touched: a verified or rejected
+ * mapping is a fact about what someone decided, not a derived row.
+ */
+export async function pruneStaleMappings(
+  organizationId: string,
+  appId: string,
+  entityType: string,
+  computedBefore: Date,
+  client?: Queryable,
+): Promise<number> {
+  const rows = await queryRows<{ id: string }>(
+    `DELETE FROM provider_entity_mappings
+      WHERE organization_id = $1 AND app_id = $2 AND entity_type = $3
+        AND computed_at < $4
+        AND status NOT IN ('manually_verified', 'rejected')
+      RETURNING id`,
+    [organizationId, appId, entityType, computedBefore],
+    client,
+  );
+  return rows.length;
+}
+
 export async function upsertMappings(
   organizationId: string,
   appId: string,
@@ -61,7 +88,7 @@ export async function upsertMappings(
           target_provider, target_external_id, target_name, mapping_method, mapping_confidence,
           status, candidates, candidate_count, evidence, computed_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15, now())
-       ON CONFLICT (app_id, entity_type, source_provider, source_external_id, target_provider)
+       ON CONFLICT (app_id, entity_type, source_provider, source_external_id, target_provider, target_external_id)
        DO UPDATE SET
          source_name = EXCLUDED.source_name,
          target_external_id = CASE WHEN provider_entity_mappings.status IN ('manually_verified','rejected')
