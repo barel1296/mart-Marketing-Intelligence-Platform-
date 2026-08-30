@@ -28,6 +28,12 @@ COPY packages/shared/package.json packages/shared/
 RUN pnpm install --frozen-lockfile
 
 COPY . .
+# Next.js freezes rewrite destinations into .next/routes-manifest.json at build
+# time; `next start` reads that manifest and never re-evaluates the config. So
+# the API's address has to be correct HERE, not only in the runtime environment.
+# The default matches the compose service name.
+ARG MART_API_INTERNAL_URL=http://api:4000
+ENV MART_API_INTERNAL_URL=${MART_API_INTERNAL_URL}
 # Workspace packages resolve to dist/, so nothing can start until this runs.
 # This also produces the Next.js production build the web service serves.
 RUN pnpm build

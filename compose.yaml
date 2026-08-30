@@ -18,6 +18,9 @@ x-mart-image: &mart-image
   build:
     context: .
     dockerfile: Dockerfile
+    args:
+      # Baked into the web build, not just supplied at runtime - see Dockerfile.
+      MART_API_INTERNAL_URL: http://api:4000
   image: mart-phase-0a:local
 
 x-mart-env: &mart-env
