@@ -98,17 +98,55 @@ export const TENJIN_INSTALL_METRIC = 'tracked_installs';
 export const TENJIN_INSTALL_METRICS_OPTIONAL = ['tracked_clicks', 'tracked_impressions'] as const;
 
 /**
- * Revenue metric ids: `revenues` is IAP revenue, `pub_rev` is ad revenue, and
- * `total_rev` is their sum.
+ * Revenue vocabulary, and why it needs a layer rather than two constants.
  *
- * MART reads the two components and deliberately ignores the total. Storage
- * sums every revenue row for a date regardless of type, so importing the total
- * alongside its own parts would double-count. A saved report carrying only
- * `total_rev` is therefore treated as incompatible rather than imported as if
- * it were one component - a wrong split is worse than a missing one.
+ * Tenjin reports ad revenue under two different metric ids that mean different
+ * things:
+ *
+ *   pub_rev               "Ad Revenue"           - reported by the ad networks
+ *   ad_mediation_revenue  "Ad Mediation Revenue" - reported by the mediation layer
+ *
+ * and it has two matching totals:
+ *
+ *   total_rev                    = revenues + pub_rev
+ *   total_ad_mediation_revenue   = revenues + ad_mediation_revenue
+ *
+ * A real account confirms these are not interchangeable: a report can carry
+ * `ad_mediation_revenue: 5.89` while `total_rev` is `0.0`, because that total
+ * does not include mediation revenue. Requiring `pub_rev` therefore rejects a
+ * perfectly good report, and reading `total_rev` as "all revenue" understates
+ * it. Both variants normalize to MART's single `ad` revenue type; the totals
+ * are only ever read when no component is present at all.
  */
 export const TENJIN_REVENUE_METRIC_IAP = 'revenues';
-export const TENJIN_REVENUE_METRIC_AD = 'pub_rev';
+/** Ad-revenue variants, preferred first. Both mean `ad` inside MART. */
+export const TENJIN_AD_REVENUE_METRICS = ['ad_mediation_revenue', 'pub_rev'] as const;
+/** Combined figures, each the sum of `revenues` and one ad variant. */
+export const TENJIN_TOTAL_REVENUE_METRICS = ['total_ad_mediation_revenue', 'total_rev'] as const;
+/** The component metrics: what MART prefers, because they carry the split. */
+export const TENJIN_REVENUE_COMPONENT_METRICS = [
+  TENJIN_REVENUE_METRIC_IAP,
+  ...TENJIN_AD_REVENUE_METRICS,
+] as const;
+
+/**
+ * Any one of these makes a saved report usable for revenue.
+ *
+ * A report carrying only a combined figure is still usable: the canonical
+ * schema has a `total` revenue type, so it can be stored for what it is. What
+ * MART must never do is relabel a total as IAP or ad, or add it to components
+ * it already imported.
+ */
+export const TENJIN_REVENUE_METRICS_ACCEPTED = [
+  ...TENJIN_REVENUE_COMPONENT_METRICS,
+  ...TENJIN_TOTAL_REVENUE_METRICS,
+] as const;
+
+/**
+ * Kept for the previous name, which several call sites and tests use. The ad
+ * concept now has more than one provider id, so the list above is the truth.
+ */
+export const TENJIN_REVENUE_METRIC_AD = TENJIN_AD_REVENUE_METRICS[0];
 
 /** Report family MART reads. Saved reports of any other type are skipped. */
 export const TENJIN_REPORT_TYPE = 'user_acquisition';
@@ -119,40 +157,75 @@ export const TENJIN_REPORT_TYPE = 'user_acquisition';
  */
 export const TENJIN_USABLE_GRANULARITIES = ['daily'] as const;
 
-/**
- * `group_by` is a closed enum: app, channel, country, site, campaign,
- * "campaign,country", "channel,app", "channel,app,country", creative.
- *
- * A grouping is safe for MART only if every dimension it splits on is one MART
- * stores. Rows are keyed on the dimensions MART keeps, so a grouping that
- * splits on something MART discards - `site`, `creative` - collapses many rows
- * onto one key and silently loses installs on write. Those two are refused
- * rather than imported.
- *
- * Listed richest first: the earlier entries carry campaign identity, which is
- * what reconciliation needs.
- */
-export const TENJIN_USABLE_GROUP_BY = [
-  'campaign,country',
+/** The dimensions a Tenjin grouping can split on. */
+export const TENJIN_DIMENSIONS = [
   'campaign',
-  'channel,app,country',
-  'channel,app',
   'country',
   'channel',
   'app',
+  'site',
+  'creative',
 ] as const;
+export type TenjinDimension = (typeof TENJIN_DIMENSIONS)[number];
 
-/** Groupings that would collapse rows onto a shared key. */
-export const TENJIN_UNSAFE_GROUP_BY = ['site', 'creative'] as const;
-
-/** Groupings that carry no campaign, so nothing can be reconciled to Meta. */
-const GROUP_BY_WITHOUT_CAMPAIGN = [
-  'channel,app,country',
-  'channel,app',
+/**
+ * Dimensions MART stores. A grouping may only split on these.
+ *
+ * Rows are keyed on the dimensions MART keeps, so a grouping that splits on one
+ * it discards - `site`, `creative` - collapses many rows onto a single storage
+ * key and silently loses installs on write.
+ */
+export const TENJIN_STORABLE_DIMENSIONS: readonly TenjinDimension[] = [
+  'campaign',
   'country',
   'channel',
   'app',
 ];
+
+export type TenjinGroupBy = {
+  /** Exactly what the provider sent, for diagnostics. */
+  raw: string;
+  /** The dimensions it splits on, in MART's vocabulary. */
+  dimensions: TenjinDimension[];
+  /** Tokens that mapped to no known dimension. Non-empty means "do not guess". */
+  unrecognized: string[];
+};
+
+/**
+ * Translate Tenjin's `group_by` into MART dimensions.
+ *
+ * Tenjin serializes the same choice two ways depending on which end of the API
+ * you are on: the ad-hoc report parameter takes `campaign,country`, while a
+ * saved report definition comes back as `campaign_country`. Comparing either
+ * spelling against a fixed string is how a valid report gets refused - the bug
+ * this layer exists to remove. Both separators are parsed into the same set,
+ * and a token that maps to nothing is reported rather than ignored.
+ */
+export function normalizeGroupBy(raw: string | null | undefined): TenjinGroupBy | null {
+  if (!raw) return null;
+  const dimensions: TenjinDimension[] = [];
+  const unrecognized: string[] = [];
+  for (const token of raw.split(/[,_\s]+/)) {
+    const key = token.trim().toLowerCase();
+    if (!key) continue;
+    const dimension = TENJIN_DIMENSIONS.find((d) => d === key);
+    if (!dimension) unrecognized.push(token);
+    else if (!dimensions.includes(dimension)) dimensions.push(dimension);
+  }
+  return { raw, dimensions, unrecognized };
+}
+
+/**
+ * How useful a grouping is to MART. Higher is better.
+ *
+ * Campaign identity is what reconciliation needs, and country is the split MART
+ * reports on, so those two dominate; a finer grouping breaks ties.
+ */
+export function groupByRank(groupBy: TenjinGroupBy | null): number {
+  if (!groupBy) return 0;
+  const has = (d: TenjinDimension): boolean => groupBy.dimensions.includes(d);
+  return (has('campaign') ? 4 : 0) + (has('country') ? 2 : 0) + (has('channel') ? 1 : 0);
+}
 
 /**
  * A saved report definition, as returned by GET /v2/saved_reports.
@@ -167,6 +240,7 @@ export type TenjinSavedReport = {
   appIds: string[];
   metrics: string[];
   granularity: string | null;
+  /** Exactly as the provider spelled it, e.g. `campaign_country`. */
   groupBy: string | null;
   pastNumberDays: number | null;
   channelIds: string[];
@@ -180,6 +254,8 @@ export type TenjinReportCompatibility = {
   blockers: string[];
   /** Usable, but with a caveat worth surfacing. */
   notes: string[];
+  /** What its grouping means in MART's vocabulary. */
+  groupBy: TenjinGroupBy | null;
 };
 
 export type TenjinReportRequirement = {
@@ -188,7 +264,7 @@ export type TenjinReportRequirement = {
   /** Every one of these metrics must be present. */
   requiredMetrics: string[];
   /** At least one of these must be present, when given. */
-  anyOfMetrics?: string[];
+  anyOfMetrics?: readonly string[];
 };
 
 /**
@@ -232,17 +308,48 @@ export function evaluateSavedReport(
     blockers.push(`granularity is ${report.granularity}; MART needs daily rows`);
   }
 
-  const groupBy = report.groupBy;
+  // Provider spelling is normalized before anything is compared: the same
+  // choice arrives as `campaign,country` from the ad-hoc parameter and
+  // `campaign_country` from a saved report definition.
+  const groupBy = normalizeGroupBy(report.groupBy);
   if (groupBy) {
-    if (TENJIN_UNSAFE_GROUP_BY.includes(groupBy as 'site')) {
+    if (groupBy.unrecognized.length > 0) {
       blockers.push(
-        `group_by ${groupBy} splits on a dimension MART does not store, so rows would collapse onto one key`,
+        `group_by ${groupBy.raw} contains dimension(s) MART does not recognize: ${groupBy.unrecognized.join(', ')}`,
       );
-    } else if (!TENJIN_USABLE_GROUP_BY.includes(groupBy as 'campaign')) {
-      blockers.push(`group_by ${groupBy} is not one MART can normalize`);
-    } else if (GROUP_BY_WITHOUT_CAMPAIGN.includes(groupBy)) {
-      notes.push(`group_by ${groupBy} carries no campaign, so nothing can be reconciled to Meta`);
     }
+    const unstorable = groupBy.dimensions.filter((d) => !TENJIN_STORABLE_DIMENSIONS.includes(d));
+    if (unstorable.length > 0) {
+      blockers.push(
+        `group_by ${groupBy.raw} splits on ${unstorable.join(', ')}, which MART does not store, so rows would collapse onto one key`,
+      );
+    }
+    if (
+      groupBy.unrecognized.length === 0 &&
+      unstorable.length === 0 &&
+      !groupBy.dimensions.includes('campaign')
+    ) {
+      notes.push(
+        `group_by ${groupBy.raw} carries no campaign, so nothing can be reconciled to Meta`,
+      );
+    }
+  }
+
+  // Which ad-revenue variant this report carries, since Tenjin has two that
+  // mean different things and an account may populate either.
+  const hasComponent = TENJIN_REVENUE_COMPONENT_METRICS.some((m) => report.metrics.includes(m));
+  const hasTotal = TENJIN_TOTAL_REVENUE_METRICS.some((m) => report.metrics.includes(m));
+  if (!hasComponent && hasTotal && (requirement.anyOfMetrics ?? []).length > 0) {
+    notes.push(
+      'carries only a combined revenue figure; it will be imported as revenue_type=total rather than split into IAP and ad',
+    );
+  }
+
+  const adVariants = TENJIN_AD_REVENUE_METRICS.filter((m) => report.metrics.includes(m));
+  if (adVariants.length > 1) {
+    notes.push(
+      `carries both ${adVariants.join(' and ')}; MART reads ${adVariants[0]} and reports the other rather than summing them`,
+    );
   }
 
   const optional = TENJIN_INSTALL_METRICS_OPTIONAL.filter((m) => !report.metrics.includes(m));
@@ -250,7 +357,7 @@ export function evaluateSavedReport(
     notes.push(`no ${optional.join('/')}; those columns will be empty`);
   }
 
-  return { report, usable: blockers.length === 0, blockers, notes };
+  return { report, usable: blockers.length === 0, blockers, notes, groupBy };
 }
 
 /**
@@ -265,19 +372,16 @@ export function selectSavedReport(
 ): { chosen: TenjinSavedReport | null; evaluated: TenjinReportCompatibility[] } {
   const evaluated = reports.map((report) => evaluateSavedReport(report, requirement));
   const usable = evaluated.filter((candidate) => candidate.usable);
-  usable.sort((a, b) => {
-    const rank = (c: TenjinReportCompatibility): number => {
-      const index = TENJIN_USABLE_GROUP_BY.indexOf(
-        (c.report.groupBy ?? '') as (typeof TENJIN_USABLE_GROUP_BY)[number],
-      );
-      return index === -1 ? TENJIN_USABLE_GROUP_BY.length : index;
-    };
-    return (
-      rank(a) - rank(b) ||
+  const componentScore = (candidate: TenjinReportCompatibility): number =>
+    TENJIN_REVENUE_COMPONENT_METRICS.filter((m) => candidate.report.metrics.includes(m)).length;
+  usable.sort(
+    (a, b) =>
+      groupByRank(b.groupBy) - groupByRank(a.groupBy) ||
+      // A report that splits IAP from ad beats one carrying only a total.
+      componentScore(b) - componentScore(a) ||
       b.report.metrics.length - a.report.metrics.length ||
-      (b.report.pastNumberDays ?? 0) - (a.report.pastNumberDays ?? 0)
-    );
-  });
+      (b.report.pastNumberDays ?? 0) - (a.report.pastNumberDays ?? 0),
+  );
   return { chosen: usable[0]?.report ?? null, evaluated };
 }
 
@@ -662,7 +766,9 @@ export class TenjinAttributionProvider implements AttributionProvider {
     const wanted = [
       `report_type=${TENJIN_REPORT_TYPE}`,
       `granularity=${TENJIN_USABLE_GRANULARITIES[0]}`,
-      `group_by=${TENJIN_USABLE_GROUP_BY[0]}`,
+      // Named in the provider's own saved-report spelling, so it can be
+      // matched against what the Data Exporter shows.
+      'group_by=campaign_country (Campaign + Country)',
       `app_ids including ${requirement.appId}`,
       `metrics ${[...requirement.requiredMetrics, ...(requirement.anyOfMetrics ?? [])].join(', ')}`,
     ].join(', ');
@@ -777,14 +883,22 @@ export class TenjinAttributionProvider implements AttributionProvider {
       {
         appId: params.externalAccountId,
         requiredMetrics: [],
-        anyOfMetrics: [TENJIN_REVENUE_METRIC_IAP, TENJIN_REVENUE_METRIC_AD],
+        // Any component will do, and a combined figure is accepted as a last
+        // resort. Requiring one specific ad metric is what rejected a real
+        // report whose ad revenue arrives as ad_mediation_revenue rather than
+        // pub_rev.
+        anyOfMetrics: TENJIN_REVENUE_METRICS_ACCEPTED,
       },
       'attribution_revenue',
     );
     const rows = await this.fetchSavedReportRows(report, params);
     const batch = emptyAttributionBatch();
+    const warnings = [...rows.warnings];
     let rejected = rows.rowsSkipped;
     let latestDataDate: IsoDate | null = null;
+    let bothAdVariants = 0;
+    let partialSplit = 0;
+    let totalOnly = 0;
 
     for (const row of rows.rows) {
       const activityDate = isoDay(str(row['date'] ?? row['day']));
@@ -802,7 +916,7 @@ export class TenjinAttributionProvider implements AttributionProvider {
       const emit = (
         revenueType: CanonicalAttributionRevenueMetric['revenueType'],
         value: number,
-      ) => {
+      ): void => {
         if (!value) return;
         batch.revenue.push({
           activityDate,
@@ -814,9 +928,48 @@ export class TenjinAttributionProvider implements AttributionProvider {
           revenue: value,
         });
       };
-      emit('iap', num(row[TENJIN_REVENUE_METRIC_IAP]));
-      emit('ad', num(row[TENJIN_REVENUE_METRIC_AD]));
+
+      const present = (key: string): boolean => row[key] !== undefined && row[key] !== null;
+      const hasIap = present(TENJIN_REVENUE_METRIC_IAP);
+      // Preferred variant first; both mean `ad` inside MART.
+      const adKeys = TENJIN_AD_REVENUE_METRICS.filter(present);
+      const adKey = adKeys[0];
+      if (adKeys.length > 1) bothAdVariants += 1;
+
+      if (hasIap || adKey) {
+        emit('iap', num(row[TENJIN_REVENUE_METRIC_IAP]));
+        if (adKey) emit('ad', num(row[adKey]));
+        // A total sits beside its own parts. Storage sums every revenue row
+        // for a date, so importing it too would double-count.
+        if (!hasIap || !adKey) partialSplit += 1;
+      } else {
+        // No component at all: the combined figure is the only revenue there
+        // is, and `total` is a type the schema represents honestly. It is
+        // never relabelled as IAP or ad.
+        const totalKey = TENJIN_TOTAL_REVENUE_METRICS.find(present);
+        if (totalKey) {
+          emit('total', num(row[totalKey]));
+          totalOnly += 1;
+        }
+      }
+
       if (!latestDataDate || activityDate > latestDataDate) latestDataDate = activityDate;
+    }
+
+    if (bothAdVariants > 0) {
+      warnings.push(
+        `The saved report carries both ${TENJIN_AD_REVENUE_METRICS.join(' and ')}. These are different Tenjin measures, so MART imported ${TENJIN_AD_REVENUE_METRICS[0]} and did not sum them; ${bothAdVariants} row(s) affected.`,
+      );
+    }
+    if (partialSplit > 0) {
+      warnings.push(
+        `${partialSplit} row(s) carried only one revenue component, so the other side is absent. The combined total was not imported, because adding it to a component would double-count.`,
+      );
+    }
+    if (totalOnly > 0) {
+      warnings.push(
+        `${totalOnly} row(s) carried no revenue component, so the combined figure was imported as revenue_type=total rather than guessed as IAP or ad.`,
+      );
     }
 
     return {
@@ -824,7 +977,7 @@ export class TenjinAttributionProvider implements AttributionProvider {
       pagesFetched: rows.pages,
       rowsFetched: rows.rowsFetched,
       rowsRejected: rejected,
-      warnings: rows.warnings,
+      warnings,
       latestDataDate,
     };
   }

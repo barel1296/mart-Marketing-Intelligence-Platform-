@@ -166,17 +166,38 @@ A saved report is usable for a stream only if **all** of these hold:
 | ----------------------------------- | --------------------------------------------------------------------------------------------- |
 | `report_type` is `user_acquisition` | Other families report different facts                                                         |
 | covers the bound app                | `app_ids` contains it, or is empty (account-wide). Rows are then filtered by `app_id` on read |
-| has the metrics                     | installs need `tracked_installs`; revenue needs at least one of `revenues` / `pub_rev`        |
+| has the metrics                     | installs need `tracked_installs`; revenue needs any one usable revenue metric (below)         |
 | `granularity` is `daily`            | Weekly, monthly and totals buckets cannot be split back into days without inventing data      |
 | `group_by` is one MART stores       | Every dimension the report splits on must be one MART keeps                                   |
+
+#### `group_by` is normalized, never string-compared
+
+Tenjin spells the same choice two ways depending on which end of the API you
+are on. The ad-hoc report parameter takes `campaign,country`; a saved report
+definition comes back as `campaign_country`. Comparing either spelling against
+a fixed string rejects a perfectly valid report — which is exactly what
+happened to a real account's `MART - Reveal Rush UA`.
+
+`normalizeGroupBy()` parses either separator into MART's dimension vocabulary:
+
+| Tenjin `group_by`                       | MART dimensions         |
+| --------------------------------------- | ----------------------- |
+| `campaign_country` / `campaign,country` | campaign + country      |
+| `channel_app_country`                   | channel + app + country |
+| `campaign`, `country`, `channel`, `app` | that single dimension   |
+| `site`, `creative`                      | refused — see below     |
+
+A token that maps to no known dimension is reported as unrecognized and blocks
+the report, rather than being quietly dropped.
 
 `site` and `creative` groupings are **refused**: MART stores neither dimension,
 so many rows would share one storage key and overwrite each other — installs
 would silently disappear. A campaign-less grouping (`app`, `channel`, …) is
 accepted with a note that nothing can be reconciled to Meta from it.
 
-When several reports qualify, the richest grouping wins, then the most metrics,
-then the longest `past_number_days`.
+When several reports qualify, the richest grouping wins, then the report that
+splits revenue into components, then the most metrics, then the longest
+`past_number_days`.
 
 **When none qualifies, MART does not create one.** The sync fails with
 `configuration_required` carrying the machine-readable code
@@ -211,11 +232,30 @@ unreachable there). Whatever the API does, MART reports what it received.
   network's campaign id, and `name` is Tenjin's campaign name. Stable-id matching
   to Meta therefore cannot work, and reconciliation correctly falls back to name
   candidates labelled non-authoritative.
-- **Revenue**: `revenues` (in-app) and `pub_rev` (ad), at `event_date` grain,
-  consistent with AppsFlyer. `total_rev` is their sum and is deliberately not
-  imported: storage sums every revenue row for a date, so importing the total
-  beside its own parts would double-count. A saved report carrying only
-  `total_rev` is refused rather than imported as if it were one component.
+- **Revenue** needs a vocabulary layer, because Tenjin has two ad-revenue
+  metrics that mean different things and two matching totals:
+
+  | Tenjin metric                | Meaning                            | MART `revenue_type`  |
+  | ---------------------------- | ---------------------------------- | -------------------- |
+  | `revenues`                   | In-app purchase revenue            | `iap`                |
+  | `ad_mediation_revenue`       | Ad revenue via the mediation layer | `ad`                 |
+  | `pub_rev`                    | Ad revenue reported by networks    | `ad`                 |
+  | `total_ad_mediation_revenue` | `revenues + ad_mediation_revenue`  | `total`, last resort |
+  | `total_rev`                  | `revenues + pub_rev`               | `total`, last resort |
+
+  A real account settles why this matters: its report carries
+  `ad_mediation_revenue: 5.89` while `total_rev` is `0.0`, because that total
+  does not include mediation revenue. Requiring `pub_rev` rejects the report;
+  reading `total_rev` as "all revenue" understates the account.
+
+  Both ad variants normalize to MART's single `ad` type. When a row carries
+  both they are **not** summed — they are different measures, and adding them
+  could double-count the same impressions — so MART imports
+  `ad_mediation_revenue` and warns, naming what it left out. A combined figure
+  is imported only when the row carries no component at all, and then as
+  `revenue_type=total`, never relabelled as IAP or ad: storage sums every
+  revenue row for a date, so a total beside its own parts would double-count.
+
 - **Not imported**: `*_Nd` cohort metrics (`revenues_Nd`, `roas_Nd`,
   `retention_Nd`). Tenjin declares `cohort_reporting: true` as a capability, but
   Phase 0A does not import cohort data — declaring a capability is not the same as

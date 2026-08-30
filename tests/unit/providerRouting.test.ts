@@ -12,11 +12,11 @@ import {
   providerEndpointInfo,
   sanitizeBody,
   sanitizeUrl,
+  normalizeGroupBy,
   selectSavedReport,
   worstFreshness,
-  TENJIN_REVENUE_METRIC_AD,
-  TENJIN_REVENUE_METRIC_IAP,
-  TENJIN_UNSAFE_GROUP_BY,
+  TENJIN_REVENUE_COMPONENT_METRICS,
+  TENJIN_REVENUE_METRICS_ACCEPTED,
   type TenjinSavedReport,
 } from '@mart/integrations';
 import { accountLabel } from '../../apps/web/lib/format';
@@ -660,7 +660,8 @@ describe('tenjin saved-report reporting', () => {
   }
 
   const APP = 'b6861802-21c7-4e6f-994d-44783bbda367';
-  const REPORT_ID = '7c1f4a26-9b0e-4a6f-9d21-1f0a5f3e2d88';
+  // The real saved report on the account this was debugged against.
+  const REPORT_ID = 'e2d46476-7ce3-4264-975e-1e1f3ef68339';
 
   const params = {
     externalAccountId: APP,
@@ -675,18 +676,26 @@ describe('tenjin saved-report reporting', () => {
       id: REPORT_ID,
       type: 'saved_report',
       attributes: {
-        name: 'MART UA daily',
+        // Verbatim from the real definition, including the metric set and the
+        // provider's underscore spelling of Campaign + Country.
+        name: 'MART - Reveal Rush UA',
         report_type: 'user_acquisition',
         app_ids: [APP],
         metrics: [
           'tracked_installs',
-          'tracked_clicks',
-          'tracked_impressions',
           'revenues',
-          'pub_rev',
+          'ad_mediation_revenue',
+          'total_rev',
+          'spend',
+          'cpm',
+          'cpi',
+          'ctr',
+          'cvr',
+          'ad_mediation_revenue_7d',
+          'roas_7d',
         ],
         granularity: 'daily',
-        group_by: 'campaign,country',
+        group_by: 'campaign_country',
         past_number_days: 30,
         channel_ids: [],
         ...overrides,
@@ -694,8 +703,15 @@ describe('tenjin saved-report reporting', () => {
     };
   }
 
-  /** One row, exactly as the live API returns it. */
+  /**
+   * One row, exactly as the live API returns it for this grouping.
+   *
+   * Note `ad_mediation_revenue` is populated while `total_rev` is 0.0: that
+   * total is `revenues + pub_rev` and does not include mediation revenue, so
+   * reading it as "all revenue" would understate the account.
+   */
   const ROW = {
+    ad_mediation_revenue: 5.896744,
     ad_network_id: 3,
     ad_network_name: 'Meta',
     app_id: APP,
@@ -707,8 +723,8 @@ describe('tenjin saved-report reporting', () => {
     name: 'CPI_Broad_US_static (FB_Reveal_Rush_CPI_Broad_US_26/08/26)',
     platform: 'android',
     revenues: 12.5,
-    pub_rev: 3.25,
-    total_rev: 15.75,
+    spend: 9.05,
+    total_rev: 0.0,
     tracked_clicks: 140,
     tracked_installs: 28,
   };
@@ -779,15 +795,78 @@ describe('tenjin saved-report reporting', () => {
     expect(urls[1]?.pathname).toBe(`/v2/reports/${REPORT_ID}`);
     const byType = Object.fromEntries(result.batch.revenue.map((r) => [r.revenueType, r] as const));
     expect(byType['iap']?.revenue).toBe(12.5);
-    expect(byType['ad']?.revenue).toBe(3.25);
-    // total_rev is the sum of the other two, and storage sums every revenue
-    // row for a date: importing it would double-count.
+    // The account's ad revenue arrives as ad_mediation_revenue, not pub_rev.
+    expect(byType['ad']?.revenue).toBe(5.896744);
+    // A combined figure sits beside its own parts, and storage sums every
+    // revenue row for a date: importing it too would double-count.
     expect(result.batch.revenue).toHaveLength(2);
+    expect(result.batch.revenue.some((r) => r.revenueType === 'total')).toBe(false);
     for (const row of result.batch.revenue) {
       expect(row.grain).toBe('event_date');
       expect(row.activityDate).toBe('2026-08-28');
       expect(row.currency).toBe('USD');
     }
+  });
+
+  it('treats pub_rev as the same ad-revenue concept on an account that reports it', async () => {
+    const { provider } = providerFor(
+      twoStep(
+        {
+          data: [
+            {
+              attributes: { ...ROW, ad_mediation_revenue: undefined, pub_rev: 3.25 },
+              type: 'report',
+            },
+          ],
+        },
+        [savedReport({ metrics: ['tracked_installs', 'revenues', 'pub_rev', 'total_rev'] })],
+      ),
+    );
+    const result = await provider.syncRevenue(params);
+    const byType = Object.fromEntries(result.batch.revenue.map((r) => [r.revenueType, r] as const));
+    expect(byType['ad']?.revenue).toBe(3.25);
+    expect(byType['iap']?.revenue).toBe(12.5);
+  });
+
+  it('never sums the two ad-revenue variants, and says so', async () => {
+    const { provider } = providerFor(
+      twoStep({ data: [{ attributes: { ...ROW, pub_rev: 3.25 }, type: 'report' }] }),
+    );
+    const result = await provider.syncRevenue(params);
+    const ad = result.batch.revenue.filter((r) => r.revenueType === 'ad');
+    // Different Tenjin measures: one of them, never their sum.
+    expect(ad).toHaveLength(1);
+    expect(ad[0]?.revenue).toBe(5.896744);
+    expect(result.warnings.join(' ')).toContain('did not sum them');
+  });
+
+  it('imports a combined figure as total only when no component exists', async () => {
+    const { provider } = providerFor(
+      twoStep(
+        {
+          data: [
+            {
+              attributes: {
+                date: '2026-08-28',
+                app_id: APP,
+                campaign_id: 'c1',
+                name: 'Campaign',
+                country: 'US',
+                total_rev: 42.5,
+              },
+              type: 'report',
+            },
+          ],
+        },
+        [savedReport({ metrics: ['tracked_installs', 'total_rev'] })],
+      ),
+    );
+    const result = await provider.syncRevenue(params);
+    expect(result.batch.revenue).toHaveLength(1);
+    // Explicitly total - never relabelled as IAP or ad.
+    expect(result.batch.revenue[0]?.revenueType).toBe('total');
+    expect(result.batch.revenue[0]?.revenue).toBe(42.5);
+    expect(result.warnings.join(' ')).toContain('revenue_type=total');
   });
 
   it('reuses one discovery call across both streams', async () => {
@@ -951,13 +1030,14 @@ describe('tenjin saved-report compatibility', () => {
 
   function report(overrides: Partial<TenjinSavedReport> = {}): TenjinSavedReport {
     return {
-      id: 'report-1',
-      name: 'UA daily',
+      id: 'e2d46476-7ce3-4264-975e-1e1f3ef68339',
+      name: 'MART - Reveal Rush UA',
       reportType: 'user_acquisition',
       appIds: [APP],
-      metrics: ['tracked_installs', 'revenues', 'pub_rev'],
+      metrics: ['tracked_installs', 'revenues', 'ad_mediation_revenue', 'total_rev'],
       granularity: 'daily',
-      groupBy: 'campaign,country',
+      // The provider's own spelling of Campaign + Country.
+      groupBy: 'campaign_country',
       pastNumberDays: 30,
       channelIds: [],
       ...overrides,
@@ -965,6 +1045,24 @@ describe('tenjin saved-report compatibility', () => {
   }
 
   const installs = { appId: APP, requiredMetrics: ['tracked_installs'] };
+
+  it('accepts the real saved report for installs and for revenue', () => {
+    // The exact definition that MART used to refuse with
+    // "group_by campaign_country is not one MART can normalize".
+    const real = report();
+    expect(evaluateSavedReport(real, installs).usable).toBe(true);
+    expect(
+      evaluateSavedReport(real, {
+        appId: APP,
+        requiredMetrics: [],
+        anyOfMetrics: TENJIN_REVENUE_METRICS_ACCEPTED,
+      }).usable,
+    ).toBe(true);
+    // Both streams resolve to the same report id.
+    expect(selectSavedReport([real], installs).chosen?.id).toBe(
+      'e2d46476-7ce3-4264-975e-1e1f3ef68339',
+    );
+  });
 
   it('parses a saved report resource into the fields it is judged on', () => {
     const parsed = parseSavedReport({
@@ -1017,14 +1115,42 @@ describe('tenjin saved-report compatibility', () => {
     expect(evaluateSavedReport(report({ granularity: 'daily' }), installs).usable).toBe(true);
   });
 
+  it('reads both provider spellings of the same grouping', () => {
+    // A saved report says campaign_country; the ad-hoc report parameter says
+    // campaign,country. Comparing either against a fixed string is the bug.
+    expect(normalizeGroupBy('campaign_country')?.dimensions).toEqual(['campaign', 'country']);
+    expect(normalizeGroupBy('campaign,country')?.dimensions).toEqual(['campaign', 'country']);
+    expect(normalizeGroupBy('channel_app_country')?.dimensions).toEqual([
+      'channel',
+      'app',
+      'country',
+    ]);
+    expect(normalizeGroupBy('channel,app')?.dimensions).toEqual(['channel', 'app']);
+    expect(normalizeGroupBy('campaign')?.dimensions).toEqual(['campaign']);
+    expect(normalizeGroupBy(null)).toBeNull();
+  });
+
+  it('accepts every spelling of a grouping MART can store', () => {
+    for (const groupBy of ['campaign_country', 'campaign,country', 'campaign', 'channel_app']) {
+      expect(evaluateSavedReport(report({ groupBy }), installs).usable, groupBy).toBe(true);
+    }
+  });
+
   it('refuses groupings that would collapse rows onto one key', () => {
     // MART stores no site or creative dimension, so many rows would share a
     // key and overwrite each other on write.
-    for (const groupBy of TENJIN_UNSAFE_GROUP_BY) {
+    for (const groupBy of ['site', 'creative', 'campaign_site']) {
       const verdict = evaluateSavedReport(report({ groupBy }), installs);
-      expect(verdict.usable).toBe(false);
+      expect(verdict.usable, groupBy).toBe(false);
       expect(verdict.blockers.join(' ')).toContain('collapse');
     }
+  });
+
+  it('refuses a grouping it does not recognize rather than guessing', () => {
+    const verdict = evaluateSavedReport(report({ groupBy: 'campaign_wormhole' }), installs);
+    expect(verdict.usable).toBe(false);
+    expect(verdict.blockers.join(' ')).toContain('does not recognize');
+    expect(normalizeGroupBy('campaign_wormhole')?.unrecognized).toEqual(['wormhole']);
   });
 
   it('accepts a campaign-less grouping but says nothing can be reconciled', () => {
@@ -1033,24 +1159,55 @@ describe('tenjin saved-report compatibility', () => {
     expect(verdict.notes.join(' ')).toContain('no campaign');
   });
 
-  it('requires at least one revenue component, and never accepts the total alone', () => {
+  it('accepts any usable revenue component, in either provider spelling', () => {
     const revenue = {
       appId: APP,
       requiredMetrics: [],
-      anyOfMetrics: [TENJIN_REVENUE_METRIC_IAP, TENJIN_REVENUE_METRIC_AD],
+      anyOfMetrics: TENJIN_REVENUE_METRICS_ACCEPTED,
     };
-    expect(evaluateSavedReport(report({ metrics: ['revenues'] }), revenue).usable).toBe(true);
-    expect(evaluateSavedReport(report({ metrics: ['pub_rev'] }), revenue).usable).toBe(true);
-    // total_rev is revenues + pub_rev; importing it as a component would
-    // double-count against itself.
-    expect(evaluateSavedReport(report({ metrics: ['total_rev'] }), revenue).usable).toBe(false);
+    for (const metric of TENJIN_REVENUE_COMPONENT_METRICS) {
+      expect(evaluateSavedReport(report({ metrics: [metric] }), revenue).usable, metric).toBe(true);
+    }
+    // A combined figure alone is usable, but says what it will become.
+    const totalOnly = evaluateSavedReport(report({ metrics: ['total_rev'] }), revenue);
+    expect(totalOnly.usable).toBe(true);
+    expect(totalOnly.notes.join(' ')).toContain('revenue_type=total');
+    // A report with no revenue at all is still refused.
+    expect(evaluateSavedReport(report({ metrics: ['tracked_installs'] }), revenue).usable).toBe(
+      false,
+    );
+  });
+
+  it('prefers a report that splits IAP from ad over one carrying only a total', () => {
+    const revenue = {
+      appId: APP,
+      requiredMetrics: [],
+      anyOfMetrics: TENJIN_REVENUE_METRICS_ACCEPTED,
+    };
+    const { chosen } = selectSavedReport(
+      [
+        report({ id: 'total-only', metrics: ['total_rev'] }),
+        report({ id: 'split', metrics: ['revenues', 'ad_mediation_revenue'] }),
+      ],
+      revenue,
+    );
+    expect(chosen?.id).toBe('split');
+  });
+
+  it('notes, rather than sums, a report carrying both ad-revenue variants', () => {
+    const verdict = evaluateSavedReport(
+      report({ metrics: ['revenues', 'ad_mediation_revenue', 'pub_rev'] }),
+      { appId: APP, requiredMetrics: [], anyOfMetrics: TENJIN_REVENUE_COMPONENT_METRICS },
+    );
+    expect(verdict.usable).toBe(true);
+    expect(verdict.notes.join(' ')).toContain('rather than summing them');
   });
 
   it('prefers the richest grouping among compatible reports', () => {
     const { chosen } = selectSavedReport(
       [
         report({ id: 'coarse', groupBy: 'app' }),
-        report({ id: 'rich', groupBy: 'campaign,country' }),
+        report({ id: 'rich', groupBy: 'campaign_country' }),
         report({ id: 'mid', groupBy: 'campaign' }),
       ],
       installs,

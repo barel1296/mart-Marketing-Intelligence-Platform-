@@ -19,11 +19,11 @@ import { isProviderError, type CanonicalAttributionBatch, type IsoDate } from '@
 import { getCredentialStore } from '../credentials.js';
 import { computeFreshnessStatus } from '../sync/freshness.js';
 import {
+  normalizeGroupBy,
   selectSavedReport,
   TenjinAttributionProvider,
   TENJIN_INSTALL_METRIC,
-  TENJIN_REVENUE_METRIC_AD,
-  TENJIN_REVENUE_METRIC_IAP,
+  TENJIN_REVENUE_METRICS_ACCEPTED,
   type TenjinSavedReport,
 } from '../providers/tenjin.js';
 import {
@@ -34,6 +34,35 @@ import {
   type SyncResult,
 } from '../types.js';
 import { createProvider, getProviderDescriptor, providerEndpointInfo } from '../registry.js';
+
+/** First report row of a raw JSON:API page, or null if the shape is different. */
+function firstReportRow(payload: unknown): Record<string, unknown> | null {
+  if (!payload || typeof payload !== 'object') return null;
+  const data = (payload as Record<string, unknown>)['data'];
+  const first = Array.isArray(data) ? data[0] : null;
+  if (!first || typeof first !== 'object') return null;
+  const attributes = (first as Record<string, unknown>)['attributes'];
+  if (attributes && typeof attributes === 'object') return attributes as Record<string, unknown>;
+  return first as Record<string, unknown>;
+}
+
+/**
+ * Field names are always safe to print; values are not. Anything key-shaped is
+ * dropped rather than truncated, so a sample row can never carry a secret.
+ */
+function sanitizeRow(row: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(row)) {
+    if (/(key|secret|token|password|credential|signature|salt|hash)/i.test(key)) {
+      out[key] = '[omitted]';
+    } else if (value === null || ['string', 'number', 'boolean'].includes(typeof value)) {
+      out[key] = value;
+    } else {
+      out[key] = `[${typeof value}]`;
+    }
+  }
+  return out;
+}
 
 /** Narrow to the Tenjin adapter, which alone has saved reports. */
 function isTenjinProvider(provider: AnyProvider): provider is TenjinAttributionProvider {
@@ -256,12 +285,24 @@ async function diagnoseStream(
   line('timezone', binding.timezone);
   line('currency', binding.default_currency);
 
+  // Captured from the raw page so a normalization failure can be traced to the
+  // field names the provider actually sent, rather than the ones MART expected.
+  let firstRowFields: string[] | null = null;
+  let firstRowSample: Record<string, unknown> | null = null;
+
   const params = {
     externalAccountId: binding.external_account_id,
     from: window.from as IsoDate,
     to: window.to as IsoDate,
     timezone: binding.timezone,
     currency: binding.default_currency,
+    onRawPage: async (page: { payload: unknown }): Promise<void> => {
+      if (firstRowFields) return;
+      const row = firstReportRow(page.payload);
+      if (!row) return;
+      firstRowFields = Object.keys(row);
+      firstRowSample = sanitizeRow(row);
+    },
   };
 
   // Saved report discovery, printed whatever the outcome. This is the part the
@@ -302,7 +343,23 @@ async function diagnoseStream(
       }),
     );
     line('ERROR', '(none)');
+    if (firstRowFields) line('FIRST ROW FIELD NAMES', (firstRowFields as string[]).join(', '));
     for (const warning of result.warnings) line('warning', warning);
+
+    const normalized =
+      result.batch.installs.length + result.batch.revenue.length + result.batch.events.length;
+    if (result.rowsFetched > 0 && normalized === 0) {
+      line(
+        'NORMALIZATION ERROR',
+        'rows arrived but none normalized - the field names above do not match what the parser reads',
+      );
+      if (firstRowSample) line('first row (sanitized)', JSON.stringify(firstRowSample));
+    } else if (result.rowsRejected > 0) {
+      line(
+        'NORMALIZATION ERROR',
+        `${result.rowsRejected} row(s) not imported - see warnings above`,
+      );
+    }
 
     const sample = result.batch.installs[0] ?? result.batch.revenue[0] ?? result.batch.events[0];
     if (sample) {
@@ -318,6 +375,7 @@ async function diagnoseStream(
       line('HTTP STATUS', error.httpStatus ?? '(no response)');
       line('ROWS FETCHED', 0);
       line('ROWS NORMALIZED', 0);
+      if (firstRowFields) line('FIRST ROW FIELD NAMES', (firstRowFields as string[]).join(', '));
       line('ERROR', `${error.errorClass}: ${error.userMessage}`);
       // Already sanitized by the HTTP client: URL without secrets, truncated body.
       line('sanitized response', JSON.stringify(error.context ?? {}));
@@ -354,11 +412,7 @@ async function reportSavedReports(
   line('SAVED REPORTS DISCOVERED', reports.length);
   const requirement =
     stream === 'attribution_revenue'
-      ? {
-          appId,
-          requiredMetrics: [],
-          anyOfMetrics: [TENJIN_REVENUE_METRIC_IAP, TENJIN_REVENUE_METRIC_AD],
-        }
+      ? { appId, requiredMetrics: [], anyOfMetrics: TENJIN_REVENUE_METRICS_ACCEPTED }
       : { appId, requiredMetrics: [TENJIN_INSTALL_METRIC] };
 
   const { chosen, evaluated } = selectSavedReport(reports, requirement);
@@ -377,13 +431,17 @@ async function reportSavedReports(
     );
     process.stdout.write(`  GRANULARITY:      ${report.granularity ?? '(not returned)'}\n`);
     process.stdout.write(`  GROUP BY:         ${report.groupBy ?? '(not returned)'}\n`);
+    process.stdout.write(
+      `  GROUP BY MEANS:   ${candidate.groupBy ? candidate.groupBy.dimensions.join(' + ') || '(nothing)' : '(not returned)'}\n`,
+    );
     process.stdout.write(`  PAST NUMBER DAYS: ${report.pastNumberDays ?? '(not returned)'}\n`);
     process.stdout.write(
       `  CHANNEL IDS:      ${report.channelIds.length ? report.channelIds.join(', ') : '(all)'}\n`,
     );
-    process.stdout.write(
-      `  USABLE FOR ${stream}: ${candidate.usable ? 'yes' : `no - ${candidate.blockers.join('; ')}`}\n`,
-    );
+    process.stdout.write(`  USABLE:           ${candidate.usable ? 'yes' : 'no'}\n`);
+    if (!candidate.usable) {
+      process.stdout.write(`  WHY NOT:          ${candidate.blockers.join('; ')}\n`);
+    }
     // Notes qualify a report MART would use; on a refused one the blockers
     // above are the whole story.
     if (candidate.usable) {
@@ -404,6 +462,10 @@ async function reportSavedReports(
   line('METRICS', chosen.metrics.join(', '));
   line('GRANULARITY', chosen.granularity ?? '(not returned)');
   line('GROUP BY', chosen.groupBy ?? '(not returned)');
+  // The provider's spelling and what MART made of it, side by side: this is
+  // where a grouping mismatch shows itself.
+  line('GROUP BY MEANS', normalizeGroupBy(chosen.groupBy)?.dimensions.join(' + ') ?? '(none)');
+  line('USABLE', 'yes');
 }
 
 main()

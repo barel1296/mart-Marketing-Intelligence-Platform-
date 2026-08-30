@@ -69,9 +69,19 @@ const TENJIN_SAVED_REPORTS = [
     name: 'FIXTURE UA daily by campaign',
     report_type: 'user_acquisition',
     app_ids: [TENJIN_APP],
-    metrics: ['tracked_installs', 'tracked_clicks', 'tracked_impressions', 'revenues', 'pub_rev'],
+    metrics: [
+      'tracked_installs',
+      'tracked_clicks',
+      'tracked_impressions',
+      'revenues',
+      'ad_mediation_revenue',
+      'total_rev',
+      'spend',
+    ],
     granularity: 'daily',
-    group_by: 'campaign,country',
+    // The provider's own saved-report spelling: an underscore, not a comma.
+    // The ad-hoc report parameter spells the same choice `campaign,country`.
+    group_by: 'campaign_country',
     past_number_days: 30,
     channel_ids: [],
   },
@@ -587,8 +597,11 @@ const server = createServer((req, res) => {
               tracked_clicks: d.clicks,
               tracked_impressions: d.impressions,
               revenues: Math.round(d.installs * 0.9 * 100) / 100,
-              pub_rev: 0.0,
+              // Ad revenue arrives through mediation on real accounts, and
+              // total_rev does not include it - it is revenues + pub_rev.
+              ad_mediation_revenue: Math.round(d.installs * 0.21 * 1000) / 1000,
               total_rev: Math.round(d.installs * 0.9 * 100) / 100,
+              spend: null,
             },
           });
         }
