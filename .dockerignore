@@ -1,0 +1,29 @@
+# Keep host state out of the image. .env in particular: a developer's local
+# credential key and provider secrets must never be baked into a layer.
+.env
+.env.*
+!.env.example
+
+.git
+.github
+.devcontainer
+
+node_modules
+**/node_modules
+dist
+**/dist
+.next
+**/.next
+out
+**/out
+coverage
+**/coverage
+*.tsbuildinfo
+**/*.tsbuildinfo
+.pnpm-store
+
+*.log
+.DS_Store
+
+# Not needed to build or run the stack.
+smart-marketing-intelligence-platform.json

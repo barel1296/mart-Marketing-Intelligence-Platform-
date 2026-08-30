@@ -1,5 +1,43 @@
 # Development
 
+## Docker (nothing to install but Docker)
+
+Start:
+
+```bash
+docker compose up --build
+```
+
+Open:
+
+```
+http://localhost:3000
+```
+
+Stop:
+
+```bash
+docker compose down
+```
+
+Reset local database:
+
+```bash
+docker compose down -v
+```
+
+This brings up PostgreSQL, the migration runner, the fixture provider, the API,
+the worker and the web app. Migrations run automatically before the API and
+worker start, the database persists in a named volume, and the provider base
+URLs point at the fixture service, so the dashboard shows synthetic data and
+says so.
+
+The credential key that encrypts stored provider credentials is generated once
+into a named volume rather than committed, so it survives restarts. `down -v`
+discards it along with the database, which is what makes that a clean reset.
+
+## Running natively
+
 ## Prerequisites
 
 - Node 22+

@@ -1,0 +1,156 @@
+# MART Phase 0A - local stack.
+#
+#   docker compose up --build     start everything, then open http://localhost:3000
+#   docker compose down           stop
+#   docker compose down -v        stop and wipe the local database
+#
+# Everything here is a development configuration. The provider base URLs point
+# at the bundled fixture server, so the dashboard shows synthetic data and says
+# so: the "DEVELOPMENT FIXTURE DATA" banner is derived from these URLs not
+# matching the real provider origins, not from a flag.
+
+name: mart
+
+x-mart-image: &mart-image
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: mart-phase-0a:local
+
+x-mart-env: &mart-env
+  NODE_ENV: development
+  LOG_LEVEL: info
+  LOG_PRETTY: "false"
+  DATABASE_URL: postgres://mart:mart_local_dev@postgres:5432/mart
+  # Local HTTP only. The API refuses to boot with this false in production.
+  COOKIE_SECURE: "false"
+  WEB_ORIGIN: http://localhost:3000
+  # No provider credentials exist locally, so every adapter reads from the
+  # fixture service instead of the real API.
+  META_GRAPH_BASE_URL: http://fixtures:4900
+  APPSFLYER_BASE_URL: http://fixtures:4900
+  TENJIN_BASE_URL: http://fixtures:4900
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: mart
+      POSTGRES_PASSWORD: mart_local_dev
+      POSTGRES_DB: mart
+    restart: unless-stopped
+    volumes:
+      - mart_pgdata:/var/lib/postgresql/data
+    ports:
+      # Loopback only, so the database is reachable with psql but not exposed
+      # to the network.
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mart -d mart"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Runs to completion before the API and worker start, so they never race a
+  # half-applied schema. It also creates the credential key the two of them read.
+  migrate:
+    <<: *mart-image
+    environment: *mart-env
+    command: ["node", "packages/db/dist/cli/migrate.js"]
+    volumes:
+      - mart_secrets:/run/mart
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # Synthetic provider data. Refuses to start without the explicit opt-in below,
+  # and refuses to run at all under NODE_ENV=production.
+  fixtures:
+    <<: *mart-image
+    environment:
+      NODE_ENV: development
+      MART_ENABLE_FIXTURES: "true"
+      MART_FIXTURE_PORT: "4900"
+    command: ["node", "scripts/fixture-provider-server.mjs"]
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:4900/v21.0/me/adaccounts',{headers:{authorization:'Bearer healthcheck-token-0000000000'}}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  api:
+    <<: *mart-image
+    environment:
+      <<: *mart-env
+      API_PORT: "4000"
+      API_HOST: 0.0.0.0
+    command: ["node", "apps/api/dist/server.js"]
+    restart: unless-stopped
+    volumes:
+      - mart_secrets:/run/mart
+    ports:
+      - "127.0.0.1:4000:4000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      fixtures:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:4000/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  worker:
+    <<: *mart-image
+    environment:
+      <<: *mart-env
+      WORKER_HEALTH_PORT: "4001"
+    command: ["node", "apps/worker/dist/worker.js"]
+    restart: unless-stopped
+    volumes:
+      - mart_secrets:/run/mart
+    ports:
+      - "127.0.0.1:4001:4001"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      fixtures:
+        condition: service_healthy
+
+  web:
+    <<: *mart-image
+    environment:
+      # `next start` serves the production build; the API and worker keep the
+      # development environment above.
+      NODE_ENV: production
+      # The browser is same-origin with the web app; Next proxies /api to the
+      # API over the compose network, so no provider or API host is ever
+      # reachable from the browser.
+      MART_API_INTERNAL_URL: http://api:4000
+    working_dir: /app/apps/web
+    command: ["./node_modules/.bin/next", "start", "-p", "3000", "-H", "0.0.0.0"]
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  mart_pgdata:
+  mart_secrets:
