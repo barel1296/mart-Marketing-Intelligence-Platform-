@@ -14,6 +14,22 @@ export { MetaAdsProvider } from './providers/meta.js';
 export { AppsFlyerAttributionProvider } from './providers/appsflyer.js';
 export { TenjinAttributionProvider } from './providers/tenjin.js';
 export {
+  evaluateSavedReport,
+  parseSavedReport,
+  selectSavedReport,
+  TENJIN_INSTALL_METRIC,
+  TENJIN_INSTALL_METRICS_OPTIONAL,
+  TENJIN_REPORT_TYPE,
+  TENJIN_REVENUE_METRIC_AD,
+  TENJIN_REVENUE_METRIC_IAP,
+  TENJIN_UNSAFE_GROUP_BY,
+  TENJIN_USABLE_GRANULARITIES,
+  TENJIN_USABLE_GROUP_BY,
+  type TenjinReportCompatibility,
+  type TenjinReportRequirement,
+  type TenjinSavedReport,
+} from './providers/tenjin.js';
+export {
   toCanonicalCampaign,
   toCanonicalAdGroup,
   toCanonicalAd,

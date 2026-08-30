@@ -303,6 +303,51 @@ describe('tenjin adapter over real HTTP', () => {
     currency: 'USD',
   };
 
+  it('addresses report data by saved report uuid, over real HTTP', async () => {
+    const urls: string[] = [];
+    const tenjin = new TenjinAttributionProvider({
+      credentials: { kind: 'tenjin', apiKey: TOKEN },
+      baseUrl: `http://127.0.0.1:${PORT}`,
+      http: new ProviderHttpClient({
+        provider: 'tenjin',
+        minIntervalMs: 0,
+        maxAttempts: 1,
+        fetchImpl: async (url: string, init?: RequestInit) => {
+          urls.push(String(url));
+          return fetch(String(url), init);
+        },
+      }),
+    });
+    const result = await tenjin.syncInstalls(window);
+
+    const discovery = urls.find((u) => u.includes('/saved_reports'));
+    expect(discovery).toBeDefined();
+    expect(discovery).toContain('report_type=user_acquisition');
+    const pull = urls.find((u) => u.includes('/reports/'));
+    expect(pull).toBeDefined();
+    // A UUID, never the report family name.
+    expect(pull).toMatch(/\/reports\/[0-9a-f-]{36}\?/);
+    expect(pull).not.toContain('/reports/user_acquisition');
+    expect(result.rowsFetched).toBeGreaterThan(0);
+  });
+
+  it('answers 400 "Saved report not found" when a family name is used as an id', async () => {
+    // The real failure, reproduced by the fixture: this is why report data
+    // cannot be addressed by report type.
+    const response = await fetch(
+      `http://127.0.0.1:${PORT}/reports/user_acquisition?start_date=2026-08-01&end_date=2026-08-03`,
+      { headers: { authorization: `Bearer ${TOKEN}` } },
+    );
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: 'Saved report not found' });
+  });
+
+  it('reports events as not implemented, so the stream is never called fresh', async () => {
+    const result = await provider().syncEvents();
+    expect(result.support).toBe('not_implemented');
+    expect(result.rowsFetched).toBe(0);
+  });
+
   it('discovers the app through the list-then-detail path', async () => {
     const apps = await provider().listApps();
     expect(apps).toHaveLength(1);

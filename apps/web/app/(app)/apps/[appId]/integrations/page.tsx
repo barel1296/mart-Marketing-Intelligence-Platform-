@@ -15,7 +15,7 @@ import {
   type ConnectionRow,
   type ProviderCatalogueEntry,
 } from '../../../../../components/integrations';
-import { accountLabel, formatDateTime, relativeTime } from '../../../../../lib/format';
+import { accountLabel, formatDateTime, relativeTime, statusLabel } from '../../../../../lib/format';
 
 type Me = { organizations: Array<{ id: string; name: string; role: string }> };
 
@@ -382,7 +382,7 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ a
                             <span key={row.data_type}>
                               <StatusChip
                                 status={row.status}
-                                label={`${row.data_type}: ${row.status}`}
+                                label={`${row.data_type}: ${statusLabel(row.status)}`}
                               />
                             </span>
                           ))}

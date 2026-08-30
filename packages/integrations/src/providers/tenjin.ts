@@ -49,7 +49,10 @@ export type TenjinProviderOptions = {
 };
 
 export type TenjinEndpoints = {
-  userAcquisition: string;
+  /** Saved report definitions. */
+  savedReports: string;
+  /** Report data. The saved report UUID is appended: /reports/{id}. */
+  reports: string;
   apps: string;
   /**
    * Documented fallback lookup that returns id + name for a set of app ids.
@@ -66,9 +69,12 @@ export type TenjinEndpoints = {
  * .../v2/api/v2/apps when an operator sets the documented base URL.
  */
 const DEFAULT_ENDPOINTS: Omit<TenjinEndpoints, 'dataExportsApps'> = {
-  // Reporting lives under /reports, alongside /reports/sk_ad_network and
-  // /reports/ad_monetization - not at the API root beside /apps.
-  userAcquisition: '/reports/user_acquisition',
+  savedReports: '/saved_reports',
+  // Report data is addressed by saved report UUID: /reports/{id}. There is no
+  // report named for its family - asking for /reports/user_acquisition makes
+  // Tenjin read "user_acquisition" as an id and answer 400 "Saved report not
+  // found", which is exactly what it did.
+  reports: '/reports',
   apps: '/apps',
 };
 
@@ -78,29 +84,223 @@ const MAX_REPORT_PAGES = 200;
 /** Bounded so a large account cannot turn discovery into hundreds of requests. */
 const MAX_APPS_TO_ENRICH = 100;
 
-/** Verified metric ids from Tenjin's user-acquisition report catalogue. */
-export const TENJIN_ATTRIBUTION_METRICS = [
-  'tracked_installs',
-  'tracked_clicks',
-  'tracked_impressions',
-] as const;
-
-export const TENJIN_REVENUE_METRICS = ['revenues', 'pub_rev', 'total_rev'] as const;
+/** Discovery page size. Large enough that no real account needs a second page. */
+const SAVED_REPORTS_PER_PAGE = 1000;
 
 /**
- * `group_by` is a closed enum, not a free list of dimensions. The allowed
- * values are: app, channel, country, site, campaign, "campaign,country",
- * "channel,app", "channel,app,country", creative. Sending anything else - a
- * date, a platform, an ad_network - is rejected.
+ * Metric ids, read from Tenjin's own reporting catalogue rather than inferred
+ * from MART's fixtures.
  *
- * "campaign,country" is the richest grouping MART can use: the row still
- * carries app, ad network, platform and date, so nothing is lost by not naming
- * them. Daily bucketing comes from `granularity`, not from grouping by date.
+ * `tracked_installs` is Tenjin-attributed; the separate `installs` metric is
+ * what the ad network claims. Only the former is attribution.
  */
-export const TENJIN_GROUP_BY = 'campaign,country';
+export const TENJIN_INSTALL_METRIC = 'tracked_installs';
+export const TENJIN_INSTALL_METRICS_OPTIONAL = ['tracked_clicks', 'tracked_impressions'] as const;
 
-/** Daily rows; the date arrives as a `date` attribute on each row. */
-export const TENJIN_GRANULARITY = 'daily';
+/**
+ * Revenue metric ids: `revenues` is IAP revenue, `pub_rev` is ad revenue, and
+ * `total_rev` is their sum.
+ *
+ * MART reads the two components and deliberately ignores the total. Storage
+ * sums every revenue row for a date regardless of type, so importing the total
+ * alongside its own parts would double-count. A saved report carrying only
+ * `total_rev` is therefore treated as incompatible rather than imported as if
+ * it were one component - a wrong split is worse than a missing one.
+ */
+export const TENJIN_REVENUE_METRIC_IAP = 'revenues';
+export const TENJIN_REVENUE_METRIC_AD = 'pub_rev';
+
+/** Report family MART reads. Saved reports of any other type are skipped. */
+export const TENJIN_REPORT_TYPE = 'user_acquisition';
+
+/**
+ * Only daily rows carry a date MART can attribute a fact to. Weekly, monthly
+ * and totals buckets cannot be split back into days without inventing data.
+ */
+export const TENJIN_USABLE_GRANULARITIES = ['daily'] as const;
+
+/**
+ * `group_by` is a closed enum: app, channel, country, site, campaign,
+ * "campaign,country", "channel,app", "channel,app,country", creative.
+ *
+ * A grouping is safe for MART only if every dimension it splits on is one MART
+ * stores. Rows are keyed on the dimensions MART keeps, so a grouping that
+ * splits on something MART discards - `site`, `creative` - collapses many rows
+ * onto one key and silently loses installs on write. Those two are refused
+ * rather than imported.
+ *
+ * Listed richest first: the earlier entries carry campaign identity, which is
+ * what reconciliation needs.
+ */
+export const TENJIN_USABLE_GROUP_BY = [
+  'campaign,country',
+  'campaign',
+  'channel,app,country',
+  'channel,app',
+  'country',
+  'channel',
+  'app',
+] as const;
+
+/** Groupings that would collapse rows onto a shared key. */
+export const TENJIN_UNSAFE_GROUP_BY = ['site', 'creative'] as const;
+
+/** Groupings that carry no campaign, so nothing can be reconciled to Meta. */
+const GROUP_BY_WITHOUT_CAMPAIGN = [
+  'channel,app,country',
+  'channel,app',
+  'country',
+  'channel',
+  'app',
+];
+
+/**
+ * A saved report definition, as returned by GET /v2/saved_reports.
+ *
+ * Only the fields MART needs to judge compatibility are lifted out; the rest
+ * of the resource is ignored rather than stored.
+ */
+export type TenjinSavedReport = {
+  id: string;
+  name: string | null;
+  reportType: string | null;
+  appIds: string[];
+  metrics: string[];
+  granularity: string | null;
+  groupBy: string | null;
+  pastNumberDays: number | null;
+  channelIds: string[];
+};
+
+/** One saved report judged against what a MART stream needs. */
+export type TenjinReportCompatibility = {
+  report: TenjinSavedReport;
+  usable: boolean;
+  /** Why it cannot be used. Empty when usable. */
+  blockers: string[];
+  /** Usable, but with a caveat worth surfacing. */
+  notes: string[];
+};
+
+export type TenjinReportRequirement = {
+  /** The Tenjin app UUID MART is bound to. */
+  appId: string;
+  /** Every one of these metrics must be present. */
+  requiredMetrics: string[];
+  /** At least one of these must be present, when given. */
+  anyOfMetrics?: string[];
+};
+
+/**
+ * Judge one saved report against a stream's needs.
+ *
+ * Exported because this is the decision the whole integration turns on: which
+ * of the account's existing reports MART is allowed to read, and - just as
+ * importantly - exactly why the others were refused, so the operator is told
+ * what to change instead of being told "no data".
+ */
+export function evaluateSavedReport(
+  report: TenjinSavedReport,
+  requirement: TenjinReportRequirement,
+): TenjinReportCompatibility {
+  const blockers: string[] = [];
+  const notes: string[] = [];
+
+  if (report.reportType && report.reportType !== TENJIN_REPORT_TYPE) {
+    blockers.push(`report_type is ${report.reportType}, not ${TENJIN_REPORT_TYPE}`);
+  }
+
+  // An empty app list is Tenjin's "every app in the account", which does cover
+  // the bound app - MART filters the rows by app_id when it reads them.
+  if (report.appIds.length > 0 && !report.appIds.includes(requirement.appId)) {
+    blockers.push('app_ids does not include the bound app');
+  } else if (report.appIds.length === 0) {
+    notes.push('covers every app in the account; rows are filtered to the bound app');
+  } else if (report.appIds.length > 1) {
+    notes.push(`covers ${report.appIds.length} apps; rows are filtered to the bound app`);
+  }
+
+  const missing = requirement.requiredMetrics.filter((metric) => !report.metrics.includes(metric));
+  if (missing.length > 0) blockers.push(`missing metric(s): ${missing.join(', ')}`);
+
+  const anyOf = requirement.anyOfMetrics ?? [];
+  if (anyOf.length > 0 && !anyOf.some((metric) => report.metrics.includes(metric))) {
+    blockers.push(`none of these metrics present: ${anyOf.join(', ')}`);
+  }
+
+  if (report.granularity && !TENJIN_USABLE_GRANULARITIES.includes(report.granularity as 'daily')) {
+    blockers.push(`granularity is ${report.granularity}; MART needs daily rows`);
+  }
+
+  const groupBy = report.groupBy;
+  if (groupBy) {
+    if (TENJIN_UNSAFE_GROUP_BY.includes(groupBy as 'site')) {
+      blockers.push(
+        `group_by ${groupBy} splits on a dimension MART does not store, so rows would collapse onto one key`,
+      );
+    } else if (!TENJIN_USABLE_GROUP_BY.includes(groupBy as 'campaign')) {
+      blockers.push(`group_by ${groupBy} is not one MART can normalize`);
+    } else if (GROUP_BY_WITHOUT_CAMPAIGN.includes(groupBy)) {
+      notes.push(`group_by ${groupBy} carries no campaign, so nothing can be reconciled to Meta`);
+    }
+  }
+
+  const optional = TENJIN_INSTALL_METRICS_OPTIONAL.filter((m) => !report.metrics.includes(m));
+  if (requirement.requiredMetrics.includes(TENJIN_INSTALL_METRIC) && optional.length > 0) {
+    notes.push(`no ${optional.join('/')}; those columns will be empty`);
+  }
+
+  return { report, usable: blockers.length === 0, blockers, notes };
+}
+
+/**
+ * Pick the best existing saved report, or none.
+ *
+ * Richest grouping first, then most metrics, then the longest rolling window -
+ * a report whose `past_number_days` is larger can answer more of a backfill.
+ */
+export function selectSavedReport(
+  reports: readonly TenjinSavedReport[],
+  requirement: TenjinReportRequirement,
+): { chosen: TenjinSavedReport | null; evaluated: TenjinReportCompatibility[] } {
+  const evaluated = reports.map((report) => evaluateSavedReport(report, requirement));
+  const usable = evaluated.filter((candidate) => candidate.usable);
+  usable.sort((a, b) => {
+    const rank = (c: TenjinReportCompatibility): number => {
+      const index = TENJIN_USABLE_GROUP_BY.indexOf(
+        (c.report.groupBy ?? '') as (typeof TENJIN_USABLE_GROUP_BY)[number],
+      );
+      return index === -1 ? TENJIN_USABLE_GROUP_BY.length : index;
+    };
+    return (
+      rank(a) - rank(b) ||
+      b.report.metrics.length - a.report.metrics.length ||
+      (b.report.pastNumberDays ?? 0) - (a.report.pastNumberDays ?? 0)
+    );
+  });
+  return { chosen: usable[0]?.report ?? null, evaluated };
+}
+
+/** Parse one saved-report resource into the fields MART judges it on. */
+export function parseSavedReport(resource: {
+  id: string | null;
+  attributes: Record<string, unknown>;
+}): TenjinSavedReport | null {
+  const attributes = resource.attributes;
+  const id = str(attributes['id']) ?? resource.id;
+  if (!id) return null;
+  return {
+    id,
+    name: str(attributes['name']),
+    reportType: str(attributes['report_type']),
+    appIds: stringList(attributes['app_ids']),
+    metrics: stringList(attributes['metrics']),
+    granularity: str(attributes['granularity']),
+    groupBy: str(attributes['group_by']),
+    pastNumberDays: optionalNum(attributes['past_number_days']),
+    channelIds: stringList(attributes['channel_ids']),
+  };
+}
 
 type TenjinRow = Record<string, string | number | null | undefined>;
 
@@ -112,6 +312,8 @@ export class TenjinAttributionProvider implements AttributionProvider {
   private readonly baseUrl: string;
   private readonly apiKey: string;
   private readonly endpoints: TenjinEndpoints;
+  /** Discovery result, cached so one run does not list saved reports twice. */
+  private savedReports: TenjinSavedReport[] | null = null;
 
   constructor(options: TenjinProviderOptions) {
     this.apiKey = options.credentials.apiKey;
@@ -421,10 +623,82 @@ export class TenjinAttributionProvider implements AttributionProvider {
     return declared;
   }
 
+  /**
+   * List the account's saved report definitions.
+   *
+   * Read-only by design: MART reuses what the operator already built and never
+   * creates or edits a report on their behalf. Cached for the lifetime of the
+   * adapter so installs and revenue in one run share a single discovery call.
+   */
+  async listSavedReports(): Promise<TenjinSavedReport[]> {
+    if (this.savedReports) return this.savedReports;
+    const body = await this.get<unknown>(this.endpoints.savedReports, {
+      report_type: TENJIN_REPORT_TYPE,
+      per_page: SAVED_REPORTS_PER_PAGE,
+    });
+    const reports = this.extractResources(body)
+      .map((resource) => parseSavedReport(resource))
+      .filter((report): report is TenjinSavedReport => report !== null);
+    this.savedReports = reports;
+    return reports;
+  }
+
+  /**
+   * Find the saved report that can answer a stream, or explain the refusal.
+   *
+   * When nothing fits, this raises `configuration_required` carrying the
+   * machine-readable code `tenjin_saved_report_required` and a description of
+   * the report that needs to exist. MART does not POST one: a sync must not
+   * quietly change the shape of someone's Tenjin account.
+   */
+  async resolveSavedReport(
+    requirement: TenjinReportRequirement,
+    streamLabel: string,
+  ): Promise<{ report: TenjinSavedReport; evaluated: TenjinReportCompatibility[] }> {
+    const reports = await this.listSavedReports();
+    const { chosen, evaluated } = selectSavedReport(reports, requirement);
+    if (chosen) return { report: chosen, evaluated };
+
+    const wanted = [
+      `report_type=${TENJIN_REPORT_TYPE}`,
+      `granularity=${TENJIN_USABLE_GRANULARITIES[0]}`,
+      `group_by=${TENJIN_USABLE_GROUP_BY[0]}`,
+      `app_ids including ${requirement.appId}`,
+      `metrics ${[...requirement.requiredMetrics, ...(requirement.anyOfMetrics ?? [])].join(', ')}`,
+    ].join(', ');
+
+    throw new ProviderError({
+      provider: 'tenjin',
+      errorClass: 'configuration_required',
+      message: `No Tenjin saved report can answer ${streamLabel}`,
+      userMessage:
+        `Tenjin has no saved report MART can use for ${streamLabel}. ` +
+        `Create one in Tenjin's Data Exporter with: ${wanted}. ` +
+        'MART only reads saved reports and will not create one for you.',
+      context: {
+        // Machine-readable so the UI and the diagnostic can branch on it
+        // rather than matching on prose.
+        code: 'tenjin_saved_report_required',
+        stream: streamLabel,
+        savedReportsSeen: reports.length,
+        required: wanted,
+        rejected: evaluated.map((candidate) => ({
+          id: candidate.report.id,
+          name: candidate.report.name,
+          blockers: candidate.blockers,
+        })),
+      },
+    });
+  }
+
   async syncInstalls(params: SyncParams): Promise<SyncResult<CanonicalAttributionBatch>> {
-    const rows = await this.fetchUserAcquisition(params, [...TENJIN_ATTRIBUTION_METRICS]);
+    const { report } = await this.resolveSavedReport(
+      { appId: params.externalAccountId, requiredMetrics: [TENJIN_INSTALL_METRIC] },
+      'attribution_installs',
+    );
+    const rows = await this.fetchSavedReportRows(report, params);
     const batch = emptyAttributionBatch();
-    let rejected = 0;
+    let rejected = rows.rowsSkipped;
     let latestDataDate: IsoDate | null = null;
 
     for (const row of rows.rows) {
@@ -463,19 +737,26 @@ export class TenjinAttributionProvider implements AttributionProvider {
     return {
       batch,
       pagesFetched: rows.pages,
-      rowsFetched: rows.rows.length,
+      rowsFetched: rows.rowsFetched,
       rowsRejected: rejected,
       warnings: [
         ...rows.warnings,
-        ...(rejected > 0 ? [`${rejected} Tenjin rows had no usable date.`] : []),
+        ...(rejected > rows.rowsSkipped
+          ? [`${rejected - rows.rowsSkipped} Tenjin rows had no usable date.`]
+          : []),
       ],
       latestDataDate,
     };
   }
 
   /**
-   * Tenjin's user-acquisition report has no in-app event breakdown, so MART
-   * reports the capability as absent rather than approximating it.
+   * Not implemented, and reported as such.
+   *
+   * The user-acquisition report has no in-app event breakdown, and MART has
+   * not built another Tenjin event source. Returning an empty batch quietly
+   * would mark the stream fresh on a run that never made a request - a
+   * dashboard claiming live event data that does not exist. The support flag
+   * is what stops that.
    */
   async syncEvents(): Promise<SyncResult<CanonicalAttributionBatch>> {
     return {
@@ -483,15 +764,26 @@ export class TenjinAttributionProvider implements AttributionProvider {
       pagesFetched: 0,
       rowsFetched: 0,
       rowsRejected: 0,
-      warnings: ['Tenjin does not expose per-event breakdowns in the user-acquisition report.'],
+      warnings: [
+        'MART does not implement a Tenjin in-app event source: the user-acquisition report has no per-event breakdown.',
+      ],
       latestDataDate: null,
+      support: 'not_implemented',
     };
   }
 
   async syncRevenue(params: SyncParams): Promise<SyncResult<CanonicalAttributionBatch>> {
-    const rows = await this.fetchUserAcquisition(params, [...TENJIN_REVENUE_METRICS]);
+    const { report } = await this.resolveSavedReport(
+      {
+        appId: params.externalAccountId,
+        requiredMetrics: [],
+        anyOfMetrics: [TENJIN_REVENUE_METRIC_IAP, TENJIN_REVENUE_METRIC_AD],
+      },
+      'attribution_revenue',
+    );
+    const rows = await this.fetchSavedReportRows(report, params);
     const batch = emptyAttributionBatch();
-    let rejected = 0;
+    let rejected = rows.rowsSkipped;
     let latestDataDate: IsoDate | null = null;
 
     for (const row of rows.rows) {
@@ -522,15 +814,15 @@ export class TenjinAttributionProvider implements AttributionProvider {
           revenue: value,
         });
       };
-      emit('iap', num(row['revenues']));
-      emit('ad', num(row['pub_rev']));
+      emit('iap', num(row[TENJIN_REVENUE_METRIC_IAP]));
+      emit('ad', num(row[TENJIN_REVENUE_METRIC_AD]));
       if (!latestDataDate || activityDate > latestDataDate) latestDataDate = activityDate;
     }
 
     return {
       batch,
       pagesFetched: rows.pages,
-      rowsFetched: rows.rows.length,
+      rowsFetched: rows.rowsFetched,
       rowsRejected: rejected,
       warnings: rows.warnings,
       latestDataDate,
@@ -538,69 +830,168 @@ export class TenjinAttributionProvider implements AttributionProvider {
   }
 
   /**
-   * GET /reports/user_acquisition.
+   * GET /reports/{saved report UUID}.
    *
    * Rows come back as JSON:API resources - `{data: [{type: "report",
-   * attributes: {...}}], has_more}` - so the metrics live under `attributes`,
-   * not at the top of each row. Pagination is an opaque cursor plus a
-   * `has_more` flag.
+   * attributes: {...}}]}` - so the metrics live under `attributes`, not at the
+   * top of each row.
+   *
+   * Two things are checked rather than assumed, because a saved report is the
+   * operator's object and not MART's:
+   *
+   *  - **Which app each row belongs to.** A report may legitimately cover the
+   *    whole account, so rows for other apps are dropped instead of being
+   *    written against the bound app.
+   *  - **Which dates actually came back.** A saved report carries its own
+   *    rolling `past_number_days`. MART asks for its window explicitly, then
+   *    compares what arrived: rows outside the requested window are not
+   *    imported, and a window the report could not cover is reported as a
+   *    warning rather than presented as complete data.
    */
-  private async fetchUserAcquisition(
+  private async fetchSavedReportRows(
+    report: TenjinSavedReport,
     params: SyncParams,
-    metrics: string[],
-  ): Promise<{ rows: TenjinRow[]; pages: number; warnings: string[] }> {
+  ): Promise<{
+    rows: TenjinRow[];
+    pages: number;
+    rowsFetched: number;
+    rowsSkipped: number;
+    warnings: string[];
+  }> {
     const rows: TenjinRow[] = [];
     const warnings: string[] = [];
-    let cursor: string | undefined;
     let pages = 0;
+    let rowsFetched = 0;
+    let otherApp = 0;
+    let outsideWindow = 0;
+    let earliest: string | null = null;
+    let latest: string | null = null;
 
-    for (let page = 1; page <= MAX_REPORT_PAGES; page += 1) {
-      const body = await this.get<unknown>(this.endpoints.userAcquisition, {
+    let next: { path: string; query: Record<string, string | number | undefined> } | null = {
+      path: `${this.endpoints.reports}/${encodeURIComponent(report.id)}`,
+      query: {
         start_date: params.from,
         end_date: params.to,
-        granularity: TENJIN_GRANULARITY,
-        group_by: TENJIN_GROUP_BY,
-        // Plural, comma-separated app UUIDs. The bundle id is not accepted here.
-        app_ids: params.externalAccountId,
-        metrics: metrics.join(','),
         format: 'json',
-        ...(cursor ? { cursor } : {}),
-      });
+      },
+    };
+
+    for (let page = 1; page <= MAX_REPORT_PAGES && next; page += 1) {
+      const body = await this.get<unknown>(next.path, next.query);
       pages += 1;
 
       const pageRows = this.extractResources(body).map(
         (resource) => resource.attributes as TenjinRow,
       );
-      rows.push(...pageRows);
+      rowsFetched += pageRows.length;
+
+      for (const row of pageRows) {
+        const date = isoDay(str(row['date'] ?? row['day']));
+        if (date) {
+          if (!earliest || date < earliest) earliest = date;
+          if (!latest || date > latest) latest = date;
+        }
+        const rowApp = str(row['app_id']);
+        if (rowApp && rowApp !== params.externalAccountId) {
+          otherApp += 1;
+          continue;
+        }
+        if (date && (date < params.from || date > params.to)) {
+          outsideWindow += 1;
+          continue;
+        }
+        rows.push(row);
+      }
 
       await params.onRawPage?.({
         pageNumber: page,
         payload: body,
         recordCount: pageRows.length,
-        schemaVersion: 'reports-ua-v2',
+        schemaVersion: 'saved-report-v2',
         windowStart: params.from,
         windowEnd: params.to,
       });
 
-      const envelope = (body ?? {}) as Record<string, unknown>;
-      if (envelope['has_more'] !== true) break;
-      cursor = readCursor(envelope);
-      if (!cursor) {
-        // Stopping with a warning beats looping: a missing cursor on a
-        // has_more page is a contract change, and silently truncating the
-        // window would look like real data.
+      next = this.nextPage(body, next);
+      if (page === MAX_REPORT_PAGES && next) {
         warnings.push(
-          'Tenjin reported more pages but returned no pagination cursor; the window may be incomplete.',
+          `Stopped after ${MAX_REPORT_PAGES} pages; the window may be incomplete. Narrow the date range or the saved report.`,
         );
-        break;
       }
     }
 
-    return { rows, pages, warnings };
+    if (otherApp > 0) {
+      warnings.push(
+        `Saved report "${report.name ?? report.id}" also covers other apps: ${otherApp} row(s) for a different app_id were not imported.`,
+      );
+    }
+    if (outsideWindow > 0) {
+      warnings.push(
+        `${outsideWindow} row(s) fell outside the requested window ${params.from}..${params.to} and were not imported; the saved report returned ${earliest ?? '?'}..${latest ?? '?'}.`,
+      );
+    }
+    // The honest read of a rolling saved report: say what it covered, do not
+    // present a partial window as a whole one.
+    if (rowsFetched > 0 && earliest && earliest > params.from) {
+      warnings.push(
+        `The saved report's own period starts at ${earliest}, so ${params.from}..${earliest} was not covered` +
+          (report.pastNumberDays ? ` (past_number_days=${report.pastNumberDays})` : '') +
+          '.',
+      );
+    }
+
+    return { rows, pages, rowsFetched, rowsSkipped: otherApp + outsideWindow, warnings };
+  }
+
+  /**
+   * Work out the next page from whatever pagination the response carries.
+   *
+   * JSON:API puts it in `links.next`; the report endpoints have also been seen
+   * to use `has_more` with an opaque cursor. Both are handled, and anything
+   * else stops paging rather than looping.
+   */
+  private nextPage(
+    body: unknown,
+    current: { path: string; query: Record<string, string | number | undefined> },
+  ): { path: string; query: Record<string, string | number | undefined> } | null {
+    const envelope = (body ?? {}) as Record<string, unknown>;
+    const links = envelope['links'];
+    const nextLink =
+      links && typeof links === 'object' ? str((links as Record<string, unknown>)['next']) : null;
+    if (nextLink) {
+      // Absolute or relative, both resolved against the configured base so a
+      // link can never redirect the sync to another host.
+      const resolved = new URL(nextLink, `${this.baseUrl}/`);
+      const base = new URL(`${this.baseUrl}/`);
+      if (resolved.origin !== base.origin) return null;
+      const query: Record<string, string | number | undefined> = {};
+      resolved.searchParams.forEach((value, key) => {
+        query[key] = value;
+      });
+      return { path: resolved.pathname.replace(base.pathname.replace(/\/$/, ''), ''), query };
+    }
+
+    if (envelope['has_more'] !== true) return null;
+    const cursor = readCursor(envelope);
+    if (!cursor) return null;
+    return { path: current.path, query: { ...current.query, cursor } };
   }
 }
 
 // ------------------------------------------------------------- helpers ------
+
+/** Tenjin sends id lists as arrays; tolerate a comma-joined string too. */
+function stringList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map((entry) => str(entry)).filter((entry): entry is string => entry !== null);
+  }
+  const single = str(value);
+  if (!single) return [];
+  return single
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+}
 
 function str(value: unknown): string | null {
   if (value === null || value === undefined) return null;

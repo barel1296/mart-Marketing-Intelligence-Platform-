@@ -1,4 +1,4 @@
-import { formatMetric, statusTone } from '../lib/format';
+import { formatMetric, statusLabel, statusTone } from '../lib/format';
 
 export type MetricValue = {
   metricKey: string;
@@ -72,7 +72,7 @@ export function StatusChip({
   status: string | null | undefined;
   label?: string;
 }) {
-  return <span className={`chip ${statusTone(status)}`}>{label ?? status ?? 'unknown'}</span>;
+  return <span className={`chip ${statusTone(status)}`}>{label ?? statusLabel(status)}</span>;
 }
 
 export function EmptyState({

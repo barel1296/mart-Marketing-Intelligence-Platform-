@@ -340,6 +340,8 @@ export function userMessageFor(
       return `${name} rejected the request. This usually means the selected account or date range is not available to this credential.`;
     case 'schema_change':
       return `${name} returned an unexpected response shape. MART stopped rather than storing data it cannot interpret.`;
+    case 'configuration_required':
+      return `${name} is connected, but the account is missing something this sync needs. See the sync run details for exactly what to create in ${name}.`;
     default:
       return `The ${name} sync failed. See the sync run details for the classified error.`;
   }

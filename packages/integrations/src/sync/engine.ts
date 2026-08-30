@@ -6,6 +6,7 @@ import type {
   SyncDataType,
   SyncRunStatus,
   SyncTrigger,
+  StreamSupport,
 } from '@mart/shared';
 import {
   chunkDateRange,
@@ -156,6 +157,7 @@ export async function runSync(run: SyncRunRow, request: SyncRequest): Promise<Sy
   const chunks = chunkDateRange(request.from, request.to, config.SYNC_WINDOW_CHUNK_DAYS);
   const completed = new Set(run.checkpoint?.completedWindows ?? []);
   let fatal: unknown = null;
+  let support: StreamSupport | null = null;
 
   for (const chunk of chunks) {
     const windowKey = `${chunk.from}..${chunk.to}`;
@@ -223,6 +225,9 @@ export async function runSync(run: SyncRunRow, request: SyncRequest): Promise<Sy
         summary.warnings.push(...result.warnings);
         summary.latestDataDate = maxDate(summary.latestDataDate, result.latestDataDate);
         summary.rowsNormalized += await persistAttribution(scope, result.batch);
+        // Carried out of the loop so the freshness row can say "never fetched"
+        // instead of "fresh" for a stream the adapter does not implement.
+        if (result.support && result.support !== 'supported') support = result.support;
         await dataQualityRepo.recordDataQualityFindings(
           checkAttributionBatch(qualityCtx, result.batch),
         );
@@ -317,6 +322,7 @@ export async function runSync(run: SyncRunRow, request: SyncRequest): Promise<Sy
       latestProviderDataDate: summary.latestDataDate,
       expectedFreshnessMinutes: expectedFreshnessMinutes(request.dataType),
       hasError: !succeeded,
+      ...(support ? { support } : {}),
     }),
     lastErrorClass: failure?.errorClass ?? null,
   });

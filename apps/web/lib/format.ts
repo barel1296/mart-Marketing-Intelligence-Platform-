@@ -71,9 +71,20 @@ export function statusTone(status: string | null | undefined): string {
     case 'disconnected':
     case 'unavailable':
       return 'chip-critical';
+    // Neither good nor bad: nobody expects data from these streams. They are
+    // deliberately not green - a stream MART never fetched is not fresh.
+    case 'unsupported':
+    case 'not_implemented':
+      return 'chip-neutral';
     default:
       return 'chip-neutral';
   }
+}
+
+/** Human wording for a status, so a chip never shows a raw enum member. */
+export function statusLabel(status: string | null | undefined): string {
+  if (!status) return 'unknown';
+  return status.replace(/_/g, ' ');
 }
 
 export type ProviderAccountLike = {

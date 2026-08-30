@@ -6,6 +6,7 @@ import type {
   ProviderCategory,
   ProviderErrorClass,
   ProviderKey,
+  StreamSupport,
 } from '@mart/shared';
 import type { CapabilityDeclaration } from './capabilities.js';
 
@@ -64,6 +65,15 @@ export type SyncResult<TBatch> = {
   warnings: string[];
   /** Latest provider-reported date actually present in the response. */
   latestDataDate: IsoDate | null;
+  /**
+   * Whether this stream can be fetched at all. Omitted means `supported`.
+   *
+   * An adapter that returns an empty batch without making a request must say
+   * so here, so the run is not recorded as fresh data. Silence would make a
+   * stream that never called the provider indistinguishable from one that did
+   * and found nothing.
+   */
+  support?: StreamSupport;
 };
 
 export type ProviderBase = {

@@ -5,10 +5,19 @@ import {
   MetaAdsProvider,
   ProviderHttpClient,
   classifyHttpStatus,
+  computeFreshnessStatus,
+  evaluateSavedReport,
   hasAuthorization,
+  parseSavedReport,
   providerEndpointInfo,
   sanitizeBody,
   sanitizeUrl,
+  selectSavedReport,
+  worstFreshness,
+  TENJIN_REVENUE_METRIC_AD,
+  TENJIN_REVENUE_METRIC_IAP,
+  TENJIN_UNSAFE_GROUP_BY,
+  type TenjinSavedReport,
 } from '@mart/integrations';
 import { accountLabel } from '../../apps/web/lib/format';
 
@@ -613,20 +622,18 @@ describe('tenjin app detail enrichment', () => {
 });
 
 /**
- * The real user-acquisition report, pinned.
+ * The saved-report reporting architecture, pinned.
  *
- * Every value asserted here was observed against a live Tenjin account, and
- * each one was wrong in the version of the adapter that reported
- * `attribution_installs` and `attribution_revenue` as failing: the endpoint
- * sat at the API root instead of under /reports, the app filter was singular,
- * `group_by` was a free-form dimension list rather than one of the enum's
- * members, `granularity` was absent, and the rows were read flat when they
- * actually arrive as JSON:API resources.
+ * Tenjin's reporting API addresses data by saved report UUID:
+ * `GET /v2/reports/{id}`. Asking for `/v2/reports/user_acquisition` makes it
+ * read "user_acquisition" as an id, and it answers 400 "Saved report not
+ * found" - which is exactly what a real account returned. Every assertion here
+ * exists because getting it wrong produced no data at all.
  */
-describe('tenjin user acquisition report', () => {
+describe('tenjin saved-report reporting', () => {
   type Reply = { status?: number; body: unknown };
 
-  function providerFor(handler: (url: URL, page: number) => Reply): {
+  function providerFor(handler: (url: URL, call: number) => Reply): {
     provider: TenjinAttributionProvider;
     urls: URL[];
   } {
@@ -653,6 +660,7 @@ describe('tenjin user acquisition report', () => {
   }
 
   const APP = 'b6861802-21c7-4e6f-994d-44783bbda367';
+  const REPORT_ID = '7c1f4a26-9b0e-4a6f-9d21-1f0a5f3e2d88';
 
   const params = {
     externalAccountId: APP,
@@ -661,6 +669,30 @@ describe('tenjin user acquisition report', () => {
     timezone: 'UTC',
     currency: 'USD',
   };
+
+  function savedReport(overrides: Record<string, unknown> = {}): unknown {
+    return {
+      id: REPORT_ID,
+      type: 'saved_report',
+      attributes: {
+        name: 'MART UA daily',
+        report_type: 'user_acquisition',
+        app_ids: [APP],
+        metrics: [
+          'tracked_installs',
+          'tracked_clicks',
+          'tracked_impressions',
+          'revenues',
+          'pub_rev',
+        ],
+        granularity: 'daily',
+        group_by: 'campaign,country',
+        past_number_days: 30,
+        channel_ids: [],
+        ...overrides,
+      },
+    };
+  }
 
   /** One row, exactly as the live API returns it. */
   const ROW = {
@@ -681,50 +713,39 @@ describe('tenjin user acquisition report', () => {
     tracked_installs: 28,
   };
 
-  const ONE_PAGE = { data: [{ attributes: ROW, type: 'report' }], has_more: false };
+  const ROWS = { data: [{ attributes: ROW, type: 'report' }] };
 
-  it('requests /reports/user_acquisition with the parameters the API accepts', async () => {
-    const { provider, urls } = providerFor(() => ({ body: ONE_PAGE }));
+  /** Discovery first, then the report pull. */
+  function twoStep(rows: unknown = ROWS, reports: unknown[] = [savedReport()]) {
+    return (url: URL): Reply =>
+      url.pathname.endsWith('/saved_reports') ? { body: { data: reports } } : { body: rows };
+  }
+
+  it('discovers saved reports of the user-acquisition type', async () => {
+    const { provider, urls } = providerFor(twoStep());
     await provider.syncInstalls(params);
 
-    const url = urls[0];
-    expect(url?.origin + url?.pathname).toBe('https://api.tenjin.com/v2/reports/user_acquisition');
-    const q = url?.searchParams;
-    expect(q?.get('start_date')).toBe('2026-08-01');
-    expect(q?.get('end_date')).toBe('2026-08-28');
-    expect(q?.get('granularity')).toBe('daily');
-    expect(q?.get('format')).toBe('json');
-    // Plural. The singular form is silently ignored, which is what produced
-    // whole-account rows or none at all.
-    expect(q?.get('app_ids')).toBe(APP);
-    expect(q?.has('app_id')).toBe(false);
-    expect(q?.get('metrics')).toContain('tracked_installs');
+    const discovery = urls[0];
+    expect(discovery?.pathname).toBe('/v2/saved_reports');
+    expect(discovery?.searchParams.get('report_type')).toBe('user_acquisition');
+    expect(discovery?.searchParams.get('per_page')).toBe('1000');
   });
 
-  it('groups by a member of the closed group_by enum', async () => {
-    const { provider, urls } = providerFor(() => ({ body: ONE_PAGE }));
+  it('pulls the data by saved report UUID, never by report family name', async () => {
+    const { provider, urls } = providerFor(twoStep());
     await provider.syncInstalls(params);
 
-    const groupBy = urls[0]?.searchParams.get('group_by');
-    // The enum, verbatim. Anything outside it is rejected by the API.
-    expect([
-      'app',
-      'channel',
-      'country',
-      'site',
-      'campaign',
-      'campaign,country',
-      'channel,app',
-      'channel,app,country',
-      'creative',
-    ]).toContain(groupBy);
-    // The two that were previously sent and are not groupable at all.
-    expect(groupBy).not.toContain('date');
-    expect(groupBy).not.toContain('platform');
+    const pull = urls[1];
+    expect(pull?.pathname).toBe(`/v2/reports/${REPORT_ID}`);
+    // The bug this whole change exists to fix.
+    expect(pull?.pathname).not.toContain('user_acquisition');
+    expect(pull?.searchParams.get('start_date')).toBe('2026-08-01');
+    expect(pull?.searchParams.get('end_date')).toBe('2026-08-28');
+    expect(pull?.searchParams.get('format')).toBe('json');
   });
 
   it('reads metrics from data[].attributes, not from the top of the row', async () => {
-    const { provider } = providerFor(() => ({ body: ONE_PAGE }));
+    const { provider } = providerFor(twoStep());
     const result = await provider.syncInstalls(params);
 
     expect(result.rowsFetched).toBe(1);
@@ -744,96 +765,338 @@ describe('tenjin user acquisition report', () => {
   });
 
   it('counts only Tenjin-tracked installs, never the network-reported figure', async () => {
-    const { provider } = providerFor(() => ({
-      body: { data: [{ attributes: { ...ROW, installs: 999 }, type: 'report' }], has_more: false },
-    }));
+    const { provider } = providerFor(
+      twoStep({ data: [{ attributes: { ...ROW, installs: 999 }, type: 'report' }] }),
+    );
     const result = await provider.syncInstalls(params);
     expect(result.batch.installs[0]?.attributedInstalls).toBe(28);
   });
 
-  it('takes revenue from the same report, at event_date grain', async () => {
-    const { provider, urls } = providerFor(() => ({ body: ONE_PAGE }));
+  it('takes revenue from the same saved report, at event_date grain', async () => {
+    const { provider, urls } = providerFor(twoStep());
     const result = await provider.syncRevenue(params);
 
-    // No second API family: revenue is columns on the user-acquisition report.
-    expect(urls).toHaveLength(1);
-    expect(urls[0]?.pathname).toBe('/v2/reports/user_acquisition');
-    expect(urls[0]?.searchParams.get('metrics')).toContain('revenues');
-
+    expect(urls[1]?.pathname).toBe(`/v2/reports/${REPORT_ID}`);
     const byType = Object.fromEntries(result.batch.revenue.map((r) => [r.revenueType, r] as const));
     expect(byType['iap']?.revenue).toBe(12.5);
     expect(byType['ad']?.revenue).toBe(3.25);
-    // total_rev is the sum of the other two; emitting it would double-count.
+    // total_rev is the sum of the other two, and storage sums every revenue
+    // row for a date: importing it would double-count.
     expect(result.batch.revenue).toHaveLength(2);
     for (const row of result.batch.revenue) {
-      // Revenue recorded on the date, not cohort LTV.
       expect(row.grain).toBe('event_date');
       expect(row.activityDate).toBe('2026-08-28');
       expect(row.currency).toBe('USD');
     }
   });
 
-  it('does not import the N-day cohort revenue columns', async () => {
-    const { provider, urls } = providerFor(() => ({ body: ONE_PAGE }));
+  it('reuses one discovery call across both streams', async () => {
+    const { provider, urls } = providerFor(twoStep());
+    await provider.syncInstalls(params);
     await provider.syncRevenue(params);
-    const metrics = urls[0]?.searchParams.get('metrics') ?? '';
-    expect(metrics).not.toMatch(/_\d+d\b/);
+    expect(urls.filter((u) => u.pathname.endsWith('/saved_reports'))).toHaveLength(1);
   });
 
-  it('follows the cursor while has_more is true', async () => {
-    const { provider, urls } = providerFor((_url, page) =>
-      page === 1
+  it('follows links.next for pagination, and only on the configured host', async () => {
+    const { provider, urls } = providerFor((url, call) => {
+      if (url.pathname.endsWith('/saved_reports')) return { body: { data: [savedReport()] } };
+      if (call === 2) {
+        return {
+          body: {
+            data: [{ attributes: ROW, type: 'report' }],
+            links: { next: `https://api.tenjin.com/v2/reports/${REPORT_ID}?page=2` },
+          },
+        };
+      }
+      return { body: { data: [{ attributes: { ...ROW, date: '2026-08-27' }, type: 'report' }] } };
+    });
+    const result = await provider.syncInstalls(params);
+
+    expect(urls).toHaveLength(3);
+    expect(urls[2]?.pathname).toBe(`/v2/reports/${REPORT_ID}`);
+    expect(urls[2]?.searchParams.get('page')).toBe('2');
+    expect(result.pagesFetched).toBe(2);
+    expect(result.batch.installs).toHaveLength(2);
+  });
+
+  it('ignores a next link that points at another host', async () => {
+    const { provider, urls } = providerFor((url) => {
+      if (url.pathname.endsWith('/saved_reports')) return { body: { data: [savedReport()] } };
+      return {
+        body: {
+          data: [{ attributes: ROW, type: 'report' }],
+          links: { next: 'https://attacker.example.com/v2/reports/x' },
+        },
+      };
+    });
+    await provider.syncInstalls(params);
+    expect(urls).toHaveLength(2);
+    expect(urls.every((u) => u.origin === 'https://api.tenjin.com')).toBe(true);
+  });
+
+  it('falls back to has_more plus cursor when there are no links', async () => {
+    const { provider, urls } = providerFor((url, call) => {
+      if (url.pathname.endsWith('/saved_reports')) return { body: { data: [savedReport()] } };
+      return call === 2
         ? { body: { data: [{ attributes: ROW, type: 'report' }], has_more: true, cursor: 'PAGE2' } }
         : {
             body: {
               data: [{ attributes: { ...ROW, date: '2026-08-27' }, type: 'report' }],
               has_more: false,
             },
-          },
+          };
+    });
+    await provider.syncInstalls(params);
+    expect(urls[2]?.searchParams.get('cursor')).toBe('PAGE2');
+  });
+
+  it('does not import rows belonging to another app', async () => {
+    const { provider } = providerFor(
+      twoStep(
+        {
+          data: [
+            { attributes: ROW, type: 'report' },
+            { attributes: { ...ROW, app_id: 'some-other-app-uuid' }, type: 'report' },
+          ],
+        },
+        // An account-wide saved report legitimately covers the bound app.
+        [savedReport({ app_ids: [] })],
+      ),
     );
     const result = await provider.syncInstalls(params);
 
-    expect(urls).toHaveLength(2);
-    expect(urls[0]?.searchParams.has('cursor')).toBe(false);
-    expect(urls[1]?.searchParams.get('cursor')).toBe('PAGE2');
-    expect(result.pagesFetched).toBe(2);
-    expect(result.batch.installs).toHaveLength(2);
-    expect(result.latestDataDate).toBe('2026-08-28');
-  });
-
-  it('stops and warns when has_more is true but no cursor comes back', async () => {
-    const { provider, urls } = providerFor(() => ({
-      body: { data: [{ attributes: ROW, type: 'report' }], has_more: true },
-    }));
-    const result = await provider.syncInstalls(params);
-
-    // One request, not two hundred: a missing cursor must not become a loop,
-    // and the truncated window must not look like a complete one.
-    expect(urls).toHaveLength(1);
-    expect(result.warnings.join(' ')).toContain('cursor');
-  });
-
-  it('rejects rows with no date rather than dropping them silently', async () => {
-    const { provider } = providerFor(() => ({
-      body: {
-        data: [
-          { attributes: { ...ROW, date: undefined }, type: 'report' },
-          { attributes: ROW, type: 'report' },
-        ],
-        has_more: false,
-      },
-    }));
-    const result = await provider.syncInstalls(params);
     expect(result.rowsFetched).toBe(2);
-    expect(result.rowsRejected).toBe(1);
     expect(result.batch.installs).toHaveLength(1);
-    expect(result.warnings.join(' ')).toContain('no usable date');
+    expect(result.rowsRejected).toBe(1);
+    expect(result.warnings.join(' ')).toContain('different app_id');
   });
 
-  it('never puts the api key in the report URL', async () => {
-    const { provider, urls } = providerFor(() => ({ body: ONE_PAGE }));
+  it('does not import rows outside the requested window, and says the window was short', async () => {
+    const { provider } = providerFor(
+      twoStep({
+        data: [
+          { attributes: { ...ROW, date: '2026-08-20' }, type: 'report' },
+          // The saved report's own rolling period reached further back than
+          // MART asked for.
+          { attributes: { ...ROW, date: '2026-07-01' }, type: 'report' },
+        ],
+      }),
+    );
+    const result = await provider.syncInstalls(params);
+
+    expect(result.batch.installs.map((i) => i.installDate)).toEqual(['2026-08-20']);
+    expect(result.warnings.join(' ')).toContain('outside the requested window');
+  });
+
+  it('warns when the saved report period does not reach the start of the window', async () => {
+    const { provider } = providerFor(
+      twoStep({ data: [{ attributes: { ...ROW, date: '2026-08-25' }, type: 'report' }] }),
+    );
+    const result = await provider.syncInstalls(params);
+    // 2026-08-01..2026-08-25 was requested but not covered - saying so beats
+    // presenting a partial window as a complete one.
+    expect(result.warnings.join(' ')).toContain('was not covered');
+  });
+
+  it('asks for a saved report instead of creating one when none is compatible', async () => {
+    const { provider, urls } = providerFor((url) =>
+      url.pathname.endsWith('/saved_reports')
+        ? { body: { data: [savedReport({ metrics: ['cost', 'clicks'] })] } }
+        : { body: ROWS },
+    );
+
+    await expect(provider.syncInstalls(params)).rejects.toMatchObject({
+      errorClass: 'configuration_required',
+    });
+    // Read-only: no POST, and no attempt to pull a report anyway.
+    expect(urls).toHaveLength(1);
+
+    const error = await provider.syncInstalls(params).catch((e: unknown) => e);
+    const context = (error as { context?: Record<string, unknown> }).context ?? {};
+    expect(context['code']).toBe('tenjin_saved_report_required');
+    expect(String(context['required'])).toContain('tracked_installs');
+    expect(JSON.stringify(context['rejected'])).toContain('missing metric(s)');
+  });
+
+  it('never puts the api key in a reporting URL', async () => {
+    const { provider, urls } = providerFor(twoStep());
     await provider.syncInstalls(params);
-    expect(urls[0]?.toString()).not.toContain('tenjin-secret-token-value');
-    expect(urls[0]?.searchParams.has('api_key')).toBe(false);
+    for (const url of urls) {
+      expect(url.toString()).not.toContain('tenjin-secret-token-value');
+      expect(url.searchParams.has('api_key')).toBe(false);
+    }
+  });
+
+  it('reports events as not implemented rather than empty-and-fresh', async () => {
+    const { provider, urls } = providerFor(twoStep());
+    const result = await provider.syncEvents();
+
+    expect(result.support).toBe('not_implemented');
+    expect(result.rowsFetched).toBe(0);
+    // The point: no request was made, so nothing about this stream is fresh.
+    expect(urls).toHaveLength(0);
+    expect(
+      computeFreshnessStatus({
+        lastSuccessAt: new Date(),
+        latestProviderDataDate: null,
+        expectedFreshnessMinutes: 360,
+        support: result.support,
+      }),
+    ).toBe('not_implemented');
+  });
+});
+
+describe('tenjin saved-report compatibility', () => {
+  const APP = 'b6861802-21c7-4e6f-994d-44783bbda367';
+
+  function report(overrides: Partial<TenjinSavedReport> = {}): TenjinSavedReport {
+    return {
+      id: 'report-1',
+      name: 'UA daily',
+      reportType: 'user_acquisition',
+      appIds: [APP],
+      metrics: ['tracked_installs', 'revenues', 'pub_rev'],
+      granularity: 'daily',
+      groupBy: 'campaign,country',
+      pastNumberDays: 30,
+      channelIds: [],
+      ...overrides,
+    };
+  }
+
+  const installs = { appId: APP, requiredMetrics: ['tracked_installs'] };
+
+  it('parses a saved report resource into the fields it is judged on', () => {
+    const parsed = parseSavedReport({
+      id: 'abc',
+      attributes: {
+        name: 'UA daily',
+        report_type: 'user_acquisition',
+        app_ids: [APP],
+        metrics: ['tracked_installs'],
+        granularity: 'daily',
+        group_by: 'campaign',
+        past_number_days: 14,
+        channel_ids: [3, 5],
+      },
+    });
+    expect(parsed).toMatchObject({
+      id: 'abc',
+      reportType: 'user_acquisition',
+      appIds: [APP],
+      metrics: ['tracked_installs'],
+      granularity: 'daily',
+      groupBy: 'campaign',
+      pastNumberDays: 14,
+      channelIds: ['3', '5'],
+    });
+  });
+
+  it('accepts a report that covers the app with the needed metrics', () => {
+    expect(evaluateSavedReport(report(), installs).usable).toBe(true);
+  });
+
+  it('accepts an account-wide report, noting that rows are filtered', () => {
+    const verdict = evaluateSavedReport(report({ appIds: [] }), installs);
+    expect(verdict.usable).toBe(true);
+    expect(verdict.notes.join(' ')).toContain('filtered to the bound app');
+  });
+
+  it('refuses a report for other apps, another type, or a missing metric', () => {
+    expect(evaluateSavedReport(report({ appIds: ['other'] }), installs).usable).toBe(false);
+    expect(evaluateSavedReport(report({ reportType: 'ad_monetization' }), installs).usable).toBe(
+      false,
+    );
+    expect(evaluateSavedReport(report({ metrics: ['cost'] }), installs).usable).toBe(false);
+  });
+
+  it('refuses a granularity that cannot be attributed to a day', () => {
+    for (const granularity of ['weekly', 'monthly', 'totals-daily']) {
+      expect(evaluateSavedReport(report({ granularity }), installs).usable).toBe(false);
+    }
+    expect(evaluateSavedReport(report({ granularity: 'daily' }), installs).usable).toBe(true);
+  });
+
+  it('refuses groupings that would collapse rows onto one key', () => {
+    // MART stores no site or creative dimension, so many rows would share a
+    // key and overwrite each other on write.
+    for (const groupBy of TENJIN_UNSAFE_GROUP_BY) {
+      const verdict = evaluateSavedReport(report({ groupBy }), installs);
+      expect(verdict.usable).toBe(false);
+      expect(verdict.blockers.join(' ')).toContain('collapse');
+    }
+  });
+
+  it('accepts a campaign-less grouping but says nothing can be reconciled', () => {
+    const verdict = evaluateSavedReport(report({ groupBy: 'app' }), installs);
+    expect(verdict.usable).toBe(true);
+    expect(verdict.notes.join(' ')).toContain('no campaign');
+  });
+
+  it('requires at least one revenue component, and never accepts the total alone', () => {
+    const revenue = {
+      appId: APP,
+      requiredMetrics: [],
+      anyOfMetrics: [TENJIN_REVENUE_METRIC_IAP, TENJIN_REVENUE_METRIC_AD],
+    };
+    expect(evaluateSavedReport(report({ metrics: ['revenues'] }), revenue).usable).toBe(true);
+    expect(evaluateSavedReport(report({ metrics: ['pub_rev'] }), revenue).usable).toBe(true);
+    // total_rev is revenues + pub_rev; importing it as a component would
+    // double-count against itself.
+    expect(evaluateSavedReport(report({ metrics: ['total_rev'] }), revenue).usable).toBe(false);
+  });
+
+  it('prefers the richest grouping among compatible reports', () => {
+    const { chosen } = selectSavedReport(
+      [
+        report({ id: 'coarse', groupBy: 'app' }),
+        report({ id: 'rich', groupBy: 'campaign,country' }),
+        report({ id: 'mid', groupBy: 'campaign' }),
+      ],
+      installs,
+    );
+    expect(chosen?.id).toBe('rich');
+  });
+
+  it('chooses nothing, and explains each refusal, when none fits', () => {
+    const { chosen, evaluated } = selectSavedReport(
+      [report({ id: 'a', metrics: ['cost'] }), report({ id: 'b', granularity: 'weekly' })],
+      installs,
+    );
+    expect(chosen).toBeNull();
+    expect(evaluated.every((c) => c.blockers.length > 0)).toBe(true);
+  });
+});
+
+describe('freshness never calls an unfetched stream fresh', () => {
+  it('reports the support state instead of a data age', () => {
+    for (const support of ['unsupported', 'not_implemented'] as const) {
+      expect(
+        computeFreshnessStatus({
+          lastSuccessAt: new Date(),
+          latestProviderDataDate: null,
+          expectedFreshnessMinutes: 360,
+          support,
+        }),
+      ).toBe(support);
+    }
+  });
+
+  it('leaves a genuinely fetched stream alone', () => {
+    expect(
+      computeFreshnessStatus({
+        lastSuccessAt: new Date(),
+        latestProviderDataDate: new Date().toISOString().slice(0, 10),
+        expectedFreshnessMinutes: 360,
+        support: 'supported',
+      }),
+    ).toBe('fresh');
+  });
+
+  it('does not let an unimplemented stream decide an app data health', () => {
+    // The whole point: installs are fine, so the app is fine.
+    expect(worstFreshness(['fresh', 'not_implemented'])).toBe('fresh');
+    expect(worstFreshness(['error', 'not_implemented'])).toBe('error');
+    expect(worstFreshness(['not_implemented'])).toBe('not_implemented');
   });
 });

@@ -54,17 +54,38 @@ const PORT = Number(process.env.MART_FIXTURE_PORT ?? 4900);
 const AD_ACCOUNT = 'act_FIXTURE0001';
 const APPSFLYER_APP = 'id_FIXTURE_APP';
 const TENJIN_APP = 'FIXTURE_TENJIN_APP';
-/** The real API accepts only these groupings; anything else is a 400. */
-const TENJIN_GROUP_BY = [
-  'app',
-  'channel',
-  'country',
-  'site',
-  'campaign',
-  'campaign,country',
-  'channel,app',
-  'channel,app,country',
-  'creative',
+/**
+ * Saved report definitions, the way a real account carries them.
+ *
+ * Reporting data is addressed by one of these ids - /reports/{id} - so the
+ * fixture cannot be pulled without discovering a report first, exactly like the
+ * real API. The second entry is deliberately unusable (weekly, and grouped on a
+ * dimension MART does not store) so the compatibility rules have something to
+ * refuse.
+ */
+const TENJIN_SAVED_REPORTS = [
+  {
+    id: '11111111-2222-3333-4444-555555555555',
+    name: 'FIXTURE UA daily by campaign',
+    report_type: 'user_acquisition',
+    app_ids: [TENJIN_APP],
+    metrics: ['tracked_installs', 'tracked_clicks', 'tracked_impressions', 'revenues', 'pub_rev'],
+    granularity: 'daily',
+    group_by: 'campaign,country',
+    past_number_days: 30,
+    channel_ids: [],
+  },
+  {
+    id: '66666666-7777-8888-9999-000000000000',
+    name: 'FIXTURE UA weekly by site',
+    report_type: 'user_acquisition',
+    app_ids: [TENJIN_APP],
+    metrics: ['tracked_installs'],
+    granularity: 'weekly',
+    group_by: 'site',
+    past_number_days: 90,
+    channel_ids: [],
+  },
 ];
 
 /**
@@ -455,14 +476,16 @@ const server = createServer((req, res) => {
   }
 
   // --------------------------------------------------------------- Tenjin ---
-  // Paths mirror the real API: /apps, /apps/{id} and /reports/user_acquisition,
-  // all relative to a base URL that already carries /v2. The legacy /api/v2
-  // prefix is stripped rather than served, so an operator with an older base URL
-  // still reaches the same routes instead of getting a confusing 404.
+  // Paths mirror the real API: /apps, /apps/{id}, /saved_reports and
+  // /reports/{saved report uuid}, all relative to a base URL that already
+  // carries /v2. The legacy /api/v2 prefix is stripped rather than served, so an
+  // operator with an older base URL still reaches the same routes.
   const tenjinPath = path.startsWith('/api/v2/') ? path.slice('/api/v2'.length) : path;
   if (
     tenjinPath === '/apps' ||
     tenjinPath.startsWith('/apps/') ||
+    tenjinPath === '/saved_reports' ||
+    tenjinPath.startsWith('/saved_reports/') ||
     tenjinPath.startsWith('/reports/')
   ) {
     const headers = { 'x-mart-fixture': 'synthetic-tenjin-data' };
@@ -497,17 +520,50 @@ const server = createServer((req, res) => {
       );
     }
 
-    if (tenjinPath === '/reports/user_acquisition') {
+    // Saved report definitions. Reporting data is addressed by the id of one of
+    // these, which is the whole point of the family.
+    if (tenjinPath === '/saved_reports') {
+      const type = q.get('report_type');
+      const reports = TENJIN_SAVED_REPORTS.filter((r) => !type || r.report_type === type);
+      return json(
+        res,
+        200,
+        {
+          data: reports.map((r) => ({
+            id: r.id,
+            type: 'saved_report',
+            attributes: { ...r },
+          })),
+        },
+        headers,
+      );
+    }
+
+    const savedDetail = /^\/saved_reports\/([^/]+)$/.exec(tenjinPath);
+    if (savedDetail) {
+      const id = decodeURIComponent(savedDetail[1]);
+      const report = TENJIN_SAVED_REPORTS.find((r) => r.id === id);
+      if (!report) return json(res, 404, { error: 'Saved report not found' }, headers);
+      return json(
+        res,
+        200,
+        { data: { id, type: 'saved_report', attributes: { ...report } } },
+        headers,
+      );
+    }
+
+    const reportPull = /^\/reports\/([^/]+)$/.exec(tenjinPath);
+    if (reportPull) {
+      const id = decodeURIComponent(reportPull[1]);
+      const report = TENJIN_SAVED_REPORTS.find((r) => r.id === id);
+      // The real failure this architecture exists to prevent: a report family
+      // name in the path is read as a saved report id and rejected.
+      if (!report) return json(res, 400, { error: 'Saved report not found' }, headers);
+
       const from = q.get('start_date');
       const to = q.get('end_date');
       if (!from || !to) return json(res, 400, { error: 'date range required' }, headers);
-      // group_by is a closed enum on the real API; anything else is rejected,
-      // so the fixture rejects it too rather than quietly returning rows.
-      const groupBy = q.get('group_by');
-      if (groupBy && !TENJIN_GROUP_BY.includes(groupBy)) {
-        return json(res, 400, { error: `invalid group_by: ${groupBy}` }, headers);
-      }
-      if (!q.get('app_ids')) return json(res, 400, { error: 'app_ids required' }, headers);
+
       const data = [];
       for (const date of daysIn(from, to)) {
         for (const campaign of CAMPAIGNS.slice(0, 2)) {
@@ -537,7 +593,7 @@ const server = createServer((req, res) => {
           });
         }
       }
-      return json(res, 200, { data, has_more: false }, headers);
+      return json(res, 200, { data, links: { next: null } }, headers);
     }
 
     return json(res, 404, { error: `no fixture route for ${path}` }, headers);

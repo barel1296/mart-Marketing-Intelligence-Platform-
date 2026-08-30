@@ -87,6 +87,12 @@ the classified error and the sanitized request context. A stream that returns
 rows but normalizes none says so explicitly, because that is a parser mismatch
 rather than an empty account.
 
+For Tenjin it also prints the account's saved reports and MART's verdict on each
+one, because Tenjin reporting is addressed by saved report UUID
+(`GET /v2/reports/{id}`) rather than by report family. If nothing in the account
+fits, the diagnostic says which report to create and why each existing one was
+refused - MART reads saved reports and never creates or edits one.
+
 ## Running natively
 
 ## Prerequisites
@@ -161,9 +167,10 @@ client, the real sync engine and the real metric arithmetic all run. It is _not_
 evidence that a connector works against the live provider, and it is not a
 specification of provider behaviour. Its data is synthetic and every id starts
 with `FIXTURE`, so a fixture row is recognisable anywhere it appears. The Tenjin
-routes mirror the real v2 contract — id-only `/apps`, a `/apps/{id}` detail, and
-`/reports/user_acquisition` returning JSON:API rows with `has_more` — so fixture
-mode exercises the same code path the real API does; see
+routes mirror the real v2 contract — id-only `/apps`, a `/apps/{id}` detail,
+`/saved_reports` definitions and `/reports/{uuid}` data — including the real
+`400 {"error":"Saved report not found"}` when a report family name is used as an
+id, so fixture mode exercises the same code path the real API does; see
 [INTEGRATIONS.md](INTEGRATIONS.md#tenjin).
 
 The server refuses to start without `MART_ENABLE_FIXTURES=true` and refuses to

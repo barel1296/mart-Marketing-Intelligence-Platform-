@@ -15,15 +15,30 @@
  */
 import { getConfig } from '@mart/config';
 import { closePool, queryRows } from '@mart/db';
-import { isProviderError, type IsoDate } from '@mart/shared';
+import { isProviderError, type CanonicalAttributionBatch, type IsoDate } from '@mart/shared';
 import { getCredentialStore } from '../credentials.js';
+import { computeFreshnessStatus } from '../sync/freshness.js';
+import {
+  selectSavedReport,
+  TenjinAttributionProvider,
+  TENJIN_INSTALL_METRIC,
+  TENJIN_REVENUE_METRIC_AD,
+  TENJIN_REVENUE_METRIC_IAP,
+  type TenjinSavedReport,
+} from '../providers/tenjin.js';
 import {
   isAttributionProvider,
   isMarketingNetworkProvider,
   type AnyProvider,
   type ProviderAccount,
+  type SyncResult,
 } from '../types.js';
 import { createProvider, getProviderDescriptor, providerEndpointInfo } from '../registry.js';
+
+/** Narrow to the Tenjin adapter, which alone has saved reports. */
+function isTenjinProvider(provider: AnyProvider): provider is TenjinAttributionProvider {
+  return provider instanceof TenjinAttributionProvider;
+}
 
 function line(label: string, value: unknown): void {
   process.stdout.write(`${label.padEnd(22)} ${String(value)}\n`);
@@ -192,10 +207,12 @@ const STREAMS = ['attribution_installs', 'attribution_revenue', 'attribution_eve
 type Stream = (typeof STREAMS)[number];
 
 /**
- * Run one reporting stream against the real provider and show what came back.
+ * Run one reporting stream against the real provider and show what happened.
  *
- * The app id, the date window and the row shape are all printed, because a
- * reporting failure is nearly always one of those three rather than the
+ * Tenjin reporting is addressed by saved report UUID, so the interesting part
+ * is usually the choice of report rather than the request: which saved reports
+ * the account has, which one MART picked, and - when it picked none - the exact
+ * reason each was refused. All of that is printed, and none of it includes the
  * credential.
  */
 async function diagnoseStream(
@@ -247,22 +264,44 @@ async function diagnoseStream(
     currency: binding.default_currency,
   };
 
-  try {
-    const result =
-      stream === 'attribution_installs'
-        ? await provider.syncInstalls(params)
-        : stream === 'attribution_revenue'
-          ? await provider.syncRevenue(params)
-          : await provider.syncEvents(params);
+  // Saved report discovery, printed whatever the outcome. This is the part the
+  // operator can act on: MART reads their reports and never creates one.
+  if (isTenjinProvider(provider) && stream !== 'attribution_events') {
+    await reportSavedReports(provider, binding.external_account_id, stream);
+  }
 
-    line('HTTP status', '200 (no error raised)');
-    line('pages fetched', result.pagesFetched);
-    line('rows fetched', result.rowsFetched);
-    line('rows rejected', result.rowsRejected);
-    line('latest data date', result.latestDataDate ?? '(none)');
-    line('installs normalized', result.batch.installs.length);
-    line('revenue normalized', result.batch.revenue.length);
-    line('events normalized', result.batch.events.length);
+  try {
+    let result: SyncResult<CanonicalAttributionBatch>;
+    if (stream === 'attribution_installs') result = await provider.syncInstalls(params);
+    else if (stream === 'attribution_revenue') result = await provider.syncRevenue(params);
+    else result = await provider.syncEvents(params);
+
+    process.stdout.write('\n');
+    line('REPORT REQUEST', `${stream} over ${window.from}..${window.to}`);
+    line(
+      'HTTP STATUS',
+      result.support && result.support !== 'supported' ? 'no request made' : '200',
+    );
+    line('ROWS FETCHED', result.rowsFetched);
+    line(
+      'ROWS NORMALIZED',
+      result.batch.installs.length + result.batch.revenue.length + result.batch.events.length,
+    );
+    line('ROWS REJECTED', result.rowsRejected);
+    line('PAGES FETCHED', result.pagesFetched);
+    line('LATEST DATA DATE', result.latestDataDate ?? '(none)');
+    line('STREAM SUPPORT', result.support ?? 'supported');
+    // A stream MART never fetched must not be recorded as fresh.
+    line(
+      'FRESHNESS WOULD BE',
+      computeFreshnessStatus({
+        lastSuccessAt: new Date(),
+        latestProviderDataDate: result.latestDataDate,
+        expectedFreshnessMinutes: 360,
+        ...(result.support ? { support: result.support } : {}),
+      }),
+    );
+    line('ERROR', '(none)');
     for (const warning of result.warnings) line('warning', warning);
 
     const sample = result.batch.installs[0] ?? result.batch.revenue[0] ?? result.batch.events[0];
@@ -274,16 +313,97 @@ async function diagnoseStream(
       );
     }
   } catch (error) {
+    process.stdout.write('\n');
     if (isProviderError(error)) {
-      line('HTTP status', error.httpStatus ?? '(no response)');
-      line('errorClass', error.errorClass);
-      line('message', error.userMessage);
+      line('HTTP STATUS', error.httpStatus ?? '(no response)');
+      line('ROWS FETCHED', 0);
+      line('ROWS NORMALIZED', 0);
+      line('ERROR', `${error.errorClass}: ${error.userMessage}`);
       // Already sanitized by the HTTP client: URL without secrets, truncated body.
       line('sanitized response', JSON.stringify(error.context ?? {}));
+      if (error.errorClass === 'configuration_required') {
+        process.stdout.write(
+          '\n  MART did not create anything in Tenjin. Create the saved report described\n' +
+            "  above in Tenjin's Data Exporter, then re-run this command.\n",
+        );
+      }
     } else {
-      line('error', error instanceof Error ? error.message : String(error));
+      line('ERROR', error instanceof Error ? error.message : String(error));
     }
   }
+}
+
+/** Print every saved report and MART's verdict on each, without guessing. */
+async function reportSavedReports(
+  provider: TenjinAttributionProvider,
+  appId: string,
+  stream: Stream,
+): Promise<void> {
+  heading('SAVED REPORTS');
+  let reports: TenjinSavedReport[];
+  try {
+    reports = await provider.listSavedReports();
+  } catch (error) {
+    line(
+      'discovery failed',
+      isProviderError(error) ? `${error.errorClass}: ${error.userMessage}` : String(error),
+    );
+    return;
+  }
+
+  line('SAVED REPORTS DISCOVERED', reports.length);
+  const requirement =
+    stream === 'attribution_revenue'
+      ? {
+          appId,
+          requiredMetrics: [],
+          anyOfMetrics: [TENJIN_REVENUE_METRIC_IAP, TENJIN_REVENUE_METRIC_AD],
+        }
+      : { appId, requiredMetrics: [TENJIN_INSTALL_METRIC] };
+
+  const { chosen, evaluated } = selectSavedReport(reports, requirement);
+
+  for (const candidate of evaluated) {
+    const report = candidate.report;
+    process.stdout.write('\n');
+    process.stdout.write(`  SAVED REPORT ID:  ${report.id}\n`);
+    process.stdout.write(`  REPORT NAME:      ${report.name ?? '(not returned)'}\n`);
+    process.stdout.write(`  REPORT TYPE:      ${report.reportType ?? '(not returned)'}\n`);
+    process.stdout.write(
+      `  APP IDS:          ${report.appIds.length ? report.appIds.join(', ') : '(all apps)'}\n`,
+    );
+    process.stdout.write(
+      `  METRICS:          ${report.metrics.length ? report.metrics.join(', ') : '(none)'}\n`,
+    );
+    process.stdout.write(`  GRANULARITY:      ${report.granularity ?? '(not returned)'}\n`);
+    process.stdout.write(`  GROUP BY:         ${report.groupBy ?? '(not returned)'}\n`);
+    process.stdout.write(`  PAST NUMBER DAYS: ${report.pastNumberDays ?? '(not returned)'}\n`);
+    process.stdout.write(
+      `  CHANNEL IDS:      ${report.channelIds.length ? report.channelIds.join(', ') : '(all)'}\n`,
+    );
+    process.stdout.write(
+      `  USABLE FOR ${stream}: ${candidate.usable ? 'yes' : `no - ${candidate.blockers.join('; ')}`}\n`,
+    );
+    // Notes qualify a report MART would use; on a refused one the blockers
+    // above are the whole story.
+    if (candidate.usable) {
+      for (const note of candidate.notes) process.stdout.write(`  note:             ${note}\n`);
+    }
+  }
+
+  process.stdout.write('\n');
+  heading('CANDIDATE REPORT');
+  if (!chosen) {
+    line('chosen', 'none - MART will ask for one rather than create it');
+    return;
+  }
+  line('SAVED REPORT ID', chosen.id);
+  line('REPORT NAME', chosen.name ?? '(not returned)');
+  line('REPORT TYPE', chosen.reportType ?? '(not returned)');
+  line('APP IDS', chosen.appIds.length ? chosen.appIds.join(', ') : '(all apps)');
+  line('METRICS', chosen.metrics.join(', '));
+  line('GRANULARITY', chosen.granularity ?? '(not returned)');
+  line('GROUP BY', chosen.groupBy ?? '(not returned)');
 }
 
 main()

@@ -293,6 +293,32 @@ describe('AppsFlyer adapter', () => {
 });
 
 describe('Tenjin adapter', () => {
+  // Reporting data is addressed by saved report UUID, so every sync makes two
+  // calls: discover the saved reports, then pull the chosen one.
+  const savedReports = JSON.stringify({
+    data: [
+      {
+        id: 'aa11bb22-cc33-dd44-ee55-ff6677889900',
+        type: 'saved_report',
+        attributes: {
+          name: 'MART UA daily',
+          report_type: 'user_acquisition',
+          app_ids: ['app-1'],
+          metrics: [
+            'tracked_installs',
+            'tracked_clicks',
+            'tracked_impressions',
+            'revenues',
+            'pub_rev',
+          ],
+          granularity: 'daily',
+          group_by: 'campaign,country',
+          past_number_days: 30,
+        },
+      },
+    ],
+  });
+
   const body = JSON.stringify({
     data: [
       {
@@ -311,7 +337,7 @@ describe('Tenjin adapter', () => {
   });
 
   it('uses tracked installs for attribution and ignores network-reported installs', async () => {
-    const stub = stubFetch([{ body }]);
+    const stub = stubFetch([{ body: savedReports }, { body }]);
     const provider = new TenjinAttributionProvider({
       credentials: { kind: 'tenjin', apiKey: 'k'.repeat(30) },
       baseUrl: 'https://tenjin.example.com',
@@ -337,7 +363,7 @@ describe('Tenjin adapter', () => {
         },
       ],
     });
-    const stub = stubFetch([{ body: revenueBody }]);
+    const stub = stubFetch([{ body: savedReports }, { body: revenueBody }]);
     const provider = new TenjinAttributionProvider({
       credentials: { kind: 'tenjin', apiKey: 'k'.repeat(30) },
       baseUrl: 'https://tenjin.example.com',

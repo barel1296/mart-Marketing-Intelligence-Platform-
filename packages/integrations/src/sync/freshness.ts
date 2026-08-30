@@ -1,4 +1,4 @@
-import type { FreshnessStatus, IsoDate } from '@mart/shared';
+import type { FreshnessStatus, IsoDate, StreamSupport } from '@mart/shared';
 import { minutesSince } from '@mart/shared';
 
 export type FreshnessInput = {
@@ -6,6 +6,12 @@ export type FreshnessInput = {
   latestProviderDataDate: IsoDate | null;
   expectedFreshnessMinutes: number;
   hasError?: boolean;
+  /**
+   * What the adapter said about this stream. A stream MART never fetched is
+   * neither fresh nor stale - it has no data age at all - so this decides the
+   * state before any timing is considered.
+   */
+  support?: StreamSupport;
   now?: Date;
 };
 
@@ -21,6 +27,10 @@ export type FreshnessInput = {
  */
 export function computeFreshnessStatus(input: FreshnessInput): FreshnessStatus {
   const now = input.now ?? new Date();
+  // Checked before the error and success branches: a no-op that "succeeded"
+  // must never be recorded as fresh, which is what made an unimplemented
+  // stream look like live data.
+  if (input.support && input.support !== 'supported') return input.support;
   if (input.hasError) return 'error';
   if (!input.lastSuccessAt) return 'unknown';
 
@@ -49,11 +59,24 @@ function todayIso(now: Date): IsoDate {
   return now.toISOString().slice(0, 10);
 }
 
-/** Worst state across a set, used to summarize an app's overall data health. */
+/** States that describe a stream nobody expects data from. */
+const NOT_APPLICABLE: readonly FreshnessStatus[] = ['unsupported', 'not_implemented'];
+
+/**
+ * Worst state across a set, used to summarize an app's overall data health.
+ *
+ * Streams that were never meant to be fetched are excluded rather than ranked:
+ * a Tenjin event stream MART does not implement says nothing about whether the
+ * install data is current, and letting it dominate would either hide a real
+ * problem or invent one. If every stream is in that category, that is the
+ * answer.
+ */
 export function worstFreshness(statuses: readonly FreshnessStatus[]): FreshnessStatus {
+  const applicable = statuses.filter((status) => !NOT_APPLICABLE.includes(status));
+  if (applicable.length === 0) return statuses[0] ?? 'unknown';
   const order: FreshnessStatus[] = ['error', 'stale', 'unknown', 'delayed', 'fresh'];
   for (const candidate of order) {
-    if (statuses.includes(candidate)) return candidate;
+    if (applicable.includes(candidate)) return candidate;
   }
   return 'unknown';
 }

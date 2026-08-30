@@ -103,6 +103,14 @@ export const PROVIDER_ERROR_CLASSES = [
   'data_validation_error',
   'normalization_error',
   'database_error',
+  /**
+   * The credential works and the request was well formed, but something the
+   * provider account must contain does not exist yet - a saved report, an
+   * export definition. Distinct from authorization_error (permission) and
+   * invalid_request (MART's fault): only the account owner can resolve it, and
+   * MART must say exactly what to create rather than mutating their account.
+   */
+  'configuration_required',
   'unknown_error',
 ] as const;
 export type ProviderErrorClass = (typeof PROVIDER_ERROR_CLASSES)[number];
@@ -123,8 +131,28 @@ export const CONNECTION_STATUSES = [
 ] as const;
 export type ConnectionStatus = (typeof CONNECTION_STATUSES)[number];
 
-export const FRESHNESS_STATUSES = ['fresh', 'delayed', 'stale', 'unknown', 'error'] as const;
+export const FRESHNESS_STATUSES = [
+  'fresh',
+  'delayed',
+  'stale',
+  'unknown',
+  'error',
+  /** The provider does not offer this data at all. */
+  'unsupported',
+  /** MART has not built this stream for this provider. */
+  'not_implemented',
+] as const;
 export type FreshnessStatus = (typeof FRESHNESS_STATUSES)[number];
+
+/**
+ * Whether a stream can be fetched at all.
+ *
+ * A stream that returns nothing because MART never asked is not fresh, and
+ * must never be recorded as if it were. Adapters say which case they are in;
+ * the sync engine turns that into the matching freshness state.
+ */
+export const STREAM_SUPPORT = ['supported', 'unsupported', 'not_implemented'] as const;
+export type StreamSupport = (typeof STREAM_SUPPORT)[number];
 
 /** Entity-mapping vocabulary (Meta <-> MMP reconciliation). */
 export const MAPPING_ENTITY_TYPES = ['campaign', 'ad_group', 'ad', 'creative'] as const;

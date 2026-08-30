@@ -15,7 +15,7 @@ in [DEVELOPMENT.md](DEVELOPMENT.md)).
 | ------------------------------ | ----------------------------------------- | ---------------------------------------------------------------------------------------- | ------------------------------- |
 | Meta Ads (Marketing API v21.0) | Published Graph API reference             | Yes — endpoints, fields, breakdowns, paging, error envelope                              | **No**                          |
 | AppsFlyer (Pull API v5)        | AppsFlyer developer hub                   | Yes — raw/agg export paths, parameters, CSV columns, plan-gated 200-with-prose behaviour | **No**                          |
-| Tenjin (v2)                    | Real responses from a live Tenjin account | Yes — endpoint, parameters, `group_by` enum, JSON:API envelope, pagination               | **Partly — see below**          |
+| Tenjin (v2)                    | Real responses from a live Tenjin account | Yes — saved-report architecture, metric catalogue, JSON:API envelope, pagination         | **Partly — see below**          |
 
 What that means in practice is set out under each provider. Nothing in this
 repository should be read as a claim that a connector has been proven end to end
@@ -132,64 +132,140 @@ measurement.
   `facebook_referrer_decryption_key`) are dropped before anything is stored or
   displayed. When an app still has no name, MART shows the raw id **as** an id
   rather than inventing one.
-- **Reporting**: `GET /reports/user_acquisition`, with `start_date`, `end_date`,
-  `granularity=daily`, `app_ids` (plural, comma-separated UUIDs — the bundle id is
-  not accepted), `metrics` and `format=json`.
-- **`group_by` is a closed enum**, not a free dimension list: `app`, `channel`,
-  `country`, `site`, `campaign`, `campaign,country`, `channel,app`,
-  `channel,app,country`, `creative`. MART sends `campaign,country`, the richest
-  grouping it can use; date, platform and ad network are not groupable and arrive
-  on the row regardless. Daily bucketing comes from `granularity`, not grouping.
-- **Envelope**: rows are JSON:API resources — `{"data": [{"type": "report",
-"attributes": {…}}], "has_more": false}` — so metrics live under `attributes`,
-  not at the top of the row. Pagination is `has_more` plus an opaque cursor;
-  `has_more` with no cursor stops the loop with a warning rather than truncating
-  the window silently.
+
+### Reporting is addressed by saved report, not by report family
+
+This is the part that is easy to get wrong, and MART got it wrong first:
+
+```
+GET /v2/reports/user_acquisition   ->  400 {"error":"Saved report not found"}
+```
+
+`GET /v2/reports/{id}` takes a **saved report UUID**. A report family name in
+that position is read as an id, and no such report exists. The definitions live
+in a separate family:
+
+| Purpose          | Endpoint                     |
+| ---------------- | ---------------------------- |
+| List definitions | `GET /v2/saved_reports`      |
+| One definition   | `GET /v2/saved_reports/{id}` |
+| Pull report data | `GET /v2/reports/{id}`       |
+
+So every Tenjin sync is two calls: discover, then pull.
+
+### MART reads saved reports and never writes them
+
+Discovery is `GET /v2/saved_reports?report_type=user_acquisition&per_page=1000`.
+Each definition is parsed down to the fields compatibility turns on: `id`,
+`name`, `report_type`, `app_ids`, `metrics`, `granularity`, `group_by`,
+`past_number_days`, `channel_ids`.
+
+A saved report is usable for a stream only if **all** of these hold:
+
+| Rule                                | Why                                                                                           |
+| ----------------------------------- | --------------------------------------------------------------------------------------------- |
+| `report_type` is `user_acquisition` | Other families report different facts                                                         |
+| covers the bound app                | `app_ids` contains it, or is empty (account-wide). Rows are then filtered by `app_id` on read |
+| has the metrics                     | installs need `tracked_installs`; revenue needs at least one of `revenues` / `pub_rev`        |
+| `granularity` is `daily`            | Weekly, monthly and totals buckets cannot be split back into days without inventing data      |
+| `group_by` is one MART stores       | Every dimension the report splits on must be one MART keeps                                   |
+
+`site` and `creative` groupings are **refused**: MART stores neither dimension,
+so many rows would share one storage key and overwrite each other — installs
+would silently disappear. A campaign-less grouping (`app`, `channel`, …) is
+accepted with a note that nothing can be reconciled to Meta from it.
+
+When several reports qualify, the richest grouping wins, then the most metrics,
+then the longest `past_number_days`.
+
+**When none qualifies, MART does not create one.** The sync fails with
+`configuration_required` carrying the machine-readable code
+`tenjin_saved_report_required`, the exact definition to create, and the reason
+each existing report was refused. A read-only integration must not reshape
+someone's Tenjin account to make its own life easier.
+
+### Date range
+
+MART asks for its own window with `start_date` and `end_date`, then checks what
+came back rather than assuming it was honoured — a saved report carries its own
+rolling `past_number_days`, and that period is the operator's setting, not
+MART's. Rows outside the requested window are not imported, and a window the
+report could not cover is reported as a warning naming the range that actually
+arrived. A partial window is never presented as a whole one.
+
+This behaviour is a runtime check precisely because the interaction between
+`past_number_days` and an explicit range could not be confirmed against the
+official API reference from the build environment (`api-docs.tenjin.com` is
+unreachable there). Whatever the API does, MART reports what it received.
+
+### Rows
+
+- **Envelope**: JSON:API resources — `{"data": [{"type": "report", "attributes":
+{…}}]}` — so metrics live under `attributes`, not at the top of the row.
+  Pagination follows `links.next` when present (same-origin only) and otherwise
+  `has_more` plus an opaque cursor.
 - **Metrics**: the adapter uses **`tracked_installs`, not `installs`** — the two
   are different measures in Tenjin (Tenjin-attributed versus network-reported),
   and using the wrong one produces a wrong CPI.
 - **Campaign identity**: `campaign_id` is a _Tenjin_ campaign UUID, not the ad
   network's campaign id, and `name` is Tenjin's campaign name. Stable-id matching
-  to Meta therefore cannot work, and reconciliation correctly falls back to
-  name candidates labelled non-authoritative.
-- **Revenue** comes from the same report — `revenues` (in-app) and `pub_rev` (ad)
-  — at `event_date` grain, consistent with AppsFlyer, so the two MMPs remain
-  interchangeable behind the interface. `total_rev` is their sum and is not
-  emitted, because doing so would double-count.
-- **Events**: the user-acquisition report has no in-app event breakdown, so
-  `syncEvents` returns an empty batch with a warning. The capability is reported
-  absent rather than approximated — an empty stream that never called the API is
-  not a healthy one.
+  to Meta therefore cannot work, and reconciliation correctly falls back to name
+  candidates labelled non-authoritative.
+- **Revenue**: `revenues` (in-app) and `pub_rev` (ad), at `event_date` grain,
+  consistent with AppsFlyer. `total_rev` is their sum and is deliberately not
+  imported: storage sums every revenue row for a date, so importing the total
+  beside its own parts would double-count. A saved report carrying only
+  `total_rev` is refused rather than imported as if it were one component.
 - **Not imported**: `*_Nd` cohort metrics (`revenues_Nd`, `roas_Nd`,
   `retention_Nd`). Tenjin declares `cohort_reporting: true` as a capability, but
   Phase 0A does not import cohort data — declaring a capability is not the same as
   using it, and cohort ROAS remains unavailable (see [METRICS.md](METRICS.md)).
-- **Still unproven**: MART's own client has not completed a live request from the
-  build environment. `node packages/integrations/dist/cli/diagnose.js tenjin
-attribution_installs` (and `attribution_revenue`) runs the real code path
-  against the real API and prints the request, the status, the row counts and the
-  first normalized row, without ever printing the key.
+
+### Events are `not_implemented`, not fresh
+
+The user-acquisition report has no in-app event breakdown, and MART has not built
+another Tenjin event source. `syncEvents` returns an empty batch marked
+`not_implemented`, and the freshness row records that instead of `fresh` — a
+stream that never made a request must not be presented as live data. Streams in
+that state are excluded from an app's worst-case data-health rollup, so an
+unimplemented stream neither hides a real problem nor invents one.
+
+### Still unproven
+
+MART's own client has not completed a live request from the build environment;
+`api.tenjin.com` is unreachable there. The diagnostic is what closes that gap on
+a machine that can reach it:
+
+```
+node packages/integrations/dist/cli/diagnose.js tenjin attribution_installs
+node packages/integrations/dist/cli/diagnose.js tenjin attribution_revenue
+```
+
+It prints the saved reports discovered, MART's verdict on each, the report it
+chose, the request, the status, the row counts and the freshness the run would
+record — and never the key.
 
 ## Error classification
 
 Every provider failure is mapped to one class. This is what makes an error
 message actionable instead of a stack trace.
 
-| Class                   | Retried | Typical cause and what MART does                                                                 |
-| ----------------------- | ------- | ------------------------------------------------------------------------------------------------ |
-| `authentication_error`  | no      | Bad or revoked token. Connection marked, user asked to reconnect                                 |
-| `authorization_error`   | no      | Token valid, resource or report not permitted for this plan                                      |
-| `expired_credential`    | no      | Token expired; reconnect prompt                                                                  |
-| `rate_limited`          | **yes** | Backoff with jitter, honouring the provider's signal                                             |
-| `provider_unavailable`  | **yes** | 5xx; retried up to `SYNC_MAX_ATTEMPTS`                                                           |
-| `timeout`               | **yes** | Network stall                                                                                    |
-| `invalid_request`       | no      | MART asked for something the account cannot serve — often the trigger for a capability downgrade |
-| `schema_change`         | no      | The response no longer matches the contract. Fails loudly and visibly                            |
-| `pagination_failure`    | no      | Cursor loop or page ceiling                                                                      |
-| `data_validation_error` | no      | Rows arrived but failed canonical validation                                                     |
-| `normalization_error`   | no      | A bug in mapping, surfaced rather than swallowed                                                 |
-| `database_error`        | no      | Storage failure during a run                                                                     |
-| `unknown_error`         | no      | Anything unclassified — never silently ignored                                                   |
+| Class                    | Retried | Typical cause and what MART does                                                                                                                            |
+| ------------------------ | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `authentication_error`   | no      | Bad or revoked token. Connection marked, user asked to reconnect                                                                                            |
+| `authorization_error`    | no      | Token valid, resource or report not permitted for this plan                                                                                                 |
+| `expired_credential`     | no      | Token expired; reconnect prompt                                                                                                                             |
+| `rate_limited`           | **yes** | Backoff with jitter, honouring the provider's signal                                                                                                        |
+| `provider_unavailable`   | **yes** | 5xx; retried up to `SYNC_MAX_ATTEMPTS`                                                                                                                      |
+| `timeout`                | **yes** | Network stall                                                                                                                                               |
+| `invalid_request`        | no      | MART asked for something the account cannot serve — often the trigger for a capability downgrade                                                            |
+| `schema_change`          | no      | The response no longer matches the contract. Fails loudly and visibly                                                                                       |
+| `pagination_failure`     | no      | Cursor loop or page ceiling                                                                                                                                 |
+| `data_validation_error`  | no      | Rows arrived but failed canonical validation                                                                                                                |
+| `normalization_error`    | no      | A bug in mapping, surfaced rather than swallowed                                                                                                            |
+| `database_error`         | no      | Storage failure during a run                                                                                                                                |
+| `configuration_required` | no      | Credential fine, request fine, but the provider account is missing something the sync needs (a saved report). MART names what to create and changes nothing |
+| `unknown_error`          | no      | Anything unclassified — never silently ignored                                                                                                              |
 
 Each class carries a user-facing message written for an operator, separate from
 the technical message kept for the log.
