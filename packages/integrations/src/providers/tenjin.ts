@@ -66,9 +66,14 @@ export type TenjinEndpoints = {
  * .../v2/api/v2/apps when an operator sets the documented base URL.
  */
 const DEFAULT_ENDPOINTS: Omit<TenjinEndpoints, 'dataExportsApps'> = {
-  userAcquisition: '/user_acquisition',
+  // Reporting lives under /reports, alongside /reports/sk_ad_network and
+  // /reports/ad_monetization - not at the API root beside /apps.
+  userAcquisition: '/reports/user_acquisition',
   apps: '/apps',
 };
+
+/** Bounded so a broken cursor cannot page forever. */
+const MAX_REPORT_PAGES = 200;
 
 /** Bounded so a large account cannot turn discovery into hundreds of requests. */
 const MAX_APPS_TO_ENRICH = 100;
@@ -82,15 +87,20 @@ export const TENJIN_ATTRIBUTION_METRICS = [
 
 export const TENJIN_REVENUE_METRICS = ['revenues', 'pub_rev', 'total_rev'] as const;
 
-export const TENJIN_GROUP_BY = [
-  'date',
-  'app',
-  'campaign',
-  'campaign_id',
-  'ad_network',
-  'country',
-  'platform',
-] as const;
+/**
+ * `group_by` is a closed enum, not a free list of dimensions. The allowed
+ * values are: app, channel, country, site, campaign, "campaign,country",
+ * "channel,app", "channel,app,country", creative. Sending anything else - a
+ * date, a platform, an ad_network - is rejected.
+ *
+ * "campaign,country" is the richest grouping MART can use: the row still
+ * carries app, ad network, platform and date, so nothing is lost by not naming
+ * them. Daily bucketing comes from `granularity`, not from grouping by date.
+ */
+export const TENJIN_GROUP_BY = 'campaign,country';
+
+/** Daily rows; the date arrives as a `date` attribute on each row. */
+export const TENJIN_GRANULARITY = 'daily';
 
 type TenjinRow = Record<string, string | number | null | undefined>;
 
@@ -425,9 +435,12 @@ export class TenjinAttributionProvider implements AttributionProvider {
       }
       const metric: CanonicalAttributionDailyMetric = {
         installDate,
-        mediaSource: str(row['ad_network'] ?? row['network'] ?? row['media_source']),
+        mediaSource: str(row['ad_network_name'] ?? row['ad_network'] ?? row['media_source']),
+        // Tenjin's own campaign UUID, not the ad network's campaign id, so it
+        // cannot match Meta by stable id. Reconciliation falls back to names
+        // and labels those candidates non-authoritative, which is correct.
         externalCampaignId: str(row['campaign_id'] ?? row['campaign_ref_id']),
-        campaignName: str(row['campaign'] ?? row['campaign_name']),
+        campaignName: str(row['campaign_name'] ?? row['campaign'] ?? row['name']),
         externalAdGroupId: null,
         adGroupName: null,
         externalAdId: null,
@@ -452,7 +465,10 @@ export class TenjinAttributionProvider implements AttributionProvider {
       pagesFetched: rows.pages,
       rowsFetched: rows.rows.length,
       rowsRejected: rejected,
-      warnings: rejected > 0 ? [`${rejected} Tenjin rows had no usable date.`] : [],
+      warnings: [
+        ...rows.warnings,
+        ...(rejected > 0 ? [`${rejected} Tenjin rows had no usable date.`] : []),
+      ],
       latestDataDate,
     };
   }
@@ -485,9 +501,9 @@ export class TenjinAttributionProvider implements AttributionProvider {
         continue;
       }
       const dims = {
-        mediaSource: str(row['ad_network'] ?? row['network'] ?? row['media_source']),
+        mediaSource: str(row['ad_network_name'] ?? row['ad_network'] ?? row['media_source']),
         externalCampaignId: str(row['campaign_id'] ?? row['campaign_ref_id']),
-        campaignName: str(row['campaign'] ?? row['campaign_name']),
+        campaignName: str(row['campaign_name'] ?? row['campaign'] ?? row['name']),
         country: countryCode(str(row['country'] ?? row['country_code'])),
         platform: platform(str(row['platform'])),
       };
@@ -516,33 +532,71 @@ export class TenjinAttributionProvider implements AttributionProvider {
       pagesFetched: rows.pages,
       rowsFetched: rows.rows.length,
       rowsRejected: rejected,
-      warnings: [],
+      warnings: rows.warnings,
       latestDataDate,
     };
   }
 
+  /**
+   * GET /reports/user_acquisition.
+   *
+   * Rows come back as JSON:API resources - `{data: [{type: "report",
+   * attributes: {...}}], has_more}` - so the metrics live under `attributes`,
+   * not at the top of each row. Pagination is an opaque cursor plus a
+   * `has_more` flag.
+   */
   private async fetchUserAcquisition(
     params: SyncParams,
     metrics: string[],
-  ): Promise<{ rows: TenjinRow[]; pages: number }> {
-    const body = await this.get<unknown>(this.endpoints.userAcquisition, {
-      app_id: params.externalAccountId,
-      start_date: params.from,
-      end_date: params.to,
-      group_by: TENJIN_GROUP_BY.join(','),
-      metrics: metrics.join(','),
-      timezone: params.timezone,
-    });
-    const rows = this.extractRows(body);
-    await params.onRawPage?.({
-      pageNumber: 1,
-      payload: body,
-      recordCount: rows.length,
-      schemaVersion: 'ua-v2',
-      windowStart: params.from,
-      windowEnd: params.to,
-    });
-    return { rows, pages: 1 };
+  ): Promise<{ rows: TenjinRow[]; pages: number; warnings: string[] }> {
+    const rows: TenjinRow[] = [];
+    const warnings: string[] = [];
+    let cursor: string | undefined;
+    let pages = 0;
+
+    for (let page = 1; page <= MAX_REPORT_PAGES; page += 1) {
+      const body = await this.get<unknown>(this.endpoints.userAcquisition, {
+        start_date: params.from,
+        end_date: params.to,
+        granularity: TENJIN_GRANULARITY,
+        group_by: TENJIN_GROUP_BY,
+        // Plural, comma-separated app UUIDs. The bundle id is not accepted here.
+        app_ids: params.externalAccountId,
+        metrics: metrics.join(','),
+        format: 'json',
+        ...(cursor ? { cursor } : {}),
+      });
+      pages += 1;
+
+      const pageRows = this.extractResources(body).map(
+        (resource) => resource.attributes as TenjinRow,
+      );
+      rows.push(...pageRows);
+
+      await params.onRawPage?.({
+        pageNumber: page,
+        payload: body,
+        recordCount: pageRows.length,
+        schemaVersion: 'reports-ua-v2',
+        windowStart: params.from,
+        windowEnd: params.to,
+      });
+
+      const envelope = (body ?? {}) as Record<string, unknown>;
+      if (envelope['has_more'] !== true) break;
+      cursor = readCursor(envelope);
+      if (!cursor) {
+        // Stopping with a warning beats looping: a missing cursor on a
+        // has_more page is a contract change, and silently truncating the
+        // window would look like real data.
+        warnings.push(
+          'Tenjin reported more pages but returned no pagination cursor; the window may be incomplete.',
+        );
+        break;
+      }
+    }
+
+    return { rows, pages, warnings };
   }
 }
 
@@ -678,4 +732,17 @@ const SENSITIVE_ATTRIBUTE_WORDS = /(key|secret|token|password|credential|signatu
 
 export function isSensitiveAttribute(key: string): boolean {
   return SENSITIVE_ATTRIBUTE_WORDS.test(key) || SENSITIVE_KEY_PATTERN.test(key);
+}
+
+/** The cursor Tenjin returns alongside has_more, wherever it puts it. */
+function readCursor(envelope: Record<string, unknown>): string | undefined {
+  for (const key of ['cursor', 'next_cursor', 'next']) {
+    const value = envelope[key];
+    if (typeof value === 'string' && value.length > 0) return value;
+  }
+  const meta = envelope['meta'];
+  if (meta && typeof meta === 'object') {
+    return readCursor(meta as Record<string, unknown>);
+  }
+  return undefined;
 }

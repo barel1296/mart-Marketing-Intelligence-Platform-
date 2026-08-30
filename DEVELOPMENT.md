@@ -72,6 +72,21 @@ That prints the mode, the endpoint, whether an Authorization header was
 attached, the HTTP status, the classified error and the accounts discovered. It
 never prints the credential - only its fingerprint and length.
 
+To exercise one reporting stream instead of discovery, name it:
+
+```bash
+docker compose exec api node packages/integrations/dist/cli/diagnose.js tenjin attribution_installs
+docker compose exec api node packages/integrations/dist/cli/diagnose.js tenjin attribution_revenue
+```
+
+That resolves the app this organization actually bound, requests the last 30
+days through the same code the sync uses, and prints the app identifier, the
+date window, the HTTP status, pages and rows fetched, rows rejected, the latest
+data date, the normalized counts and one sample normalized row - or, on failure,
+the classified error and the sanitized request context. A stream that returns
+rows but normalizes none says so explicitly, because that is a parser mismatch
+rather than an empty account.
+
 ## Running natively
 
 ## Prerequisites
@@ -146,8 +161,10 @@ client, the real sync engine and the real metric arithmetic all run. It is _not_
 evidence that a connector works against the live provider, and it is not a
 specification of provider behaviour. Its data is synthetic and every id starts
 with `FIXTURE`, so a fixture row is recognisable anywhere it appears. The Tenjin
-routes in particular follow MART's _assumed_ envelope, which is unverified — see
-[INTEGRATIONS.md](INTEGRATIONS.md#verification-status--read-this-first).
+routes mirror the real v2 contract — id-only `/apps`, a `/apps/{id}` detail, and
+`/reports/user_acquisition` returning JSON:API rows with `has_more` — so fixture
+mode exercises the same code path the real API does; see
+[INTEGRATIONS.md](INTEGRATIONS.md#tenjin).
 
 The server refuses to start without `MART_ENABLE_FIXTURES=true` and refuses to
 start at all when `NODE_ENV=production`. Nothing in the production code path

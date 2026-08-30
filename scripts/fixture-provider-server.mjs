@@ -54,6 +54,18 @@ const PORT = Number(process.env.MART_FIXTURE_PORT ?? 4900);
 const AD_ACCOUNT = 'act_FIXTURE0001';
 const APPSFLYER_APP = 'id_FIXTURE_APP';
 const TENJIN_APP = 'FIXTURE_TENJIN_APP';
+/** The real API accepts only these groupings; anything else is a 400. */
+const TENJIN_GROUP_BY = [
+  'app',
+  'channel',
+  'country',
+  'site',
+  'campaign',
+  'campaign,country',
+  'channel,app',
+  'channel,app,country',
+  'creative',
+];
 
 /**
  * Three campaigns, chosen so the reconciliation screen has something real to
@@ -66,8 +78,18 @@ const TENJIN_APP = 'FIXTURE_TENJIN_APP';
  */
 const CAMPAIGNS = [
   { id: 'FIXTURE_C_1001', name: 'FIXTURE UA iOS Tier1', objective: 'APP_INSTALLS', budget: 250000 },
-  { id: 'FIXTURE_C_1002', name: 'FIXTURE UA Android Broad', objective: 'APP_INSTALLS', budget: 180000 },
-  { id: 'FIXTURE_C_1003', name: 'FIXTURE Retargeting EU', objective: 'APP_INSTALLS', budget: 60000 },
+  {
+    id: 'FIXTURE_C_1002',
+    name: 'FIXTURE UA Android Broad',
+    objective: 'APP_INSTALLS',
+    budget: 180000,
+  },
+  {
+    id: 'FIXTURE_C_1003',
+    name: 'FIXTURE Retargeting EU',
+    objective: 'APP_INSTALLS',
+    budget: 60000,
+  },
 ];
 const MMP_ONLY_CAMPAIGN_NAME = 'FIXTURE UA iOS Tier1';
 const COUNTRIES = ['US', 'GB', 'DE'];
@@ -289,7 +311,11 @@ const server = createServer((req, res) => {
     }
 
     return json(res, 400, {
-      error: { message: `Fixture server has no route for edge '${edge}'`, type: 'GraphMethodException', code: 100 },
+      error: {
+        message: `Fixture server has no route for edge '${edge}'`,
+        type: 'GraphMethodException',
+        code: 100,
+      },
     });
   }
 
@@ -429,52 +455,97 @@ const server = createServer((req, res) => {
   }
 
   // --------------------------------------------------------------- Tenjin ---
-  if (path.startsWith('/api/v2/')) {
-    const headers = { 'x-mart-fixture': 'unverified-tenjin-envelope' };
+  // Paths mirror the real API: /apps, /apps/{id} and /reports/user_acquisition,
+  // all relative to a base URL that already carries /v2. The legacy /api/v2
+  // prefix is stripped rather than served, so an operator with an older base URL
+  // still reaches the same routes instead of getting a confusing 404.
+  const tenjinPath = path.startsWith('/api/v2/') ? path.slice('/api/v2'.length) : path;
+  if (
+    tenjinPath === '/apps' ||
+    tenjinPath.startsWith('/apps/') ||
+    tenjinPath.startsWith('/reports/')
+  ) {
+    const headers = { 'x-mart-fixture': 'synthetic-tenjin-data' };
     if (!token) return json(res, 401, { error: 'invalid api key' }, headers);
 
-    if (path === '/api/v2/apps') {
+    // The collection really does return resource identifiers only - no names.
+    // Reproducing that is the point: it is what forces the detail lookup.
+    if (tenjinPath === '/apps') {
+      return json(res, 200, { data: [{ id: TENJIN_APP, type: 'app' }] }, headers);
+    }
+
+    const detail = /^\/apps\/([^/]+)$/.exec(tenjinPath);
+    if (detail) {
+      const id = decodeURIComponent(detail[1]);
+      if (id !== TENJIN_APP) return json(res, 404, { error: 'app not found' }, headers);
       return json(
         res,
         200,
         {
-          data: [
-            { id: TENJIN_APP, name: 'FIXTURE Tenjin App (synthetic)', platform: 'ios', store_id: 'id000000000' },
-          ],
+          data: {
+            id,
+            type: 'app',
+            attributes: {
+              name: 'FIXTURE Tenjin App (synthetic)',
+              bundle_id: 'com.fixture.tenjin',
+              platform: 'ios',
+              store_id: 'id000000000',
+            },
+          },
         },
         headers,
       );
     }
 
-    if (path === '/api/v2/user_acquisition') {
-      const from = q.get('start_date') ?? q.get('from');
-      const to = q.get('end_date') ?? q.get('to');
+    if (tenjinPath === '/reports/user_acquisition') {
+      const from = q.get('start_date');
+      const to = q.get('end_date');
       if (!from || !to) return json(res, 400, { error: 'date range required' }, headers);
-      const rows = [];
+      // group_by is a closed enum on the real API; anything else is rejected,
+      // so the fixture rejects it too rather than quietly returning rows.
+      const groupBy = q.get('group_by');
+      if (groupBy && !TENJIN_GROUP_BY.includes(groupBy)) {
+        return json(res, 400, { error: `invalid group_by: ${groupBy}` }, headers);
+      }
+      if (!q.get('app_ids')) return json(res, 400, { error: 'app_ids required' }, headers);
+      const data = [];
       for (const date of daysIn(from, to)) {
         for (const campaign of CAMPAIGNS.slice(0, 2)) {
           const d = delivery(date, campaign, null);
-          rows.push({
-            date,
-            campaign_id: campaign.id,
-            campaign_name: campaign.name,
-            ad_network: 'Facebook',
-            country: 'US',
-            platform: 'ios',
-            tracked_installs: Math.round(d.installs * 0.82),
-            tracked_clicks: d.clicks,
-            tracked_impressions: d.impressions,
-            revenues: Math.round(d.installs * 0.9 * 100) / 100,
+          data.push({
+            type: 'report',
+            // Rows are JSON:API resources: the metrics live under attributes.
+            attributes: {
+              date,
+              app_id: TENJIN_APP,
+              app_name: 'FIXTURE Tenjin App (synthetic)',
+              // Tenjin's own campaign UUID, not the ad network's id - which is
+              // why MART cannot match this to Meta by stable id.
+              campaign_id: `FIXTURE-TENJIN-${campaign.id}`,
+              name: campaign.name,
+              ad_network_id: 3,
+              ad_network_name: 'Meta',
+              country: 'US',
+              platform: 'ios',
+              tracked_installs: Math.round(d.installs * 0.82),
+              tracked_clicks: d.clicks,
+              tracked_impressions: d.impressions,
+              revenues: Math.round(d.installs * 0.9 * 100) / 100,
+              pub_rev: 0.0,
+              total_rev: Math.round(d.installs * 0.9 * 100) / 100,
+            },
           });
         }
       }
-      return json(res, 200, { data: rows }, headers);
+      return json(res, 200, { data, has_more: false }, headers);
     }
 
     return json(res, 404, { error: `no fixture route for ${path}` }, headers);
   }
 
-  json(res, 404, { error: { message: `Fixture server has no route for ${path}`, type: 'FixtureError' } });
+  json(res, 404, {
+    error: { message: `Fixture server has no route for ${path}`, type: 'FixtureError' },
+  });
 });
 
 server.listen(PORT, () => {

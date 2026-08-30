@@ -611,3 +611,229 @@ describe('tenjin app detail enrichment', () => {
     expect(urls.some((u) => u.includes('api.tenjin.com'))).toBe(false);
   });
 });
+
+/**
+ * The real user-acquisition report, pinned.
+ *
+ * Every value asserted here was observed against a live Tenjin account, and
+ * each one was wrong in the version of the adapter that reported
+ * `attribution_installs` and `attribution_revenue` as failing: the endpoint
+ * sat at the API root instead of under /reports, the app filter was singular,
+ * `group_by` was a free-form dimension list rather than one of the enum's
+ * members, `granularity` was absent, and the rows were read flat when they
+ * actually arrive as JSON:API resources.
+ */
+describe('tenjin user acquisition report', () => {
+  type Reply = { status?: number; body: unknown };
+
+  function providerFor(handler: (url: URL, page: number) => Reply): {
+    provider: TenjinAttributionProvider;
+    urls: URL[];
+  } {
+    const urls: URL[] = [];
+    const provider = new TenjinAttributionProvider({
+      credentials: { kind: 'tenjin', apiKey: 'tenjin-secret-token-value' },
+      baseUrl: 'https://api.tenjin.com/v2',
+      http: new ProviderHttpClient({
+        provider: 'tenjin',
+        minIntervalMs: 0,
+        maxAttempts: 1,
+        fetchImpl: async (url: string) => {
+          const parsed = new URL(String(url));
+          urls.push(parsed);
+          const { status = 200, body } = handler(parsed, urls.length);
+          return new Response(JSON.stringify(body), {
+            status,
+            headers: { 'content-type': 'application/json' },
+          });
+        },
+      }),
+    });
+    return { provider, urls };
+  }
+
+  const APP = 'b6861802-21c7-4e6f-994d-44783bbda367';
+
+  const params = {
+    externalAccountId: APP,
+    from: '2026-08-01',
+    to: '2026-08-28',
+    timezone: 'UTC',
+    currency: 'USD',
+  };
+
+  /** One row, exactly as the live API returns it. */
+  const ROW = {
+    ad_network_id: 3,
+    ad_network_name: 'Meta',
+    app_id: APP,
+    app_name: 'Reveal Rush',
+    // A Tenjin campaign UUID - deliberately not a Meta campaign id.
+    campaign_id: 'b47f71fd-4c12-48ba-b49a-f78e5d7a7fa3',
+    country: 'US',
+    date: '2026-08-28',
+    name: 'CPI_Broad_US_static (FB_Reveal_Rush_CPI_Broad_US_26/08/26)',
+    platform: 'android',
+    revenues: 12.5,
+    pub_rev: 3.25,
+    total_rev: 15.75,
+    tracked_clicks: 140,
+    tracked_installs: 28,
+  };
+
+  const ONE_PAGE = { data: [{ attributes: ROW, type: 'report' }], has_more: false };
+
+  it('requests /reports/user_acquisition with the parameters the API accepts', async () => {
+    const { provider, urls } = providerFor(() => ({ body: ONE_PAGE }));
+    await provider.syncInstalls(params);
+
+    const url = urls[0];
+    expect(url?.origin + url?.pathname).toBe('https://api.tenjin.com/v2/reports/user_acquisition');
+    const q = url?.searchParams;
+    expect(q?.get('start_date')).toBe('2026-08-01');
+    expect(q?.get('end_date')).toBe('2026-08-28');
+    expect(q?.get('granularity')).toBe('daily');
+    expect(q?.get('format')).toBe('json');
+    // Plural. The singular form is silently ignored, which is what produced
+    // whole-account rows or none at all.
+    expect(q?.get('app_ids')).toBe(APP);
+    expect(q?.has('app_id')).toBe(false);
+    expect(q?.get('metrics')).toContain('tracked_installs');
+  });
+
+  it('groups by a member of the closed group_by enum', async () => {
+    const { provider, urls } = providerFor(() => ({ body: ONE_PAGE }));
+    await provider.syncInstalls(params);
+
+    const groupBy = urls[0]?.searchParams.get('group_by');
+    // The enum, verbatim. Anything outside it is rejected by the API.
+    expect([
+      'app',
+      'channel',
+      'country',
+      'site',
+      'campaign',
+      'campaign,country',
+      'channel,app',
+      'channel,app,country',
+      'creative',
+    ]).toContain(groupBy);
+    // The two that were previously sent and are not groupable at all.
+    expect(groupBy).not.toContain('date');
+    expect(groupBy).not.toContain('platform');
+  });
+
+  it('reads metrics from data[].attributes, not from the top of the row', async () => {
+    const { provider } = providerFor(() => ({ body: ONE_PAGE }));
+    const result = await provider.syncInstalls(params);
+
+    expect(result.rowsFetched).toBe(1);
+    expect(result.rowsRejected).toBe(0);
+    const install = result.batch.installs[0];
+    expect(install?.installDate).toBe('2026-08-28');
+    expect(install?.attributedInstalls).toBe(28);
+    expect(install?.attributedClicks).toBe(140);
+    expect(install?.mediaSource).toBe('Meta');
+    expect(install?.externalCampaignId).toBe('b47f71fd-4c12-48ba-b49a-f78e5d7a7fa3');
+    expect(install?.campaignName).toBe(
+      'CPI_Broad_US_static (FB_Reveal_Rush_CPI_Broad_US_26/08/26)',
+    );
+    expect(install?.country).toBe('US');
+    expect(install?.platform).toBe('android');
+    expect(result.latestDataDate).toBe('2026-08-28');
+  });
+
+  it('counts only Tenjin-tracked installs, never the network-reported figure', async () => {
+    const { provider } = providerFor(() => ({
+      body: { data: [{ attributes: { ...ROW, installs: 999 }, type: 'report' }], has_more: false },
+    }));
+    const result = await provider.syncInstalls(params);
+    expect(result.batch.installs[0]?.attributedInstalls).toBe(28);
+  });
+
+  it('takes revenue from the same report, at event_date grain', async () => {
+    const { provider, urls } = providerFor(() => ({ body: ONE_PAGE }));
+    const result = await provider.syncRevenue(params);
+
+    // No second API family: revenue is columns on the user-acquisition report.
+    expect(urls).toHaveLength(1);
+    expect(urls[0]?.pathname).toBe('/v2/reports/user_acquisition');
+    expect(urls[0]?.searchParams.get('metrics')).toContain('revenues');
+
+    const byType = Object.fromEntries(result.batch.revenue.map((r) => [r.revenueType, r] as const));
+    expect(byType['iap']?.revenue).toBe(12.5);
+    expect(byType['ad']?.revenue).toBe(3.25);
+    // total_rev is the sum of the other two; emitting it would double-count.
+    expect(result.batch.revenue).toHaveLength(2);
+    for (const row of result.batch.revenue) {
+      // Revenue recorded on the date, not cohort LTV.
+      expect(row.grain).toBe('event_date');
+      expect(row.activityDate).toBe('2026-08-28');
+      expect(row.currency).toBe('USD');
+    }
+  });
+
+  it('does not import the N-day cohort revenue columns', async () => {
+    const { provider, urls } = providerFor(() => ({ body: ONE_PAGE }));
+    await provider.syncRevenue(params);
+    const metrics = urls[0]?.searchParams.get('metrics') ?? '';
+    expect(metrics).not.toMatch(/_\d+d\b/);
+  });
+
+  it('follows the cursor while has_more is true', async () => {
+    const { provider, urls } = providerFor((_url, page) =>
+      page === 1
+        ? { body: { data: [{ attributes: ROW, type: 'report' }], has_more: true, cursor: 'PAGE2' } }
+        : {
+            body: {
+              data: [{ attributes: { ...ROW, date: '2026-08-27' }, type: 'report' }],
+              has_more: false,
+            },
+          },
+    );
+    const result = await provider.syncInstalls(params);
+
+    expect(urls).toHaveLength(2);
+    expect(urls[0]?.searchParams.has('cursor')).toBe(false);
+    expect(urls[1]?.searchParams.get('cursor')).toBe('PAGE2');
+    expect(result.pagesFetched).toBe(2);
+    expect(result.batch.installs).toHaveLength(2);
+    expect(result.latestDataDate).toBe('2026-08-28');
+  });
+
+  it('stops and warns when has_more is true but no cursor comes back', async () => {
+    const { provider, urls } = providerFor(() => ({
+      body: { data: [{ attributes: ROW, type: 'report' }], has_more: true },
+    }));
+    const result = await provider.syncInstalls(params);
+
+    // One request, not two hundred: a missing cursor must not become a loop,
+    // and the truncated window must not look like a complete one.
+    expect(urls).toHaveLength(1);
+    expect(result.warnings.join(' ')).toContain('cursor');
+  });
+
+  it('rejects rows with no date rather than dropping them silently', async () => {
+    const { provider } = providerFor(() => ({
+      body: {
+        data: [
+          { attributes: { ...ROW, date: undefined }, type: 'report' },
+          { attributes: ROW, type: 'report' },
+        ],
+        has_more: false,
+      },
+    }));
+    const result = await provider.syncInstalls(params);
+    expect(result.rowsFetched).toBe(2);
+    expect(result.rowsRejected).toBe(1);
+    expect(result.batch.installs).toHaveLength(1);
+    expect(result.warnings.join(' ')).toContain('no usable date');
+  });
+
+  it('never puts the api key in the report URL', async () => {
+    const { provider, urls } = providerFor(() => ({ body: ONE_PAGE }));
+    await provider.syncInstalls(params);
+    expect(urls[0]?.toString()).not.toContain('tenjin-secret-token-value');
+    expect(urls[0]?.searchParams.has('api_key')).toBe(false);
+  });
+});

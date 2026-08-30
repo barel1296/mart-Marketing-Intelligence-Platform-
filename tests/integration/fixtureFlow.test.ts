@@ -2,7 +2,11 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { clearProviderOverrides } from '@mart/integrations';
+import {
+  clearProviderOverrides,
+  ProviderHttpClient,
+  TenjinAttributionProvider,
+} from '@mart/integrations';
 import {
   closeServer,
   connectProvider,
@@ -33,6 +37,7 @@ const SERVER_SCRIPT = path.resolve(HERE, '../../scripts/fixture-provider-server.
 
 const META_ACCOUNT = 'act_FIXTURE0001';
 const APPSFLYER_APP = 'id_FIXTURE_APP';
+const TENJIN_APP = 'FIXTURE_TENJIN_APP';
 // Long enough to pass the adapter's token shape check, and obviously not a key.
 const TOKEN = 'FIXTURE-TOKEN-000000000000000000';
 
@@ -266,5 +271,75 @@ describe('fixture provider flow over real HTTP', () => {
     );
     // A malformed credential is rejected before any request is made.
     expect(response.statusCode).toBe(400);
+  });
+});
+
+/**
+ * The Tenjin adapter over real HTTP.
+ *
+ * The other end is the fixture server, so this proves nothing about the live
+ * Tenjin API. What it does prove is that the request MART builds is answerable
+ * at the paths the real API uses - /apps, /apps/{id}, /reports/user_acquisition
+ * - and that the reply parses. The wire shapes asserted in
+ * tests/unit/providerRouting.test.ts are the ones observed on a real account;
+ * this suite checks the code path end to end at those same addresses.
+ */
+describe('tenjin adapter over real HTTP', () => {
+  function provider(): TenjinAttributionProvider {
+    return new TenjinAttributionProvider({
+      credentials: { kind: 'tenjin', apiKey: TOKEN },
+      // No /v2 suffix here: the fixture server is not Tenjin, and the adapter
+      // must build its paths relative to whatever base URL it is given.
+      baseUrl: `http://127.0.0.1:${PORT}`,
+      http: new ProviderHttpClient({ provider: 'tenjin', minIntervalMs: 0, maxAttempts: 1 }),
+    });
+  }
+
+  const window = {
+    externalAccountId: TENJIN_APP,
+    from: '2026-08-01',
+    to: '2026-08-03',
+    timezone: 'UTC',
+    currency: 'USD',
+  };
+
+  it('discovers the app through the list-then-detail path', async () => {
+    const apps = await provider().listApps();
+    expect(apps).toHaveLength(1);
+    expect(apps[0]?.externalAccountId).toBe(TENJIN_APP);
+    expect(apps[0]?.name).toBe('FIXTURE Tenjin App (synthetic)');
+    expect(apps[0]?.metadata?.['platform']).toBe('ios');
+    expect(apps[0]?.metadata?.['bundleId']).toBe('com.fixture.tenjin');
+  });
+
+  it('ingests installs from the user-acquisition report', async () => {
+    const result = await provider().syncInstalls(window);
+    expect(result.rowsFetched).toBeGreaterThan(0);
+    expect(result.rowsRejected).toBe(0);
+    expect(result.batch.installs.length).toBe(result.rowsFetched);
+    const install = result.batch.installs[0];
+    expect(install?.attributedInstalls).toBeGreaterThan(0);
+    expect(install?.mediaSource).toBe('Meta');
+    expect(install?.campaignName).toBeTruthy();
+    expect(result.latestDataDate).toBe('2026-08-03');
+  });
+
+  it('ingests revenue from the same report at event_date grain', async () => {
+    const result = await provider().syncRevenue(window);
+    expect(result.batch.revenue.length).toBeGreaterThan(0);
+    expect(result.batch.revenue.every((row) => row.grain === 'event_date')).toBe(true);
+    expect(result.batch.revenue.every((row) => row.currency === 'USD')).toBe(true);
+    expect(result.batch.revenue.some((row) => row.revenueType === 'iap')).toBe(true);
+  });
+
+  it('reports a rejected api key as an authentication failure, not a schema change', async () => {
+    const anonymous = new TenjinAttributionProvider({
+      credentials: { kind: 'tenjin', apiKey: '' },
+      baseUrl: `http://127.0.0.1:${PORT}`,
+      http: new ProviderHttpClient({ provider: 'tenjin', minIntervalMs: 0, maxAttempts: 1 }),
+    });
+    const health = await anonymous.validateConnection();
+    expect(health.ok).toBe(false);
+    expect(health.errorClass).toBe('authentication_error');
   });
 });

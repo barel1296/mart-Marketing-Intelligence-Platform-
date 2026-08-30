@@ -2,15 +2,20 @@
 
 ## Verification status — read this first
 
-Phase 0A was implemented without access to any live provider account. No Meta
-Ads token, no AppsFlyer token and no Tenjin API key were available in the build
-environment, so **no MART connector has been run against a real provider API.**
+Phase 0A was implemented without access to any live provider account, and the
+build environment has no outbound access to the provider APIs. Meta and
+AppsFlyer are therefore documentation-verified only. Tenjin is the exception:
+its wire format was corrected against **real responses from a live Tenjin
+account**, so the shapes below are observed rather than assumed — but MART's own
+HTTP client still has not completed a request to `api.tenjin.com` from this
+environment, so the end-to-end run belongs to the operator (see the diagnostic
+in [DEVELOPMENT.md](DEVELOPMENT.md)).
 
-| Provider                       | Contract source                                                | Verified against docs                                                                    | Verified against a live account |
-| ------------------------------ | -------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | ------------------------------- |
-| Meta Ads (Marketing API v21.0) | Published Graph API reference                                  | Yes — endpoints, fields, breakdowns, paging, error envelope                              | **No**                          |
-| AppsFlyer (Pull API v5)        | AppsFlyer developer hub                                        | Yes — raw/agg export paths, parameters, CSV columns, plan-gated 200-with-prose behaviour | **No**                          |
-| Tenjin                         | Metric catalogue verified; **REST wire format not verifiable** | Partial — see below                                                                      | **No**                          |
+| Provider                       | Contract source                           | Verified against docs                                                                    | Verified against a live account |
+| ------------------------------ | ----------------------------------------- | ---------------------------------------------------------------------------------------- | ------------------------------- |
+| Meta Ads (Marketing API v21.0) | Published Graph API reference             | Yes — endpoints, fields, breakdowns, paging, error envelope                              | **No**                          |
+| AppsFlyer (Pull API v5)        | AppsFlyer developer hub                   | Yes — raw/agg export paths, parameters, CSV columns, plan-gated 200-with-prose behaviour | **No**                          |
+| Tenjin (v2)                    | Real responses from a live Tenjin account | Yes — endpoint, parameters, `group_by` enum, JSON:API envelope, pagination               | **Partly — see below**          |
 
 What that means in practice is set out under each provider. Nothing in this
 repository should be read as a claim that a connector has been proven end to end
@@ -115,27 +120,55 @@ measurement.
 
 ## Tenjin
 
-- **Base**: `https://reporting.tenjin.com` (configurable).
-- **Auth**: API key.
-- **Verified**: the metric vocabulary. Tenjin's user-acquisition report uses
-  `tracked_installs`, `tracked_clicks`, `tracked_impressions` and
-  `revenues`/`pub_rev`/`total_rev`. In particular the adapter uses
-  **`tracked_installs`, not `installs`** — the two are different measures in
-  Tenjin, and using the wrong one produces a wrong CPI.
-- **Not verified**: the REST wire format. The exact endpoint paths, parameter
-  names and response envelope could not be confirmed against live documentation
-  or a live account in this environment. Three things follow:
-  1. Endpoint paths are **configurable** (`TenjinEndpoints`), defaulting to
-     `/api/v2/user_acquisition` and `/api/v2/apps`, so a corrected contract is a
-     configuration change rather than a code change.
-  2. The response reader accepts several plausible envelopes (a bare array, or
-     `data` / `results` / `rows` / `report`) and **fails loudly** with a
-     `schema_change` error on anything else, rather than guessing.
-  3. Tenjin declares `cohort_reporting: true` as a capability, but Phase 0A does
-     **not** import cohort data — declaring a capability is not the same as using
-     it, and cohort ROAS remains unavailable (see [METRICS.md](METRICS.md)).
-- **Revenue** is emitted at `event_date` grain, consistent with AppsFlyer, so the
-  two MMPs remain interchangeable behind the interface.
+- **Base**: `https://api.tenjin.com/v2` (configurable). The version lives in the
+  base URL, so adapter paths are version-free and cannot concatenate into
+  `.../v2/api/v2/apps`.
+- **Auth**: API key as `Authorization: Bearer <key>`. Never a query parameter — a
+  token in a URL leaks through logs, proxies and the provider's own error echoes.
+- **Apps**: `GET /apps` returns resource identifiers only — `{"id": "...", "type":
+"app"}` with no attributes — so each id is enriched with `GET /apps/{id}`, which
+  carries `name`, `bundle_id`, `platform` and `store_id`. Key-shaped attributes on
+  that response (`public_key`, `ios_shared_secret`,
+  `facebook_referrer_decryption_key`) are dropped before anything is stored or
+  displayed. When an app still has no name, MART shows the raw id **as** an id
+  rather than inventing one.
+- **Reporting**: `GET /reports/user_acquisition`, with `start_date`, `end_date`,
+  `granularity=daily`, `app_ids` (plural, comma-separated UUIDs — the bundle id is
+  not accepted), `metrics` and `format=json`.
+- **`group_by` is a closed enum**, not a free dimension list: `app`, `channel`,
+  `country`, `site`, `campaign`, `campaign,country`, `channel,app`,
+  `channel,app,country`, `creative`. MART sends `campaign,country`, the richest
+  grouping it can use; date, platform and ad network are not groupable and arrive
+  on the row regardless. Daily bucketing comes from `granularity`, not grouping.
+- **Envelope**: rows are JSON:API resources — `{"data": [{"type": "report",
+"attributes": {…}}], "has_more": false}` — so metrics live under `attributes`,
+  not at the top of the row. Pagination is `has_more` plus an opaque cursor;
+  `has_more` with no cursor stops the loop with a warning rather than truncating
+  the window silently.
+- **Metrics**: the adapter uses **`tracked_installs`, not `installs`** — the two
+  are different measures in Tenjin (Tenjin-attributed versus network-reported),
+  and using the wrong one produces a wrong CPI.
+- **Campaign identity**: `campaign_id` is a _Tenjin_ campaign UUID, not the ad
+  network's campaign id, and `name` is Tenjin's campaign name. Stable-id matching
+  to Meta therefore cannot work, and reconciliation correctly falls back to
+  name candidates labelled non-authoritative.
+- **Revenue** comes from the same report — `revenues` (in-app) and `pub_rev` (ad)
+  — at `event_date` grain, consistent with AppsFlyer, so the two MMPs remain
+  interchangeable behind the interface. `total_rev` is their sum and is not
+  emitted, because doing so would double-count.
+- **Events**: the user-acquisition report has no in-app event breakdown, so
+  `syncEvents` returns an empty batch with a warning. The capability is reported
+  absent rather than approximated — an empty stream that never called the API is
+  not a healthy one.
+- **Not imported**: `*_Nd` cohort metrics (`revenues_Nd`, `roas_Nd`,
+  `retention_Nd`). Tenjin declares `cohort_reporting: true` as a capability, but
+  Phase 0A does not import cohort data — declaring a capability is not the same as
+  using it, and cohort ROAS remains unavailable (see [METRICS.md](METRICS.md)).
+- **Still unproven**: MART's own client has not completed a live request from the
+  build environment. `node packages/integrations/dist/cli/diagnose.js tenjin
+attribution_installs` (and `attribution_revenue`) runs the real code path
+  against the real API and prints the request, the status, the row counts and the
+  first normalized row, without ever printing the key.
 
 ## Error classification
 

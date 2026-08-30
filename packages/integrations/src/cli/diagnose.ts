@@ -15,11 +15,12 @@
  */
 import { getConfig } from '@mart/config';
 import { closePool, queryRows } from '@mart/db';
-import { isProviderError } from '@mart/shared';
+import { isProviderError, type IsoDate } from '@mart/shared';
 import { getCredentialStore } from '../credentials.js';
 import {
   isAttributionProvider,
   isMarketingNetworkProvider,
+  type AnyProvider,
   type ProviderAccount,
 } from '../types.js';
 import { createProvider, getProviderDescriptor, providerEndpointInfo } from '../registry.js';
@@ -34,10 +35,16 @@ function heading(text: string): void {
 
 async function main(): Promise<void> {
   const providerKey = process.argv[2];
-  const organizationId = process.argv[3];
+  // Optional second argument: a sync stream to exercise instead of discovery.
+  const streamArg = process.argv[3];
+  const stream = STREAMS.includes(streamArg as Stream) ? (streamArg as Stream) : null;
+  const organizationId = stream ? process.argv[4] : process.argv[3];
   if (!providerKey) {
     process.stderr.write(
-      'usage: diagnose <provider_key> [organization_id]\n  e.g. diagnose meta_ads\n',
+      'usage: diagnose <provider_key> [stream] [organization_id]\n' +
+        '  e.g. diagnose meta_ads\n' +
+        '       diagnose tenjin attribution_installs\n' +
+        '       diagnose tenjin attribution_revenue\n',
     );
     process.exitCode = 2;
     return;
@@ -106,6 +113,11 @@ async function main(): Promise<void> {
   line('message', health.message);
   if (health.details) line('details', JSON.stringify(health.details));
 
+  if (stream) {
+    await diagnoseStream(provider, stream, connection.organization_id);
+    return;
+  }
+
   heading('ACCOUNT / APP DISCOVERY');
   try {
     // Narrowed with statements rather than a ternary: a conditional expression
@@ -170,6 +182,104 @@ async function main(): Promise<void> {
       line('message', error.userMessage);
       // context is already sanitized by the HTTP client.
       line('context', JSON.stringify(error.context ?? {}));
+    } else {
+      line('error', error instanceof Error ? error.message : String(error));
+    }
+  }
+}
+
+const STREAMS = ['attribution_installs', 'attribution_revenue', 'attribution_events'] as const;
+type Stream = (typeof STREAMS)[number];
+
+/**
+ * Run one reporting stream against the real provider and show what came back.
+ *
+ * The app id, the date window and the row shape are all printed, because a
+ * reporting failure is nearly always one of those three rather than the
+ * credential.
+ */
+async function diagnoseStream(
+  provider: AnyProvider,
+  stream: Stream,
+  organizationId: string,
+): Promise<void> {
+  heading(`STREAM: ${stream}`);
+  if (!isAttributionProvider(provider)) {
+    line('error', 'this provider is not an attribution provider');
+    return;
+  }
+
+  // The app this organization actually bound, so the diagnostic uses the same
+  // identifier the sync does.
+  const bindings = await queryRows<{
+    external_account_id: string;
+    timezone: string;
+    default_currency: string;
+  }>(
+    `SELECT a.external_account_id, ap.timezone, ap.default_currency
+       FROM integration_app_bindings b
+       JOIN integration_accounts a ON a.id = b.integration_account_id
+       JOIN apps ap ON ap.id = b.app_id
+      WHERE b.organization_id = $1 AND b.status = 'active' AND b.role = 'primary_attribution'
+      ORDER BY b.created_at DESC LIMIT 1`,
+    [organizationId],
+  );
+  const binding = bindings[0];
+  if (!binding) {
+    line('error', 'no active primary attribution binding for this organization');
+    return;
+  }
+
+  const to = new Date();
+  const from = new Date(to.getTime() - 29 * 86400000);
+  const window = { from: from.toISOString().slice(0, 10), to: to.toISOString().slice(0, 10) };
+
+  line('app identifier', binding.external_account_id);
+  line('date range', `${window.from} -> ${window.to}`);
+  line('timezone', binding.timezone);
+  line('currency', binding.default_currency);
+
+  const params = {
+    externalAccountId: binding.external_account_id,
+    from: window.from as IsoDate,
+    to: window.to as IsoDate,
+    timezone: binding.timezone,
+    currency: binding.default_currency,
+  };
+
+  try {
+    const result =
+      stream === 'attribution_installs'
+        ? await provider.syncInstalls(params)
+        : stream === 'attribution_revenue'
+          ? await provider.syncRevenue(params)
+          : await provider.syncEvents(params);
+
+    line('HTTP status', '200 (no error raised)');
+    line('pages fetched', result.pagesFetched);
+    line('rows fetched', result.rowsFetched);
+    line('rows rejected', result.rowsRejected);
+    line('latest data date', result.latestDataDate ?? '(none)');
+    line('installs normalized', result.batch.installs.length);
+    line('revenue normalized', result.batch.revenue.length);
+    line('events normalized', result.batch.events.length);
+    for (const warning of result.warnings) line('warning', warning);
+
+    const sample = result.batch.installs[0] ?? result.batch.revenue[0] ?? result.batch.events[0];
+    if (sample) {
+      process.stdout.write(`\n  sample normalized row: ${JSON.stringify(sample)}\n`);
+    } else if (result.rowsFetched > 0) {
+      process.stdout.write(
+        '\n  rows arrived but none normalized - the response shape does not match the parser.\n',
+      );
+    }
+  } catch (error) {
+    if (isProviderError(error)) {
+      line('HTTP status', error.httpStatus ?? '(no response)');
+      line('errorClass', error.errorClass);
+      line('message', error.userMessage);
+      // Already sanitized by the HTTP client: URL without secrets, truncated body.
+      line('sanitized response', JSON.stringify(error.context ?? {}));
     } else {
       line('error', error instanceof Error ? error.message : String(error));
     }
