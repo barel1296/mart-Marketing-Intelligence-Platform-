@@ -212,6 +212,34 @@ export async function reconcileCampaigns(input: ReconcileInput): Promise<Reconci
     const key = nameKey(campaign.name);
     const nameCandidates = key ? (attributionByName.get(key) ?? []) : [];
 
+    // Several marketing campaigns sharing one name is the mirror image of the
+    // many-to-one case and is NOT aggregation: an attribution campaign naming
+    // that name cannot say which of them it came from. Matching it to each in
+    // turn would credit the same installs to every duplicate and inflate their
+    // mapped spend, so both sides are left ambiguous instead.
+    const duplicateMarketingNames = key ? (marketingByName.get(key) ?? []).length : 0;
+    if (nameCandidates.length > 0 && duplicateMarketingNames > 1) {
+      summary.ambiguous += 1;
+      mappings.push({
+        entityType: 'campaign',
+        sourceProvider: input.marketingProviderKey,
+        sourceExternalId: campaign.external_campaign_id,
+        sourceName: campaign.name,
+        targetProvider: input.attributionProviderKey,
+        targetExternalId: null,
+        targetName: null,
+        mappingMethod: 'provider_name_embedding',
+        mappingConfidence: 0.25,
+        status: 'ambiguous',
+        candidates: nameCandidates.map(toCandidate),
+        evidence: {
+          reason: `${duplicateMarketingNames} marketing campaigns share this name, so an attribution campaign naming it cannot be attributed to one of them`,
+          duplicateMarketingCampaigns: duplicateMarketingNames,
+        },
+      });
+      continue;
+    }
+
     if (nameCandidates.length > 0) {
       // How the match was reached decides the method and the confidence. A
       // whole-name equality is a bare shared name; a name found inside the
@@ -523,22 +551,34 @@ export async function campaignCoverage(
   appId: string,
   marketingProviderKey: string,
 ): Promise<CoverageSummary> {
+  // One row per campaign, not per mapping. A marketing campaign with three
+  // attribution children is one campaign that is mapped, not three - counting
+  // rows would let a well-mapped campaign raise coverage simply by having more
+  // children beneath it, which is the opposite of what coverage measures.
   const rows = await queryRows<{
     status: MappingStatus;
     mapping_method: string;
-    confident: string;
+    operational: boolean;
     count: string;
   }>(
-    `SELECT status, mapping_method,
-            count(*) FILTER (WHERE mapping_confidence >= $4)::text AS confident,
+    `WITH best AS (
+       SELECT DISTINCT ON (source_provider, source_external_id)
+              source_external_id, status, mapping_method, mapping_confidence
+       FROM provider_entity_mappings
+       WHERE organization_id = $1 AND app_id = $2 AND entity_type = 'campaign'
+         -- Organic is recorded from the attribution side, so it is matched on
+         -- status rather than on source provider. It is counted for display and
+         -- left out of the coverage denominator below.
+         AND (source_provider = $3 OR status = 'not_applicable')
+       -- The strongest link a campaign has is the one that describes it.
+       ORDER BY source_provider, source_external_id, mapping_confidence DESC, status
+     )
+     SELECT status, mapping_method,
+            (status IN ('matched_exact', 'matched_confident', 'manually_verified')
+             OR (status = 'matched_fallback' AND mapping_confidence >= $4)) AS operational,
             count(*)::text AS count
-     FROM provider_entity_mappings
-     WHERE organization_id = $1 AND app_id = $2 AND entity_type = 'campaign'
-       -- Organic is recorded from the attribution side, so it is matched on
-       -- status rather than on source provider. It is counted for display and
-       -- left out of the coverage denominator below.
-       AND (source_provider = $3 OR status = 'not_applicable')
-     GROUP BY status, mapping_method`,
+     FROM best
+     GROUP BY status, mapping_method, operational`,
     [organizationId, appId, marketingProviderKey, OPERATIONAL_MAPPING_CONFIDENCE],
   );
 
@@ -551,7 +591,7 @@ export async function campaignCoverage(
     if (row.mapping_method === 'provider_name_embedding' && row.status === 'matched_fallback') {
       matchedNameEmbedded += count;
     }
-    if (row.status === 'matched_fallback') operationalFallback += Number(row.confident);
+    if (row.status === 'matched_fallback' && row.operational) operationalFallback += count;
   }
 
   const get = (status: MappingStatus): number => byStatus.get(status) ?? 0;

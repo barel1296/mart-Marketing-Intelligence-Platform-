@@ -797,8 +797,21 @@ describe('reconciliation', () => {
       expect(coverage.authoritativeCoveragePct).toBe(0);
       // Everything resolves deterministically, so operations can proceed.
       expect(coverage.operationalCoveragePct).toBe(100);
-      expect(coverage.matchedNameEmbedded).toBe(3);
       expect(coverage.coveragePct).toBe(coverage.authoritativeCoveragePct);
+
+      // Coverage counts campaigns, not mapping rows. Two Meta campaigns are
+      // mapped; one of them has two Tenjin children. Counting rows would make
+      // a campaign with more children raise coverage, which measures the
+      // opposite of what coverage means.
+      expect(coverage.matchedNameEmbedded).toBe(2);
+      expect(coverage.total).toBe(2);
+      const rows = await queryRows<{ count: string }>(
+        `SELECT count(*)::text AS count FROM provider_entity_mappings
+          WHERE app_id = $1 AND source_provider = 'meta_ads'
+            AND mapping_method = 'provider_name_embedding'`,
+        [ctx.appId],
+      );
+      expect(Number(rows[0]?.count)).toBe(3);
     });
 
     it('keeps organic out of mapped installs, revenue and CPI', async () => {
@@ -888,6 +901,144 @@ describe('reconciliation', () => {
         [ctx.appId],
       );
       expect(after).toHaveLength(0);
+    });
+
+    it('aggregates matched children into one campaign row, and shows the figures', async () => {
+      const ctx = await setupRealShape();
+      await reconcile(ctx.user.organizationId, ctx.appId);
+
+      const table = await request(
+        ctx.user,
+        'GET',
+        `/api/v1/organizations/${ctx.user.organizationId}/apps/${ctx.appId}/campaigns?from=2026-08-28&to=2026-08-28`,
+      );
+      const rows = (
+        table.json() as {
+          rows: Array<{
+            externalCampaignId: string;
+            campaignName: string | null;
+            spend: number;
+            mappingStatus: string;
+            mappedChildren: number;
+            attributedInstalls: number | null;
+            attributedRevenue: number | null;
+            reportedCpi: number | null;
+            attributionNote: string | null;
+          }>;
+        }
+      ).rows;
+
+      // One row per Meta campaign, not one per mapping. Joining the mapping
+      // rows directly repeated the campaign - and its spend - per child.
+      expect(rows).toHaveLength(2);
+      expect(rows.reduce((sum, r) => sum + r.spend, 0)).toBeCloseTo(140, 10);
+
+      const a = rows.find((r) => r.campaignName === META_A);
+      expect(a?.mappingStatus).toBe('matched_fallback');
+      expect(a?.mappedChildren).toBe(2);
+      // The bug: a matched_fallback campaign showing an em dash while its
+      // mapped children have installs. static 300 + video 100.
+      expect(a?.attributedInstalls).toBe(400);
+      expect(a?.attributedRevenue).toBe(120);
+      expect(a?.reportedCpi).toBeCloseTo(100 / 400, 10);
+      expect(a?.attributionNote).toMatch(/embedded/i);
+      expect(a?.attributionNote).toMatch(/aggregated across 2/i);
+
+      const b = rows.find((r) => r.campaignName === META_B);
+      expect(b?.mappedChildren).toBe(1);
+      expect(b?.attributedInstalls).toBe(60);
+    });
+
+    it('still withholds figures behind a bare shared name', async () => {
+      controls.marketingRows = [
+        {
+          reportDate: '2026-08-28',
+          campaignId: '1301',
+          campaignName: 'Summer US',
+          spend: 100,
+          impressions: 1000,
+          clicks: 10,
+        },
+      ];
+      // Same name, no embedded annotation: a coincidence of wording.
+      controls.attributionRows = [
+        {
+          installDate: '2026-08-28',
+          campaignId: null,
+          campaignName: 'summer us',
+          installs: 40,
+          revenue: 10,
+        },
+      ];
+      const ctx = await setup();
+      await triggerSync(ctx, '2026-08-28', '2026-08-28');
+      await reconcile(ctx.user.organizationId, ctx.appId);
+
+      const table = await request(
+        ctx.user,
+        'GET',
+        `/api/v1/organizations/${ctx.user.organizationId}/apps/${ctx.appId}/campaigns?from=2026-08-28&to=2026-08-28`,
+      );
+      const row = (
+        table.json() as {
+          rows: Array<{
+            mappingStatus: string;
+            attributedInstalls: number | null;
+            attributionNote: string | null;
+          }>;
+        }
+      ).rows[0];
+      expect(row?.mappingStatus).toBe('matched_fallback');
+      expect(row?.attributedInstalls).toBeNull();
+      expect(row?.attributionNote).toMatch(/withheld/i);
+    });
+
+    it('refuses to pick between marketing campaigns that share a name', async () => {
+      controls.marketingRows = [
+        {
+          reportDate: '2026-08-28',
+          campaignId: '1401',
+          campaignName: META_A,
+          spend: 60,
+          impressions: 4000,
+          clicks: 300,
+        },
+        // A duplicate, as Meta's "- Copy" flow produces.
+        {
+          reportDate: '2026-08-28',
+          campaignId: '1402',
+          campaignName: META_A,
+          spend: 80,
+          impressions: 6000,
+          clicks: 400,
+        },
+      ];
+      controls.attributionRows = [
+        {
+          installDate: '2026-08-28',
+          campaignId: 'b47f71fd-4c12-48ba-b49a-f78e5d7a7fa3',
+          campaignName: `CPI_Broad_US_static (${META_A})`,
+          installs: 300,
+          revenue: 90,
+        },
+      ];
+      const ctx = await setup();
+      await triggerSync(ctx, '2026-08-28', '2026-08-28');
+      const summary = await reconcile(ctx.user.organizationId, ctx.appId);
+
+      // Crediting the same 300 installs to both duplicates would inflate each
+      // one's mapped spend and understate both CPIs.
+      expect(summary.matchedNameEmbedded).toBe(0);
+      expect(summary.ambiguous).toBe(2);
+
+      const mappings = await queryRows<{ status: string; evidence: Record<string, unknown> }>(
+        `SELECT status, evidence FROM provider_entity_mappings
+          WHERE app_id = $1 AND source_provider = 'meta_ads'`,
+        [ctx.appId],
+      );
+      expect(mappings).toHaveLength(2);
+      expect(mappings.every((m) => m.status === 'ambiguous')).toBe(true);
+      expect(String(mappings[0]?.evidence['reason'])).toMatch(/share this name/i);
     });
 
     it('does not raise a finding for organic alone', async () => {

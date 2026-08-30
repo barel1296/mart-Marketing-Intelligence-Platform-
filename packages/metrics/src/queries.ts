@@ -1,7 +1,20 @@
 import type { IsoDate, MappingStatus } from '@mart/shared';
+import { OPERATIONAL_MAPPING_CONFIDENCE } from '@mart/shared';
 import { queryRows, toNumber, toNullableNumber } from '@mart/db';
 import type { MetricFilters } from './service.js';
 import { safeRatio } from './registry.js';
+
+/**
+ * When the campaign table may show attribution beside delivery.
+ *
+ * Authoritative links, plus deterministic high-confidence ones. A bare shared
+ * name stays withheld: it is evidence of a coincidence of wording, not of a
+ * link. Withholding a figure that genuinely exists is its own failure though -
+ * a campaign whose mapped children have installs must not render an em dash.
+ */
+const DISPLAYABLE = `(map_best.status IN ('matched_exact','matched_confident','manually_verified')
+  OR (map_best.status = 'matched_fallback'
+      AND map_best.mapping_confidence >= ${OPERATIONAL_MAPPING_CONFIDENCE}))`;
 
 /**
  * Time series.
@@ -162,7 +175,12 @@ export type CampaignTableRow = {
   mappingMethod: string | null;
   mappingConfidence: number | null;
   attributionCampaignId: string | null;
-  /** Null unless the mapping is authoritative; see the note on each row. */
+  /** How many attribution campaigns are mapped beneath this one. */
+  mappedChildren: number;
+  /**
+   * Summed across every mapped child. Null when the mapping is not strong
+   * enough to state a figure from; see the note on each row.
+   */
   attributedInstalls: number | null;
   attributedRevenue: number | null;
   reportedCpi: number | null;
@@ -238,7 +256,7 @@ export async function loadCampaignTable(
   let mappingFilter = '';
   if (filters.mappingStatus) {
     params.push(filters.mappingStatus);
-    mappingFilter = ` AND COALESCE(map.status, 'unmatched') = $${params.length}`;
+    mappingFilter = ` AND COALESCE(map_best.status, 'unmatched') = $${params.length}`;
   }
 
   params.push(limit, offset);
@@ -257,6 +275,7 @@ export async function loadCampaignTable(
     mapping_method: string | null;
     mapping_confidence: string | null;
     attribution_campaign_id: string | null;
+    mapped_children: string;
     attributed_installs: string | null;
     attributed_revenue: string | null;
     attribution_latest_date: string | null;
@@ -281,33 +300,29 @@ export async function loadCampaignTable(
          ${extra}
        GROUP BY m.external_campaign_id
      ),
+     -- One row per marketing campaign, whatever its number of attribution
+     -- children. Joining the mapping rows directly would repeat the campaign -
+     -- and its spend - once per child.
      map AS (
-       SELECT source_external_id, target_external_id, status, mapping_method, mapping_confidence
+       SELECT source_external_id,
+              array_agg(target_external_id) FILTER (WHERE target_external_id IS NOT NULL)
+                AS target_external_ids,
+              count(*) FILTER (WHERE target_external_id IS NOT NULL)::int AS mapped_children
        FROM provider_entity_mappings
        WHERE organization_id = $1 AND app_id = $2 AND entity_type = 'campaign'
          AND source_provider = $5
          AND ($6::text IS NULL OR target_provider = $6)
+       GROUP BY source_external_id
      ),
-     attribution AS (
-       SELECT external_campaign_id,
-              SUM(attributed_installs) AS attributed_installs,
-              MAX(install_date) AS attribution_latest_date
-       FROM attribution_daily_metrics
-       WHERE organization_id = $1 AND app_id = $2
-         AND install_date BETWEEN $3 AND $4
-         AND ($6::text IS NULL OR provider_key = $6)
-         AND external_campaign_id IS NOT NULL
-       GROUP BY external_campaign_id
-     ),
-     attribution_revenue AS (
-       SELECT external_campaign_id, SUM(revenue) AS attributed_revenue
-       FROM attribution_revenue_metrics
-       WHERE organization_id = $1 AND app_id = $2
-         AND activity_date BETWEEN $3 AND $4
-         AND grain = 'event_date'
-         AND ($6::text IS NULL OR provider_key = $6)
-         AND external_campaign_id IS NOT NULL
-       GROUP BY external_campaign_id
+     -- The strongest link the campaign has is the one that describes it.
+     map_best AS (
+       SELECT DISTINCT ON (source_external_id)
+              source_external_id, target_external_id, status, mapping_method, mapping_confidence
+       FROM provider_entity_mappings
+       WHERE organization_id = $1 AND app_id = $2 AND entity_type = 'campaign'
+         AND source_provider = $5
+         AND ($6::text IS NULL OR target_provider = $6)
+       ORDER BY source_external_id, mapping_confidence DESC, status
      )
      SELECT marketing.external_campaign_id,
             marketing.campaign_name,
@@ -316,20 +331,43 @@ export async function loadCampaignTable(
             marketing.impressions::text AS impressions,
             marketing.clicks::text AS clicks,
             marketing.marketing_latest_date::text AS marketing_latest_date,
-            map.status AS mapping_status,
-            map.mapping_method,
-            map.mapping_confidence::text AS mapping_confidence,
-            map.target_external_id AS attribution_campaign_id,
-            CASE WHEN map.status IN ('matched_exact','matched_confident','manually_verified')
+            map_best.status AS mapping_status,
+            map_best.mapping_method,
+            map_best.mapping_confidence::text AS mapping_confidence,
+            map_best.target_external_id AS attribution_campaign_id,
+            COALESCE(map.mapped_children, 0)::text AS mapped_children,
+            -- Displayed for authoritative links and for deterministic
+            -- high-confidence ones. A bare shared name stays withheld: it is
+            -- evidence of nothing but a coincidence of wording.
+            CASE WHEN ${DISPLAYABLE}
                  THEN attribution.attributed_installs::text END AS attributed_installs,
-            CASE WHEN map.status IN ('matched_exact','matched_confident','manually_verified')
+            CASE WHEN ${DISPLAYABLE}
                  THEN attribution_revenue.attributed_revenue::text END AS attributed_revenue,
             attribution.attribution_latest_date::text AS attribution_latest_date,
             count(*) OVER ()::text AS total_count
      FROM marketing
      LEFT JOIN map ON map.source_external_id = marketing.external_campaign_id
-     LEFT JOIN attribution ON attribution.external_campaign_id = map.target_external_id
-     LEFT JOIN attribution_revenue ON attribution_revenue.external_campaign_id = map.target_external_id
+     LEFT JOIN map_best ON map_best.source_external_id = marketing.external_campaign_id
+     -- Summed across every mapped child, so a Meta campaign with a static and a
+     -- video creative beneath it shows both creatives' installs.
+     LEFT JOIN LATERAL (
+       SELECT SUM(a.attributed_installs) AS attributed_installs,
+              MAX(a.install_date) AS attribution_latest_date
+       FROM attribution_daily_metrics a
+       WHERE a.organization_id = $1 AND a.app_id = $2
+         AND a.install_date BETWEEN $3 AND $4
+         AND ($6::text IS NULL OR a.provider_key = $6)
+         AND a.external_campaign_id = ANY(map.target_external_ids)
+     ) attribution ON map.target_external_ids IS NOT NULL
+     LEFT JOIN LATERAL (
+       SELECT SUM(r.revenue) AS attributed_revenue
+       FROM attribution_revenue_metrics r
+       WHERE r.organization_id = $1 AND r.app_id = $2
+         AND r.activity_date BETWEEN $3 AND $4
+         AND r.grain = 'event_date'
+         AND ($6::text IS NULL OR r.provider_key = $6)
+         AND r.external_campaign_id = ANY(map.target_external_ids)
+     ) attribution_revenue ON map.target_external_ids IS NOT NULL
      WHERE true ${mappingFilter}
      ORDER BY ${sortColumn} ${direction} NULLS LAST
      LIMIT $${limitParam} OFFSET $${offsetParam}`,
@@ -346,6 +384,8 @@ export async function loadCampaignTable(
       const clicks = toNumber(row.clicks);
       const installs = row.attributed_installs === null ? null : toNumber(row.attributed_installs);
       const status: MappingStatus | 'not_computed' = row.mapping_status ?? 'not_computed';
+      const confidence = toNullableNumber(row.mapping_confidence);
+      const mappedChildren = toNumber(row.mapped_children);
       return {
         externalCampaignId: row.external_campaign_id,
         campaignName: row.campaign_name,
@@ -359,11 +399,12 @@ export async function loadCampaignTable(
         mappingMethod: row.mapping_method,
         mappingConfidence: toNullableNumber(row.mapping_confidence),
         attributionCampaignId: row.attribution_campaign_id,
+        mappedChildren,
         attributedInstalls: installs,
         attributedRevenue:
           row.attributed_revenue === null ? null : toNumber(row.attributed_revenue),
         reportedCpi: installs === null ? null : safeRatio(spend, installs, 25).value,
-        attributionNote: attributionNoteFor(status),
+        attributionNote: attributionNoteFor(status, confidence, mappedChildren),
         marketingLatestDate: row.marketing_latest_date,
         attributionLatestDate: row.attribution_latest_date,
       };
@@ -371,16 +412,26 @@ export async function loadCampaignTable(
   };
 }
 
-function attributionNoteFor(status: MappingStatus | 'not_computed'): string | null {
+function attributionNoteFor(
+  status: MappingStatus | 'not_computed',
+  confidence: number | null,
+  mappedChildren: number,
+): string | null {
   switch (status) {
     case 'matched_exact':
     case 'matched_confident':
     case 'manually_verified':
-      return null;
+      return mappedChildren > 1
+        ? `Aggregated across ${mappedChildren} mapped attribution campaigns.`
+        : null;
     case 'matched_fallback':
-      return 'Name-based candidate match only. Attribution figures are withheld until the mapping is verified.';
+      // Two different situations behind one status: a deterministic match
+      // MART will report from, and a bare name it will not.
+      return (confidence ?? 0) >= OPERATIONAL_MAPPING_CONFIDENCE
+        ? `Linked by the campaign name the attribution provider embedded in its own${mappedChildren > 1 ? `, aggregated across ${mappedChildren} campaigns` : ''}. Deterministic, but not authoritative: verify before relying on it.`
+        : 'Name-based candidate match only. Attribution figures are withheld until the mapping is verified.';
     case 'ambiguous':
-      return 'Several attribution campaigns share this name. MART will not pick one.';
+      return 'Several campaigns share this name. MART will not pick one.';
     case 'unmatched':
       return 'No attribution campaign could be linked to this campaign.';
     case 'rejected':

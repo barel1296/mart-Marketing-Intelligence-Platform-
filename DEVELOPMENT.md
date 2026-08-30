@@ -93,6 +93,23 @@ one, because Tenjin reporting is addressed by saved report UUID
 fits, the diagnostic says which report to create and why each existing one was
 refused - MART reads saved reports and never creates or edits one.
 
+### Why a campaign is unmatched
+
+Reconciliation reports how many campaigns are unmatched; this explains each one:
+
+```bash
+docker compose exec api node packages/integrations/dist/cli/reconcile-audit.js <organization_id> [app_id]
+```
+
+For every unmatched attribution campaign it prints the id, name, installs and
+revenue, the network campaign name embedded in its own name, whether an exact
+marketing campaign carries that name, and - when it does not - whether a near
+name exists, what state that campaign is in, whether the attribution predates
+the marketing data MART holds, and the reason the matcher refused. It does the
+same in the other direction for marketing campaigns nothing names. It is
+read-only and creates no mappings: a near miss is reported so a person can
+decide, because two campaign names that differ by a date are two campaigns.
+
 ## Running natively
 
 ## Prerequisites

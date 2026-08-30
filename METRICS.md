@@ -134,10 +134,15 @@ Reconciliation reports coverage twice, and they are never averaged into one:
 | Authoritative coverage | stable id + manually verified                              | whether MART will state identity     |
 | Operational coverage   | authoritative + deterministic high-confidence name matches | whether MART will state a mapped CPI |
 
-The gap between them is the point. On the account this was built against,
-authoritative coverage is 0% — Tenjin campaign ids are Tenjin UUIDs and can
-never equal Meta's — while operational coverage is 100%, because every Tenjin
-campaign name carries the Meta campaign name verbatim in parentheses. A mapped
+Both are counted **per campaign, not per mapping row**. A marketing campaign
+with three attribution children is one campaign that is mapped, not three;
+counting rows would let a well-mapped campaign raise coverage simply by having
+more creatives beneath it, which measures the opposite of what coverage means.
+
+The gap between the two numbers is the point. On the account this was built
+against, authoritative coverage is 0% — Tenjin campaign ids are Tenjin UUIDs
+and can never equal Meta's — while operational coverage reflects how many of
+the network's campaigns a Tenjin campaign actually names. A mapped
 CPI is computable and correct; a claim that the two providers share an identity
 is not, and MART makes neither claim on the other's evidence.
 
@@ -147,14 +152,22 @@ broken.
 
 ## Attribution figures in the campaign table
 
-The campaign table joins delivery to attribution **only through an authoritative
-mapping** (`matched_exact`, `matched_confident`, `manually_verified`). For a
-campaign whose mapping is `matched_fallback`, `ambiguous` or `unmatched`, the
-attribution columns show `—` with a note explaining why, not a plausible number
-sourced from a name match.
+The campaign table shows attribution beside delivery for **authoritative
+mappings and for deterministic high-confidence ones** — a network campaign name
+found verbatim inside the MMP's own campaign name. A bare shared name
+(`name_fallback`, confidence 0.5) still shows `—` with a note: it is evidence of
+a coincidence of wording, not of a link. `ambiguous` and `unmatched` show `—`
+too.
 
-This is the rule that makes the reconciliation screen worth having: coverage is
-not cosmetic, it decides which numbers the dashboard is willing to state.
+Figures are **aggregated across every mapped child**. One Meta campaign with a
+static and a video creative beneath it shows the sum of both, once, on a single
+row — the campaign appears once whatever its number of children, and its spend
+is never repeated per child.
+
+Withholding a figure that genuinely exists is its own failure. A campaign whose
+mapped children have installs must not render an em dash; that is why the
+display gate follows operational coverage rather than authoritative coverage,
+and why the note says which kind of link produced the number.
 
 ## Freshness
 
