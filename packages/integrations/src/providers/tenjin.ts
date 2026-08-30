@@ -4,7 +4,8 @@ import type {
   CanonicalAttributionRevenueMetric,
   IsoDate,
 } from '@mart/shared';
-import { ProviderError, SENSITIVE_KEY_PATTERN } from '@mart/shared';
+import { ProviderError, SENSITIVE_KEY_PATTERN, isProviderError } from '@mart/shared';
+import { getLogger } from '@mart/observability';
 import { ProviderHttpClient, userMessageFor } from '../http.js';
 import { declare, type CapabilityDeclaration } from '../capabilities.js';
 import {
@@ -50,6 +51,12 @@ export type TenjinProviderOptions = {
 export type TenjinEndpoints = {
   userAcquisition: string;
   apps: string;
+  /**
+   * Documented fallback lookup that returns id + name for a set of app ids.
+   * Absolute, because it sits outside the /v2 base. Only used when the app
+   * detail endpoint still yields no name.
+   */
+  dataExportsApps: string;
 };
 
 /**
@@ -58,10 +65,13 @@ export type TenjinEndpoints = {
  * in every path is what stops the two being concatenated into
  * .../v2/api/v2/apps when an operator sets the documented base URL.
  */
-const DEFAULT_ENDPOINTS: TenjinEndpoints = {
+const DEFAULT_ENDPOINTS: Omit<TenjinEndpoints, 'dataExportsApps'> = {
   userAcquisition: '/user_acquisition',
   apps: '/apps',
 };
+
+/** Bounded so a large account cannot turn discovery into hundreds of requests. */
+const MAX_APPS_TO_ENRICH = 100;
 
 /** Verified metric ids from Tenjin's user-acquisition report catalogue. */
 export const TENJIN_ATTRIBUTION_METRICS = [
@@ -96,7 +106,11 @@ export class TenjinAttributionProvider implements AttributionProvider {
   constructor(options: TenjinProviderOptions) {
     this.apiKey = options.credentials.apiKey;
     this.baseUrl = options.baseUrl.replace(/\/+$/, '');
-    this.endpoints = { ...DEFAULT_ENDPOINTS, ...options.endpoints };
+    // Derived from the configured origin rather than hardcoded, so fixture
+    // mode stays self-consistent: pointing TENJIN_BASE_URL at the fixture
+    // server must not send this one request to the real Tenjin.
+    const dataExportsApps = new URL('/data_exports/v1/apps', `${this.baseUrl}/`).toString();
+    this.endpoints = { ...DEFAULT_ENDPOINTS, dataExportsApps, ...options.endpoints };
     this.http =
       options.http ??
       new ProviderHttpClient({ provider: 'tenjin', minIntervalMs: 250, maxAttempts: 3 });
@@ -122,6 +136,30 @@ export class TenjinAttributionProvider implements AttributionProvider {
    * versions. Accept the known shapes and fail loudly on anything else rather
    * than silently returning zero rows.
    */
+  /**
+   * Normalize a response into resources with an id and an attribute bag.
+   *
+   * Tenjin's app endpoints are JSON:API: `{data: [{id, type, attributes}]}`, and
+   * the collection form omits `attributes` entirely. Report endpoints return
+   * flat rows. Both are handled here so the rest of the adapter sees one shape.
+   */
+  private extractResources(
+    body: unknown,
+  ): Array<{ id: string | null; attributes: Record<string, unknown> }> {
+    const rows = this.extractRows(body);
+    return rows.map((row) => {
+      const record = row as unknown as Record<string, unknown>;
+      const attributes = record['attributes'];
+      return {
+        id: str(record['id'] as string | undefined),
+        attributes:
+          attributes && typeof attributes === 'object'
+            ? (attributes as Record<string, unknown>)
+            : record,
+      };
+    });
+  }
+
   private extractRows(body: unknown): TenjinRow[] {
     if (Array.isArray(body)) return body as TenjinRow[];
     if (body && typeof body === 'object') {
@@ -129,6 +167,8 @@ export class TenjinAttributionProvider implements AttributionProvider {
       for (const key of ['data', 'results', 'rows', 'report']) {
         const value = record[key];
         if (Array.isArray(value)) return value as TenjinRow[];
+        // The single-resource form: {data: {id, type, attributes}}.
+        if (value && typeof value === 'object') return [value as TenjinRow];
       }
     }
     throw new ProviderError({
@@ -198,52 +238,135 @@ export class TenjinAttributionProvider implements AttributionProvider {
     }
   }
 
+  /**
+   * Discover apps.
+   *
+   * The collection endpoint returns JSON:API resource identifiers - `{id, type}`
+   * with no attributes - so the list alone cannot name anything. Each id is
+   * therefore enriched with GET /v2/apps/{id}, which carries the attributes.
+   * A per-app failure is recorded against that app instead of failing the whole
+   * discovery: two named apps and one that 403s is a better answer than none.
+   */
   async listApps(): Promise<ProviderAccount[]> {
     const body = await this.get<unknown>(this.endpoints.apps, {});
-    const rows = this.extractRows(body);
-    return rows
-      .map((row): ProviderAccount | null => {
-        // Never fall back to an api_key field as the identifier: Tenjin issues
-        // per-app keys, and an id is displayed in the UI and stored in the
-        // database. A row with no real id is skipped rather than labelled with
-        // something key-shaped.
-        const id = pick(row, ID_KEYS);
-        if (!id.value) return null;
+    const resources = this.extractResources(body);
 
-        const name = pick(row, NAME_KEYS);
-        const bundleId = pick(row, BUNDLE_KEYS);
-        const platform = pick(row, PLATFORM_KEYS);
+    const out: ProviderAccount[] = [];
+    for (const resource of resources.slice(0, MAX_APPS_TO_ENRICH)) {
+      // JSON:API puts the id on the resource; a flat row carries it inline.
+      const idFromAttributes = pick(resource.attributes, ID_KEYS);
+      const id = idFromAttributes.value ?? resource.id;
+      if (!id) continue;
+      const idSource = idFromAttributes.key ?? 'data.id';
 
-        return {
-          externalAccountId: id.value,
-          // Falling back to the id keeps the required field populated, but
-          // nameSource records that no real name came back, so the UI can say
-          // so instead of presenting a UUID as if it were a title.
-          name: name.value ?? id.value,
-          accountType: 'mmp_app' as const,
-          currency: null,
-          timezone: str(row['timezone']),
-          status: str(row['status']),
-          metadata: {
-            bundleId: bundleId.value,
-            platform: platform.value ? normalizeTenjinPlatform(platform.value) : null,
-            tenjinAppId: id.value,
-            // Which field each value actually came from, and every other
-            // non-secret field the response carried. Tenjin's app payload is
-            // not verified against live documentation, so nothing identifying
-            // is discarded: whatever it returns is available for display and
-            // for working out the real contract from a single run.
-            fieldSources: {
-              id: id.key,
-              name: name.key,
-              bundleId: bundleId.key,
-              platform: platform.key,
-            },
-            raw: safeRow(row),
+      let attributes = resource.attributes;
+      let detailStatus = 'not needed';
+
+      if (!hasIdentifyingAttributes(attributes)) {
+        const detail = await this.fetchAppDetail(id);
+        detailStatus = detail.status;
+        attributes = { ...attributes, ...detail.attributes };
+      }
+
+      let name = pick(attributes, NAME_KEYS);
+      let nameSource = name.key;
+
+      // Documented fallback, used only when the detail call still produced no
+      // name - never speculatively, because it is a second endpoint the token
+      // may not be entitled to.
+      if (!name.value) {
+        const fallback = await this.fetchNameFromDataExports(id);
+        if (fallback) {
+          name = { value: fallback, key: 'data_exports:name' };
+          nameSource = 'data_exports:name';
+          detailStatus = `${detailStatus} + data_exports fallback`;
+        }
+      }
+
+      const bundleId = pick(attributes, BUNDLE_KEYS);
+      const platform = pick(attributes, PLATFORM_KEYS);
+      const storeId = pick(attributes, STORE_ID_KEYS);
+
+      out.push({
+        externalAccountId: id,
+        // Falls back to the id so the field stays populated; fieldSources
+        // records that no real name arrived, so nothing presents a UUID as a
+        // title.
+        name: name.value ?? id,
+        accountType: 'mmp_app' as const,
+        currency: null,
+        timezone: str(attributes['timezone'] as string | undefined),
+        status: str(attributes['status'] as string | undefined),
+        metadata: {
+          bundleId: bundleId.value,
+          platform: platform.value ? normalizeTenjinPlatform(platform.value) : null,
+          storeId: storeId.value,
+          tenjinAppId: id,
+          detailStatus,
+          fieldSources: {
+            id: idSource,
+            name: nameSource,
+            bundleId: bundleId.key,
+            platform: platform.key,
+            storeId: storeId.key,
           },
-        };
-      })
-      .filter((a): a is ProviderAccount => a !== null);
+          raw: safeRow(attributes),
+        },
+      });
+    }
+    return out;
+  }
+
+  /**
+   * GET /v2/apps/{id} -> data.attributes.
+   *
+   * Returns a status string rather than throwing: one inaccessible app must not
+   * hide the ones that are readable.
+   */
+  private async fetchAppDetail(
+    id: string,
+  ): Promise<{ status: string; attributes: Record<string, unknown> }> {
+    try {
+      const body = await this.get<unknown>(`${this.endpoints.apps}/${encodeURIComponent(id)}`, {});
+      const data = (body as { data?: unknown } | null)?.data;
+      const attributes = (data as { attributes?: unknown } | undefined)?.attributes;
+      if (attributes && typeof attributes === 'object') {
+        return { status: 'ok', attributes: attributes as Record<string, unknown> };
+      }
+      // A 200 with no attributes is a contract change, not a missing app.
+      return { status: 'ok but no attributes', attributes: {} };
+    } catch (error) {
+      const status = isProviderError(error)
+        ? `${error.errorClass}${error.httpStatus ? ` (${error.httpStatus})` : ''}`
+        : 'request failed';
+      getLogger().warn({ provider: 'tenjin', tenjinAppId: id, status }, 'tenjin app detail failed');
+      return { status, attributes: {} };
+    }
+  }
+
+  /** Documented id -> name lookup, used only after the detail call yields none. */
+  private async fetchNameFromDataExports(id: string): Promise<string | null> {
+    try {
+      const response = await this.http.request<unknown>({
+        url: this.endpoints.dataExportsApps,
+        query: { 'ids[]': id },
+        headers: { authorization: `Bearer ${this.apiKey}` },
+        responseType: 'json',
+      });
+      for (const resource of this.extractResources(response.body)) {
+        if (resource.id && resource.id !== id) continue;
+        const name = pick(resource.attributes, NAME_KEYS);
+        if (name.value) return name.value;
+      }
+      return null;
+    } catch (error) {
+      const status = isProviderError(error) ? error.errorClass : 'request failed';
+      getLogger().warn(
+        { provider: 'tenjin', tenjinAppId: id, status },
+        'tenjin data-exports name lookup failed',
+      );
+      return null;
+    }
   }
 
   async getCapabilities(externalAccountId?: string): Promise<CapabilityDeclaration[]> {
@@ -492,6 +615,16 @@ const BUNDLE_KEYS = [
   'identifier',
 ] as const;
 const PLATFORM_KEYS = ['platform', 'os', 'device_platform', 'app_platform', 'store'] as const;
+const STORE_ID_KEYS = ['store_id', 'storeId', 'app_store_id', 'store_app_id'] as const;
+
+/** Whether a resource already carries enough to identify the app without a second call. */
+function hasIdentifyingAttributes(attributes: Record<string, unknown>): boolean {
+  return (
+    pick(attributes, NAME_KEYS).value !== null ||
+    pick(attributes, BUNDLE_KEYS).value !== null ||
+    pick(attributes, STORE_ID_KEYS).value !== null
+  );
+}
 
 /** First present value plus the key it came from, so provenance is reportable. */
 function pick(
@@ -525,10 +658,24 @@ function normalizeTenjinPlatform(value: string): string {
 function safeRow(row: Record<string, unknown>): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(row)) {
-    if (SENSITIVE_KEY_PATTERN.test(key)) continue;
+    if (isSensitiveAttribute(key)) continue;
     if (value === null || value === undefined) continue;
     if (typeof value === 'object') continue;
     out[key] = String(value);
   }
   return out;
+}
+
+/**
+ * Broader than the shared redaction pattern, which matches `api_key` and
+ * `private_key` but not `public_key` or `facebook_referrer_decryption_key`.
+ * Tenjin's app resource carries several of those, and none of them belongs in
+ * the database or on screen just because it arrived beside a bundle id.
+ * Substring matching, deliberately: an identification field never contains any
+ * of these words.
+ */
+const SENSITIVE_ATTRIBUTE_WORDS = /(key|secret|token|password|credential|signature|salt|hash)/i;
+
+export function isSensitiveAttribute(key: string): boolean {
+  return SENSITIVE_ATTRIBUTE_WORDS.test(key) || SENSITIVE_KEY_PATTERN.test(key);
 }

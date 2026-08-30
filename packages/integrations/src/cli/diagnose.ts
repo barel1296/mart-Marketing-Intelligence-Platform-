@@ -125,12 +125,16 @@ async function main(): Promise<void> {
       };
       const hasName = account.name !== account.externalAccountId;
       process.stdout.write('\n');
-      process.stdout.write(`  NAME:      ${hasName ? account.name : '(not returned)'}\n`);
-      process.stdout.write(`  PLATFORM:  ${metaStr('platform')}\n`);
-      process.stdout.write(`  BUNDLE ID: ${metaStr('bundleId')}\n`);
       process.stdout.write(
-        `  ${providerKey === 'tenjin' ? 'TENJIN ID' : 'PROVIDER ID'}: ${account.externalAccountId}\n`,
+        `  ${providerKey === 'tenjin' ? 'TENJIN ID' : 'PROVIDER ID'}:              ${account.externalAccountId}\n`,
       );
+      process.stdout.write(`  DETAIL REQUEST STATUS: ${metaStr('detailStatus')}\n`);
+      process.stdout.write(
+        `  NAME:                  ${hasName ? account.name : '(not returned)'}\n`,
+      );
+      process.stdout.write(`  PLATFORM:              ${metaStr('platform')}\n`);
+      process.stdout.write(`  BUNDLE ID:             ${metaStr('bundleId')}\n`);
+      process.stdout.write(`  STORE ID:              ${metaStr('storeId')}\n`);
       // Which response field each value came from, so the real contract can be
       // read off one run instead of guessed.
       const sources = meta['fieldSources'];
