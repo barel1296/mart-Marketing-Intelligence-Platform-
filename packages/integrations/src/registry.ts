@@ -250,7 +250,7 @@ export type ProviderEndpointInfo = {
 const PRODUCTION_BASE_URLS: Partial<Record<ProviderKey, string>> = {
   meta_ads: 'https://graph.facebook.com',
   appsflyer: 'https://hq1.appsflyer.com',
-  tenjin: 'https://reporting.tenjin.com',
+  tenjin: 'https://api.tenjin.com',
 };
 
 function originOf(url: string): string {

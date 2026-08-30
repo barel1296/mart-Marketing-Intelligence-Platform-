@@ -214,12 +214,27 @@ export class MetaAdsProvider implements MarketingNetworkProvider {
         fields: 'id,name',
         limit: 1,
       });
+      const visible = (body.data ?? []).length;
+      if (visible === 0) {
+        // The token authenticated - Meta answered rather than rejecting it -
+        // but it can see no ad accounts. That is a permissions/scope problem,
+        // not a bad credential, and saying "invalid" here would send the
+        // operator to re-paste a token that was never the issue.
+        return {
+          ok: true,
+          status: 'pending',
+          message:
+            'Meta accepted the token, but it can see no ad accounts. Grant ads_read on at least one ad account, or check that the token belongs to the right user or system user.',
+          checkedAt,
+          details: { adAccountsVisible: 0, apiVersion: this.apiVersion },
+        };
+      }
       return {
         ok: true,
         status: 'connected',
         message: 'Meta Ads credential is valid and can list ad accounts.',
         checkedAt,
-        details: { adAccountsVisible: (body.data ?? []).length > 0 },
+        details: { adAccountsVisible: visible, apiVersion: this.apiVersion },
       };
     } catch (error) {
       return toHealth(error, checkedAt);

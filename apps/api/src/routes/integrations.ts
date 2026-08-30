@@ -55,7 +55,16 @@ export async function registerIntegrationRoutes(server: FastifyInstance): Promis
     return {
       providers: catalogue.map((provider) => {
         const descriptor = implemented.get(provider.provider_key);
+        const endpoint = providerEndpointInfo(provider.provider_key);
         return {
+          configuredBaseUrl: endpoint?.configuredBaseUrl ?? null,
+          productionBaseUrl: endpoint?.productionBaseUrl ?? null,
+          origin:
+            endpoint === null
+              ? 'unknown'
+              : endpoint.isProduction
+                ? 'live_provider'
+                : 'non_production_endpoint',
           providerKey: provider.provider_key,
           category: provider.category,
           displayName: provider.display_name,
@@ -140,6 +149,20 @@ export async function registerIntegrationRoutes(server: FastifyInstance): Promis
       connectionId: connection.id,
       credentials,
     });
+
+    const endpoint = providerEndpointInfo(descriptor.providerKey);
+    if (endpoint && !endpoint.isProduction) {
+      // Not blocked - fixture mode is a supported way to develop - but never
+      // silent: a credential just went to something that is not the provider.
+      request.log.warn(
+        {
+          providerKey: descriptor.providerKey,
+          configuredBaseUrl: endpoint.configuredBaseUrl,
+          productionBaseUrl: endpoint.productionBaseUrl,
+        },
+        'credential stored for a provider pointed at a non-production endpoint',
+      );
+    }
 
     const provider = createProvider({ providerKey: descriptor.providerKey, credentials });
     const health = await provider.validateConnection();

@@ -89,10 +89,10 @@ const envSchema = z.object({
   SYNC_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(10).default(3),
 
   // --- Providers ------------------------------------------------------------
-  META_GRAPH_API_VERSION: z.string().default('v21.0'),
+  META_GRAPH_API_VERSION: z.string().default('v26.0'),
   META_GRAPH_BASE_URL: z.string().url().default('https://graph.facebook.com'),
   APPSFLYER_BASE_URL: z.string().url().default('https://hq1.appsflyer.com'),
-  TENJIN_BASE_URL: z.string().url().default('https://reporting.tenjin.com'),
+  TENJIN_BASE_URL: z.string().url().default('https://api.tenjin.com/v2'),
 
   // --- Observability --------------------------------------------------------
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),

@@ -395,13 +395,24 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ a
                         ? 'stored (encrypted)'
                         : 'missing — reconnect required'}
                     </dd>
+                    <dt>Mode</dt>
+                    <dd>
+                      {card.origin === 'live_provider' ? (
+                        <StatusChip status="connected" label="REAL PROVIDER" />
+                      ) : (
+                        <StatusChip status="serious" label="FIXTURE PROVIDER" />
+                      )}
+                    </dd>
                     <dt>Reads from</dt>
                     <dd>
-                      <span className="mono">{card.configuredBaseUrl ?? 'unknown'}</span>{' '}
-                      {card.origin === 'live_provider' ? (
-                        <StatusChip status="connected" label="live provider" />
-                      ) : (
-                        <StatusChip status="serious" label="development endpoint" />
+                      <span className="mono">{card.configuredBaseUrl ?? 'unknown'}</span>
+                      {card.origin === 'live_provider' ? null : (
+                        <span className="cell-note">
+                          Real provider is{' '}
+                          <span className="mono">{card.productionBaseUrl ?? 'unknown'}</span>. Any
+                          credential stored here is being sent to the fixture server, not to the
+                          provider.
+                        </span>
                       )}
                     </dd>
                   </dl>

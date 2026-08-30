@@ -47,6 +47,31 @@ MART_WEB_PORT=3100 docker compose up --build
 
 `MART_API_PORT` and `MART_WORKER_PORT` work the same way.
 
+### Real providers instead of fixtures
+
+Compose defaults every provider to the fixture server. Switch one to the real
+API by exporting its base URL before starting, per provider:
+
+```bash
+export MART_META_BASE_URL=https://graph.facebook.com
+export MART_TENJIN_BASE_URL=https://api.tenjin.com/v2
+export MART_APPSFLYER_BASE_URL=https://hq1.appsflyer.com
+docker compose up --build
+```
+
+Each integration card then shows **REAL PROVIDER** or **FIXTURE PROVIDER**, so a
+real credential can never quietly route to the fixtures. To see exactly what a
+stored credential does against the real API, without printing it:
+
+```bash
+docker compose exec api node packages/integrations/dist/cli/diagnose.js meta_ads
+docker compose exec api node packages/integrations/dist/cli/diagnose.js tenjin
+```
+
+That prints the mode, the endpoint, whether an Authorization header was
+attached, the HTTP status, the classified error and the accounts discovered. It
+never prints the credential - only its fingerprint and length.
+
 ## Running natively
 
 ## Prerequisites

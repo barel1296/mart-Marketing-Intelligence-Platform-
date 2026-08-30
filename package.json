@@ -19,6 +19,7 @@
     "test:integration": "vitest run --project integration",
     "db:migrate": "pnpm --filter @mart/db migrate",
     "db:reset": "pnpm --filter @mart/db reset",
+    "diagnose": "node packages/integrations/dist/cli/diagnose.js",
     "dev:fixtures": "MART_ENABLE_FIXTURES=true node scripts/fixture-provider-server.mjs",
     "dev:api": "pnpm --filter @mart/api dev",
     "dev:worker": "pnpm --filter @mart/worker dev",

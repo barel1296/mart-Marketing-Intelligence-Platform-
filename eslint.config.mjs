@@ -97,6 +97,7 @@ export default [
     // CLIs and the dev/test surface legitimately write to stdout.
     files: [
       'packages/db/src/cli/**/*.ts',
+      'packages/integrations/src/cli/**/*.ts',
       'apps/*/src/server.ts',
       'tests/**/*.ts',
       'scripts/**/*.ts',

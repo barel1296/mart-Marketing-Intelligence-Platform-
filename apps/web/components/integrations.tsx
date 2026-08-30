@@ -22,6 +22,9 @@ export type ProviderCatalogueEntry = {
   implemented: boolean;
   supportsAccountDiscovery: boolean;
   credentialFields: CredentialField[];
+  configuredBaseUrl?: string | null;
+  productionBaseUrl?: string | null;
+  origin?: 'live_provider' | 'non_production_endpoint' | 'unknown';
 };
 
 export type AccountRow = {
@@ -140,8 +143,24 @@ export function ConnectProviderCard({
             {provider.providerKey} · {provider.authKind}
           </div>
         </div>
-        <StatusChip status="available" label="Available" />
+        <div className="button-row">
+          {provider.origin === 'live_provider' ? (
+            <StatusChip status="connected" label="REAL PROVIDER" />
+          ) : provider.origin === 'non_production_endpoint' ? (
+            <StatusChip status="serious" label="FIXTURE PROVIDER" />
+          ) : null}
+          <StatusChip status="available" label="Available" />
+        </div>
       </div>
+
+      {provider.origin === 'non_production_endpoint' ? (
+        <p className="hint" style={{ fontSize: 11, margin: 0 }}>
+          This provider is pointed at <span className="mono">{provider.configuredBaseUrl}</span>,
+          not <span className="mono">{provider.productionBaseUrl}</span>. A real credential entered
+          here would be sent to the fixture server. Set the provider&rsquo;s base URL to switch to
+          real mode.
+        </p>
+      ) : null}
 
       {open ? (
         <form

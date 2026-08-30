@@ -52,9 +52,15 @@ export type TenjinEndpoints = {
   apps: string;
 };
 
+/**
+ * Paths relative to TENJIN_BASE_URL, which already carries the /v2 prefix
+ * (https://api.tenjin.com/v2). Keeping the version in the base URL rather than
+ * in every path is what stops the two being concatenated into
+ * .../v2/api/v2/apps when an operator sets the documented base URL.
+ */
 const DEFAULT_ENDPOINTS: TenjinEndpoints = {
-  userAcquisition: '/api/v2/user_acquisition',
-  apps: '/api/v2/apps',
+  userAcquisition: '/user_acquisition',
+  apps: '/apps',
 };
 
 /** Verified metric ids from Tenjin's user-acquisition report catalogue. */
@@ -102,8 +108,10 @@ export class TenjinAttributionProvider implements AttributionProvider {
   ): Promise<T> {
     const response = await this.http.request<T>({
       url: `${this.baseUrl}${path}`,
-      // Tenjin authenticates the reporting API with an api_key parameter.
-      query: { api_key: this.apiKey, ...query },
+      query,
+      // Bearer header, never a query parameter: a token in a URL leaks through
+      // logs, proxies and the provider's own error echoes.
+      headers: { authorization: `Bearer ${this.apiKey}` },
       responseType: 'json',
     });
     return response.body;
@@ -195,7 +203,11 @@ export class TenjinAttributionProvider implements AttributionProvider {
     const rows = this.extractRows(body);
     return rows
       .map((row): ProviderAccount | null => {
-        const id = str(row['id'] ?? row['app_id'] ?? row['api_key']);
+        // Never fall back to an api_key field as the identifier: Tenjin issues
+        // per-app keys, and an id is displayed in the UI and stored in the
+        // database. A row with no real id is skipped rather than labelled with
+        // something key-shaped.
+        const id = str(row['id'] ?? row['app_id']);
         if (!id) return null;
         return {
           externalAccountId: id,

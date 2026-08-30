@@ -156,6 +156,19 @@ export class ProviderHttpClient {
         });
 
         const text = await response.text();
+        // Diagnostics: method, sanitized URL, status, and whether auth was
+        // attached - never the header value, never an unsanitized body.
+        getLogger().info(
+          {
+            provider: this.provider,
+            method: options.method ?? 'GET',
+            url: sanitizeUrl(url),
+            status: response.status,
+            attempt,
+            identityHeaderPresent: hasAuthorization(options.headers),
+          },
+          'provider request',
+        );
         if (!response.ok) {
           const errorClass = classifyHttpStatus(response.status, text);
           const retryAfterMs = parseRetryAfter(response.headers);
@@ -167,8 +180,13 @@ export class ProviderHttpClient {
             ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
             message: `${this.provider} responded ${response.status}`,
             userMessage: userMessageFor(this.provider, errorClass, response.status),
-            // Truncated body only; provider errors can echo request parameters.
-            context: { bodyPreview: text.slice(0, 300) },
+            // Truncated AND sanitized: provider errors can echo request
+            // parameters, including an api_key sent in the query string.
+            context: {
+              bodyPreview: sanitizeBody(text.slice(0, 300)),
+              url: sanitizeUrl(url),
+              identityHeaderPresent: hasAuthorization(options.headers),
+            },
           });
           counters.increment('provider_errors_total', {
             provider: this.provider,
@@ -213,7 +231,14 @@ export class ProviderHttpClient {
           class: errorClass,
         });
         getLogger().warn(
-          { provider: this.provider, attempt, errorClass },
+          {
+            provider: this.provider,
+            method: options.method ?? 'GET',
+            url: sanitizeUrl(url),
+            attempt,
+            errorClass,
+            identityHeaderPresent: hasAuthorization(options.headers),
+          },
           'provider request failed, will retry if attempts remain',
         );
         if (attempt >= this.maxAttempts) throw lastError;
@@ -236,6 +261,48 @@ export class ProviderHttpClient {
 }
 
 /** Response headers minus anything that could carry credentials. */
+/**
+ * A URL safe to log.
+ *
+ * Some providers authenticate with a query parameter, and a provider error can
+ * echo the request back. Anything secret-shaped in the query string is replaced
+ * before the URL reaches a log line, a stored error, or an API response.
+ */
+export function sanitizeUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (SECRET_QUERY_KEYS.test(key)) parsed.searchParams.set(key, 'REDACTED');
+    }
+    return parsed.toString();
+  } catch {
+    return '(unparseable url)';
+  }
+}
+
+const SECRET_QUERY_KEYS =
+  /(^|_)(api[_-]?key|access[_-]?token|token|key|secret|sig|signature|password)$/i;
+
+/** Strip anything secret-shaped out of a provider's own error text. */
+export function sanitizeBody(text: string): string {
+  return text.replace(
+    /((?:api[_-]?key|access[_-]?token|token|key|secret|password)["']?\s*[:=]\s*["']?)([^"'&,\s}]{4,})/gi,
+    '$1REDACTED',
+  );
+}
+
+/**
+ * Whether an Authorization header was attached - the fact, never the value.
+ *
+ * Callers log this as `identityHeaderPresent`, not `authenticated`: the logger's
+ * redaction pattern matches /auth/, so the obvious field name gets replaced with
+ * [redacted] and the diagnostic tells you nothing.
+ */
+export function hasAuthorization(headers?: Record<string, string>): boolean {
+  if (!headers) return false;
+  return Object.keys(headers).some((key) => key.toLowerCase() === 'authorization');
+}
+
 function safeHeaders(headers: Headers): Record<string, string> {
   const allowed = ['content-type', 'x-request-id', 'retry-after', 'x-ratelimit-remaining'];
   const out: Record<string, string> = {};
