@@ -4,6 +4,9 @@
 #   docker compose down           stop
 #   docker compose down -v        stop and wipe the local database
 #
+# If a host port is already taken, override it without touching this file:
+#   MART_WEB_PORT=3100 docker compose up --build
+#
 # Everything here is a development configuration. The provider base URLs point
 # at the bundled fixture server, so the dashboard shows synthetic data and says
 # so: the "DEVELOPMENT FIXTURE DATA" banner is derived from these URLs not
@@ -41,10 +44,10 @@ services:
     restart: unless-stopped
     volumes:
       - mart_pgdata:/var/lib/postgresql/data
-    ports:
-      # Loopback only, so the database is reachable with psql but not exposed
-      # to the network.
-      - "127.0.0.1:5432:5432"
+    # Deliberately not published to the host: the other services reach it over
+    # the compose network, and binding 5432 collides with any PostgreSQL the
+    # developer already runs. For a shell:
+    #   docker compose exec postgres psql -U mart -d mart
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U mart -d mart"]
       interval: 3s
@@ -97,7 +100,7 @@ services:
     volumes:
       - mart_secrets:/run/mart
     ports:
-      - "127.0.0.1:4000:4000"
+      - "127.0.0.1:${MART_API_PORT:-4000}:4000"
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -125,7 +128,7 @@ services:
     volumes:
       - mart_secrets:/run/mart
     ports:
-      - "127.0.0.1:4001:4001"
+      - "127.0.0.1:${MART_WORKER_PORT:-4001}:4001"
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -146,7 +149,7 @@ services:
     command: ["./node_modules/.bin/next", "start", "-p", "3000", "-H", "0.0.0.0"]
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "${MART_WEB_PORT:-3000}:3000"
     depends_on:
       api:
         condition: service_healthy

@@ -36,6 +36,17 @@ The credential key that encrypts stored provider credentials is generated once
 into a named volume rather than committed, so it survives restarts. `down -v`
 discards it along with the database, which is what makes that a clean reset.
 
+PostgreSQL is not published to the host, so it cannot collide with one you
+already run; use `docker compose exec postgres psql -U mart -d mart` to reach
+it. If port 3000 is taken (Grafana likes it), override the host port without
+editing anything:
+
+```bash
+MART_WEB_PORT=3100 docker compose up --build
+```
+
+`MART_API_PORT` and `MART_WORKER_PORT` work the same way.
+
 ## Running natively
 
 ## Prerequisites
