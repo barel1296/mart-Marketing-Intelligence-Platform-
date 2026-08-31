@@ -43,6 +43,8 @@ const attribution = {
   attributedRevenue: 250,
   mappedPaidInstalls: 300,
   mappedAttributedRevenue: 180,
+  deliveryAlignedPaidInstalls: 300,
+  deliveryAlignedRevenue: 180,
   organicInstalls: 100,
   organicRevenue: 70,
   unmappedPaidInstalls: 0,
@@ -93,6 +95,53 @@ describe('metric arithmetic', () => {
     expect(metric('mapped_cpi').value).not.toBeCloseTo(1000 / 400, 10);
   });
 
+  /**
+   * Population alignment. Spend is summed over the selected window, so a
+   * campaign that spent nothing in it contributes zero to the numerator - while
+   * its installs, mapped perfectly well, would still land in the denominator.
+   * Dividing one population by the other understates cost per install.
+   */
+  it('divides window spend only by installs whose campaign delivered in the window', () => {
+    const cpi = metric('mapped_cpi', context(), marketing, {
+      ...attribution,
+      mappedPaidInstalls: 300,
+      // 100 of those are on a campaign that did not deliver in this window.
+      deliveryAlignedPaidInstalls: 200,
+    });
+    expect(cpi.value).toBeCloseTo(800 / 200, 10);
+    expect(cpi.value).not.toBeCloseTo(800 / 300, 10);
+    expect(cpi.availability).toBe('partial');
+    expect(cpi.reason).toMatch(/did not deliver in this period/i);
+  });
+
+  it('keeps the mapping population and the delivery-aligned population apart', () => {
+    const values = (a: typeof attribution) => ({
+      mapped: metric('mapped_paid_installs', context(), marketing, a).value,
+      aligned: metric('delivery_aligned_paid_installs', context(), marketing, a).value,
+      mappedRevenue: metric('mapped_attributed_revenue', context(), marketing, a).value,
+      alignedRevenue: metric('delivery_aligned_revenue', context(), marketing, a).value,
+    });
+    expect(
+      values({
+        ...attribution,
+        mappedPaidInstalls: 300,
+        deliveryAlignedPaidInstalls: 200,
+        mappedAttributedRevenue: 180,
+        deliveryAlignedRevenue: 120,
+      }),
+    ).toEqual({ mapped: 300, aligned: 200, mappedRevenue: 180, alignedRevenue: 120 });
+    // Two labels, two numbers: neither is silently the other.
+    expect(metric('mapped_paid_installs').displayName).toMatch(/all mapped campaigns/i);
+    expect(metric('delivery_aligned_paid_installs').displayName).toMatch(/delivery-aligned/i);
+    expect(metric('mapped_cpi').displayName).toMatch(/selected period/i);
+  });
+
+  it('states both populations in the mapped CPI definition', () => {
+    const definition = getMetricDefinition('mapped_cpi');
+    expect(definition?.description).toMatch(/NUMERATOR POPULATION/);
+    expect(definition?.description).toMatch(/DENOMINATOR POPULATION/);
+  });
+
   it('never lets organic installs into a mapped figure', () => {
     const mapped = metric('mapped_paid_installs');
     expect(mapped.value).toBe(300);
@@ -115,11 +164,23 @@ describe('metric arithmetic', () => {
     const cpi = metric('mapped_cpi', context(), marketing, {
       ...attribution,
       mappedPaidInstalls: 0,
+      deliveryAlignedPaidInstalls: 0,
       unmappedPaidInstalls: 300,
     });
     expect(cpi.value).toBeNull();
     expect(cpi.availability).toBe('unavailable');
     expect(cpi.reason).toMatch(/no attribution campaign is mapped/i);
+  });
+
+  it('refuses a mapped CPI when the mapped campaigns did not deliver here', () => {
+    const cpi = metric('mapped_cpi', context(), marketing, {
+      ...attribution,
+      mappedPaidInstalls: 300,
+      deliveryAlignedPaidInstalls: 0,
+    });
+    expect(cpi.value).toBeNull();
+    expect(cpi.availability).toBe('unavailable');
+    expect(cpi.reason).toMatch(/did not deliver in this period/i);
   });
 
   it('marks a mapped CPI partial while paid installs remain unmapped', () => {

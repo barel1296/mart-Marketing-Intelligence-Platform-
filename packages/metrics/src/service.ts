@@ -23,6 +23,39 @@ const MAPPED_ATTRIBUTION_CAMPAIGN = `t.external_campaign_id IN (
          OR (m.status = 'matched_fallback'
              AND m.mapping_confidence >= ${OPERATIONAL_MAPPING_CONFIDENCE}))
 )`;
+
+/**
+ * The attribution campaign resolves to a marketing campaign that actually
+ * DELIVERED in the selected window.
+ *
+ * This is a different population from "mapped", and the difference is the
+ * reason a mapped CPI can be wrong: spend is summed over the window, so a
+ * campaign that spent nothing in it contributes zero to the numerator - while
+ * its installs, mapped perfectly well, still land in the denominator. Dividing
+ * one population by the other understates cost per install.
+ *
+ * $3 and $4 are the window bounds. Both call sites bind
+ * [organizationId, appId, from, to, ...] in that order.
+ */
+const DELIVERY_ALIGNED_CAMPAIGN = `t.external_campaign_id IN (
+  SELECT m.target_external_id FROM provider_entity_mappings m
+  JOIN (
+    SELECT DISTINCT md.external_campaign_id, md.provider_key
+    FROM marketing_daily_metrics md
+    WHERE md.organization_id = t.organization_id AND md.app_id = t.app_id
+      AND md.report_date BETWEEN $3 AND $4
+      AND (md.spend > 0 OR md.impressions > 0 OR md.clicks > 0)
+  ) delivered
+    ON delivered.external_campaign_id = m.source_external_id
+   AND delivered.provider_key = m.source_provider
+  WHERE m.organization_id = t.organization_id AND m.app_id = t.app_id
+    AND m.entity_type = 'campaign'
+    AND m.target_provider = t.provider_key
+    AND m.target_external_id IS NOT NULL
+    AND (m.status IN ('matched_exact', 'matched_confident', 'manually_verified')
+         OR (m.status = 'matched_fallback'
+             AND m.mapping_confidence >= ${OPERATIONAL_MAPPING_CONFIDENCE}))
+)`;
 import {
   getMetricDefinition,
   listMetricDefinitions,
@@ -109,6 +142,14 @@ export type AttributionAggregate = {
   /** Paid installs on campaigns mapped to the marketing network. */
   mappedPaidInstalls: number;
   mappedAttributedRevenue: number;
+  /**
+   * The subset of the mapped population whose marketing campaign also
+   * delivered in the selected window. This is the only install population a
+   * window's spend may be divided by: the other one contains installs the
+   * window's spend did not buy.
+   */
+  deliveryAlignedPaidInstalls: number;
+  deliveryAlignedRevenue: number;
   /** Unpaid traffic. Never part of a paid campaign's CPI or ROAS. */
   organicInstalls: number;
   organicRevenue: number;
@@ -221,6 +262,7 @@ export async function loadAttributionAggregate(
   const installRows = await queryRows<{
     installs: string;
     mapped_installs: string;
+    delivery_aligned_installs: string;
     organic_installs: string;
     row_count: string;
     latest_date: string | null;
@@ -228,6 +270,9 @@ export async function loadAttributionAggregate(
     `SELECT COALESCE(SUM(attributed_installs), 0)::text AS installs,
             COALESCE(SUM(attributed_installs) FILTER (
               WHERE ${NOT_ORGANIC} AND ${MAPPED_ATTRIBUTION_CAMPAIGN}), 0)::text AS mapped_installs,
+            COALESCE(SUM(attributed_installs) FILTER (
+              WHERE ${NOT_ORGANIC} AND ${DELIVERY_ALIGNED_CAMPAIGN}), 0)::text
+              AS delivery_aligned_installs,
             COALESCE(SUM(attributed_installs) FILTER (WHERE NOT (${NOT_ORGANIC})), 0)::text
               AS organic_installs,
             count(*)::text AS row_count,
@@ -261,12 +306,16 @@ export async function loadAttributionAggregate(
   const revenueRows = await queryRows<{
     revenue: string;
     mapped_revenue: string;
+    delivery_aligned_revenue: string;
     organic_revenue: string;
     latest_date: string | null;
   }>(
     `SELECT COALESCE(SUM(revenue), 0)::text AS revenue,
             COALESCE(SUM(revenue) FILTER (
               WHERE ${NOT_ORGANIC} AND ${MAPPED_ATTRIBUTION_CAMPAIGN}), 0)::text AS mapped_revenue,
+            COALESCE(SUM(revenue) FILTER (
+              WHERE ${NOT_ORGANIC} AND ${DELIVERY_ALIGNED_CAMPAIGN}), 0)::text
+              AS delivery_aligned_revenue,
             COALESCE(SUM(revenue) FILTER (WHERE NOT (${NOT_ORGANIC})), 0)::text AS organic_revenue,
             MAX(activity_date)::text AS latest_date
      FROM attribution_revenue_metrics t WHERE ${revenueWhere}`,
@@ -282,6 +331,8 @@ export async function loadAttributionAggregate(
     attributedRevenue: toNumber(revenueRows[0]?.revenue),
     mappedPaidInstalls,
     mappedAttributedRevenue: toNumber(revenueRows[0]?.mapped_revenue),
+    deliveryAlignedPaidInstalls: toNumber(installRows[0]?.delivery_aligned_installs),
+    deliveryAlignedRevenue: toNumber(revenueRows[0]?.delivery_aligned_revenue),
     organicInstalls,
     organicRevenue: toNumber(revenueRows[0]?.organic_revenue),
     // Paid installs MART cannot yet attach to a marketing campaign. Reported
@@ -469,25 +520,40 @@ function buildMetricValue(
         value: attribution.mappedAttributedRevenue,
         numerator: attribution.mappedAttributedRevenue,
       });
+    case 'delivery_aligned_paid_installs':
+      return withFreshness({
+        ...base,
+        value: attribution.deliveryAlignedPaidInstalls,
+        numerator: attribution.deliveryAlignedPaidInstalls,
+      });
+    case 'delivery_aligned_revenue':
+      return withFreshness({
+        ...base,
+        value: attribution.deliveryAlignedRevenue,
+        numerator: attribution.deliveryAlignedRevenue,
+      });
     case 'mapped_cpi': {
-      // Both sides describe the same mapped campaigns. When nothing is mapped
-      // the honest answer is the reason, not a number computed from a
-      // denominator that does not match its numerator.
-      if (attribution.mappedPaidInstalls === 0) {
+      // Both sides describe the campaigns that delivered in this window. The
+      // wider mapped population is a coverage figure, not a denominator: an
+      // install mapped to a campaign that spent nothing here was not bought by
+      // this window's spend.
+      if (attribution.deliveryAlignedPaidInstalls === 0) {
         return {
           ...base,
           numerator: marketing.mappedSpend,
           denominator: 0,
           availability: 'unavailable',
           reason:
-            attribution.attributedInstalls > 0
-              ? 'No attribution campaign is mapped to a marketing campaign yet, so spend and installs cannot be attributed to the same campaigns. Reconcile campaigns first.'
-              : 'No attributed installs for the selected filters.',
+            attribution.mappedPaidInstalls > 0
+              ? "Installs are mapped, but to campaigns that did not deliver in this period. This period's spend did not buy them, so it cannot be divided by them."
+              : attribution.attributedInstalls > 0
+                ? 'No attribution campaign is mapped to a marketing campaign yet, so spend and installs cannot be attributed to the same campaigns. Reconcile campaigns first.'
+                : 'No attributed installs for the selected filters.',
         };
       }
       const ratio = safeRatio(
         marketing.mappedSpend,
-        attribution.mappedPaidInstalls,
+        attribution.deliveryAlignedPaidInstalls,
         definition.minimumDenominator,
       );
       const value = finishRatio(
@@ -495,15 +561,31 @@ function buildMetricValue(
         withFreshness,
         ratio,
         marketing.mappedSpend,
-        attribution.mappedPaidInstalls,
+        attribution.deliveryAlignedPaidInstalls,
       );
-      // Available, but not the whole picture: say how much paid attribution is
-      // still outside the mapping rather than letting the number imply it all.
-      if (value.availability === 'available' && attribution.unmappedPaidInstalls > 0) {
+      // Available, but not the whole picture. Two different exclusions, both
+      // named rather than folded into the number.
+      const outsideDelivery =
+        attribution.mappedPaidInstalls - attribution.deliveryAlignedPaidInstalls;
+      if (
+        value.availability === 'available' &&
+        (attribution.unmappedPaidInstalls > 0 || outsideDelivery > 0)
+      ) {
+        const reasons: string[] = [];
+        if (attribution.unmappedPaidInstalls > 0) {
+          reasons.push(
+            `${attribution.unmappedPaidInstalls} paid install(s) are on campaigns MART cannot map yet`,
+          );
+        }
+        if (outsideDelivery > 0) {
+          reasons.push(
+            `${outsideDelivery} mapped install(s) are on campaigns that did not deliver in this period`,
+          );
+        }
         return {
           ...value,
           availability: 'partial',
-          reason: `${attribution.unmappedPaidInstalls} paid install(s) are on campaigns MART cannot map yet and are excluded from this figure.`,
+          reason: `${reasons.join(', and ')}. Both are excluded from this figure.`,
         };
       }
       return value;

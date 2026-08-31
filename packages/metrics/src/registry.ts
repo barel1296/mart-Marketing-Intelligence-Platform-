@@ -166,9 +166,9 @@ export const METRIC_DEFINITIONS: readonly MetricDefinition[] = [
   },
   {
     metricKey: 'mapped_paid_installs',
-    displayName: 'Mapped paid installs',
+    displayName: 'Mapped paid installs (all mapped campaigns)',
     description:
-      'Installs on attribution campaigns that resolve to a campaign in the marketing network, by stable id, human verification, or a deterministic high-confidence name match. Organic is excluded.',
+      "Installs on attribution campaigns that resolve to a campaign in the marketing network, by stable id, human verification, or a deterministic high-confidence name match. Organic is excluded. This is the MAPPING population: it includes installs on campaigns that did not deliver in the selected period, so it is a coverage figure and not a denominator for the period's spend.",
     formula: 'SUM(attributed_installs) WHERE campaign is mapped AND media_source <> organic',
     grain: {
       primary: 'install_date',
@@ -194,12 +194,46 @@ export const METRIC_DEFINITIONS: readonly MetricDefinition[] = [
     maxAcceptableStalenessMinutes: 24 * 60,
   },
   {
-    metricKey: 'mapped_cpi',
-    displayName: 'Mapped CPI',
+    metricKey: 'delivery_aligned_paid_installs',
+    displayName: 'Delivery-aligned paid installs',
     description:
-      'Spend on mapped marketing campaigns divided by the installs attributed to those same campaigns. Both sides describe the same set of campaigns, which is what makes this a CPI rather than a ratio of two unrelated totals.',
+      "The subset of mapped paid installs whose marketing campaign also delivered in the selected period. This is the only install population the period's spend may be divided by; installs mapped to a campaign that spent nothing in the period are real, and the period's spend did not buy them.",
     formula:
-      'SUM(marketing.spend WHERE campaign mapped) [report_date] / SUM(attribution.attributed_installs WHERE campaign mapped) [install_date]',
+      'SUM(attributed_installs) WHERE campaign is mapped AND that campaign delivered in the window AND not organic',
+    grain: {
+      primary: 'install_date',
+      note: 'Install-date grain, restricted to campaigns that delivered in the selected window.',
+    },
+    sources: ['marketing', 'attribution', 'mapping'],
+    requiredCapabilities: ['attributed_installs'],
+    minimumDenominator: 0,
+    format: 'integer',
+    maxAcceptableStalenessMinutes: 24 * 60,
+  },
+  {
+    metricKey: 'delivery_aligned_revenue',
+    displayName: 'Delivery-aligned attributed revenue',
+    description:
+      "Revenue on mapped campaigns that also delivered in the selected period. The revenue counterpart of delivery-aligned installs, and the only revenue population comparable against the period's spend.",
+    formula:
+      'SUM(revenue) WHERE grain = event_date AND campaign is mapped AND that campaign delivered in the window AND not organic',
+    grain: {
+      primary: 'event_date',
+      note: 'Event-date grain, restricted to campaigns that delivered in the selected window.',
+    },
+    sources: ['marketing', 'attribution', 'mapping'],
+    requiredCapabilities: ['attributed_revenue'],
+    minimumDenominator: 0,
+    format: 'currency',
+    maxAcceptableStalenessMinutes: 48 * 60,
+  },
+  {
+    metricKey: 'mapped_cpi',
+    displayName: 'Mapped CPI (selected period)',
+    description:
+      'Spend in the selected period on mapped marketing campaigns, divided by the installs attributed to those same campaigns in the same period. NUMERATOR POPULATION: campaigns mapped to attribution that delivered in the window. DENOMINATOR POPULATION: the same campaigns. Stating both is the point - a ratio whose sides describe different populations is not a CPI, and the difference against the wider mapped population is reported beside it.',
+    formula:
+      'SUM(marketing.spend WHERE campaign mapped) [report_date] / SUM(attribution.attributed_installs WHERE campaign mapped AND delivered in window) [install_date]',
     grain: {
       primary: 'report_date',
       mixed: ['report_date', 'install_date'],
