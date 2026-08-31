@@ -147,6 +147,15 @@ Center therefore reports coverage over the selected window, three ways:
 | **Spend coverage**   | network spend in the window            | **is the money accounted for**     |
 | Attribution coverage | paid attributed installs in the window | is the attribution accounted for   |
 
+They are computed once per response and read by both the KPI cards and the
+reconciliation panel. Computing them twice for one page is how a card came to
+say "unavailable" above a panel reading 100%: the card's call had no reporting
+period, so the period metrics correctly reported that they had no period.
+
+Labels carry the distinction, because the two families share the word
+"coverage" and nothing else: **(selected period)** for the three above,
+**(all structure)** for authoritative and operational mapping coverage.
+
 They are never averaged. Spend coverage is the one that exposes a single large
 campaign sitting unmapped: on the account this was built against, campaign
 coverage read 50% while spend coverage read **9.9%**, because one campaign

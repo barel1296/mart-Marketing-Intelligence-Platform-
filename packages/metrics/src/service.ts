@@ -544,7 +544,7 @@ function buildMetricValue(
           ...base,
           availability: 'unavailable',
           reason:
-            'Period coverage needs a reconciled mapping set for the selected window. Run a sync for both providers, then recompute mappings.',
+            'This metric is computed over the selected reporting period, and no period reached the metric layer with this request.',
         };
       }
       // Three separate questions, never blended: how many campaigns, how much

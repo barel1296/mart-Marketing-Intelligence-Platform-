@@ -202,7 +202,13 @@ export async function registerAnalyticsRoutes(server: FastifyInstance): Promise<
       }
 
       const [coverage, discrepancies, ambiguous] = await Promise.all([
-        campaignCoverage(context.organizationId, app.id, state.marketingProviderKey),
+        // Windowed, like every other coverage read: a standalone reconciliation
+        // view must not disagree with the Command Center about the same period.
+        campaignCoverage(context.organizationId, app.id, state.marketingProviderKey, {
+          from: range.from,
+          to: range.to,
+          attributionProviderKey: state.attributionProviderKey,
+        }),
         loadReconciliationDiscrepancies({
           organizationId: context.organizationId,
           appId: app.id,
@@ -378,10 +384,14 @@ export async function registerAnalyticsRoutes(server: FastifyInstance): Promise<
       setNoStore(reply);
 
       const range = resolveRange(query);
-      const { context: metricContext, state } = await buildMetricContext(
-        context.organizationId,
-        app,
-      );
+      // One coverage computation for the whole response: the KPI cards and the
+      // reconciliation panel must be the same numbers, not two calls that can
+      // drift apart.
+      const {
+        context: metricContext,
+        state,
+        coverage,
+      } = await buildMetricContext(context.organizationId, app, range);
       const filters: MetricFilters = {
         organizationId: context.organizationId,
         appId: app.id,
@@ -405,18 +415,11 @@ export async function registerAnalyticsRoutes(server: FastifyInstance): Promise<
 
       const metrics = computeMetricValues({ context: metricContext, marketing, attribution });
 
-      const [series, campaigns, coverage, discrepancies, ambiguous] = await Promise.all([
+      const [series, campaigns, discrepancies, ambiguous] = await Promise.all([
         loadTimeseries(filters),
         state.marketingProviderKey
           ? loadCampaignTable({ ...filters, limit: 25 })
           : Promise.resolve({ rows: [], total: 0 }),
-        state.marketingProviderKey
-          ? campaignCoverage(context.organizationId, app.id, state.marketingProviderKey, {
-              from: range.from,
-              to: range.to,
-              attributionProviderKey: state.attributionProviderKey,
-            })
-          : Promise.resolve(null),
         state.marketingProviderKey && state.attributionProviderKey
           ? loadReconciliationDiscrepancies(filters, 10)
           : Promise.resolve([]),

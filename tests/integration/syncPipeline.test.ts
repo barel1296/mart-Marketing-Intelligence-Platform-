@@ -907,6 +907,121 @@ describe('reconciliation', () => {
       expect(summary.matchedExact).toBe(0);
     });
 
+    it('serves the KPI cards the same selected-period coverage as the reconciliation panel', async () => {
+      structure();
+      // A campaign that spent earlier in the month and nothing in the selected
+      // week. It must not blank the period cards, and must not reduce them.
+      controls.marketingRows.push({
+        reportDate: '2026-08-05',
+        campaignId: 'c-historical',
+        campaignName: 'RMKT_historical_campaign',
+        spend: 500,
+        impressions: 40000,
+        clicks: 3000,
+      });
+      const ctx = await setup('tenjin');
+      await triggerSync(ctx, '2026-08-01', '2026-08-31');
+      await reconcile(ctx.user.organizationId, ctx.appId, 'meta_ads', 'tenjin');
+
+      const payload = await request(
+        ctx.user,
+        'GET',
+        `/api/v1/organizations/${ctx.user.organizationId}/apps/${ctx.appId}/command-center?from=2026-08-25&to=2026-08-31`,
+      );
+      const body = payload.json() as {
+        metrics: Array<{
+          metricKey: string;
+          displayName: string;
+          value: number | null;
+          availability: string;
+        }>;
+        reconciliation: {
+          coverage: {
+            eligible?: {
+              campaignPct: number | null;
+              spendPct: number | null;
+              installPct: number | null;
+              historicalCampaigns: number;
+            };
+          } | null;
+        };
+      };
+      const metric = (key: string) => body.metrics.find((m) => m.metricKey === key);
+      const eligible = body.reconciliation.coverage?.eligible;
+      expect(eligible).toBeDefined();
+
+      // The regression: the cards read "unavailable" while the panel below
+      // them read 100%, because the two came from different calls.
+      for (const key of [
+        'campaign_operational_coverage',
+        'spend_coverage',
+        'attribution_coverage',
+      ]) {
+        expect(metric(key)?.availability, key).not.toBe('unavailable');
+      }
+      // Metric values are ratios and render as percentages; the panel carries
+      // the already-scaled figure. Same number, one scaling apart.
+      const asPct = (value: number | null | undefined): number | null =>
+        value === null || value === undefined ? null : Number((value * 100).toFixed(1));
+      expect(asPct(metric('campaign_operational_coverage')?.value)).toBe(eligible?.campaignPct);
+      expect(asPct(metric('spend_coverage')?.value)).toBe(eligible?.spendPct);
+      expect(asPct(metric('attribution_coverage')?.value)).toBe(eligible?.installPct);
+
+      // Everything that delivered in the window is mapped, and the campaign
+      // that only spent earlier is excluded rather than counted against it.
+      expect(eligible?.campaignPct).toBe(100);
+      expect(eligible?.spendPct).toBe(100);
+      expect(eligible?.installPct).toBe(100);
+      expect(eligible?.historicalCampaigns).toBeGreaterThan(0);
+
+      // The two families are labelled so they cannot be read as one number.
+      expect(metric('campaign_operational_coverage')?.displayName).toMatch(/selected period/i);
+      expect(metric('spend_coverage')?.displayName).toMatch(/selected period/i);
+      expect(metric('attribution_coverage')?.displayName).toMatch(/selected period/i);
+      expect(metric('mapping_coverage')?.displayName).toMatch(/all structure/i);
+      expect(metric('operational_mapping_coverage')?.displayName).toMatch(/all structure/i);
+    });
+
+    it('keeps a historical campaign in MART, unmapped and outside period coverage', async () => {
+      structure();
+      controls.marketingRows.push({
+        reportDate: '2026-08-05',
+        campaignId: 'c-historical',
+        campaignName: 'RMKT_historical_campaign',
+        spend: 500,
+        impressions: 40000,
+        clicks: 3000,
+      });
+      const ctx = await setup('tenjin');
+      await triggerSync(ctx, '2026-08-01', '2026-08-31');
+      await reconcile(ctx.user.organizationId, ctx.appId, 'meta_ads', 'tenjin');
+
+      // Still stored, still unmapped: neither deleted nor force-matched.
+      const stored = await queryRows<{ external_campaign_id: string }>(
+        `SELECT external_campaign_id FROM marketing_campaigns
+          WHERE app_id = $1 AND external_campaign_id = 'c-historical'`,
+        [ctx.appId],
+      );
+      expect(stored).toHaveLength(1);
+      const mapping = await queryRows<{ status: string; target_external_id: string | null }>(
+        `SELECT status, target_external_id FROM provider_entity_mappings
+          WHERE app_id = $1 AND source_external_id = 'c-historical'`,
+        [ctx.appId],
+      );
+      expect(mapping[0]?.status).toBe('unmatched');
+      expect(mapping[0]?.target_external_id).toBeNull();
+
+      // It lowers the all-structure number and leaves the period alone.
+      const coverage = await campaignCoverage(ctx.user.organizationId, ctx.appId, 'meta_ads', {
+        from: '2026-08-25',
+        to: '2026-08-31',
+        attributionProviderKey: 'tenjin',
+      });
+      expect(coverage.operationalCoveragePct).toBeLessThan(100);
+      expect(coverage.eligible?.campaignPct).toBe(100);
+      expect(coverage.eligible?.spendPct).toBe(100);
+    });
+
     it('does not leak one provider pair semantics into another', async () => {
       structure();
       // Identical data, a different attribution provider. MART has not verified

@@ -1,6 +1,7 @@
 import type { AppRow } from '@mart/db';
 import { integrationsRepo, syncRepo } from '@mart/db';
-import { campaignCoverage, worstFreshness } from '@mart/integrations';
+import type { IsoDate } from '@mart/shared';
+import { campaignCoverage, worstFreshness, type CoverageSummary } from '@mart/integrations';
 import type { MetricContext } from '@mart/metrics';
 
 export type AppIntegrationState = {
@@ -46,7 +47,22 @@ export async function loadIntegrationState(
 export async function buildMetricContext(
   organizationId: string,
   app: AppRow,
-): Promise<{ context: MetricContext; state: AppIntegrationState }> {
+  /**
+   * The reporting period on screen. Passing it is what makes the selected-period
+   * coverage metrics computable; without it only the all-structure numbers
+   * exist, and the period ones correctly report that they have no period.
+   */
+  window?: { from: IsoDate; to: IsoDate },
+): Promise<{
+  context: MetricContext;
+  state: AppIntegrationState;
+  /**
+   * Returned so callers render the same numbers the metrics were computed
+   * from. Computing coverage twice for one response is how a KPI card and the
+   * panel below it came to disagree.
+   */
+  coverage: CoverageSummary | null;
+}> {
   const state = await loadIntegrationState(organizationId, app.id);
   const bindings = await integrationsRepo.listAppBindings(organizationId, app.id);
 
@@ -66,7 +82,18 @@ export async function buildMetricContext(
   const attributionRows = freshnessRows.filter((r) => r.data_type.startsWith('attribution'));
 
   const coverage = state.marketingProviderKey
-    ? await campaignCoverage(organizationId, app.id, state.marketingProviderKey)
+    ? await campaignCoverage(
+        organizationId,
+        app.id,
+        state.marketingProviderKey,
+        window
+          ? {
+              from: window.from,
+              to: window.to,
+              attributionProviderKey: state.attributionProviderKey,
+            }
+          : undefined,
+      )
     : null;
 
   const context: MetricContext = {
@@ -107,5 +134,5 @@ export async function buildMetricContext(
       : undefined,
   };
 
-  return { context, state };
+  return { context, state, coverage };
 }

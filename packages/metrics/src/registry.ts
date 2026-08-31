@@ -247,7 +247,7 @@ export const METRIC_DEFINITIONS: readonly MetricDefinition[] = [
   },
   {
     metricKey: 'mapping_coverage',
-    displayName: 'Authoritative mapping coverage',
+    displayName: 'Authoritative mapping coverage (all structure)',
     description:
       'Share of marketing-network campaigns linked to an attribution campaign by stable id or human verification. Every name-based match is excluded, however deterministic.',
     formula: '(matched_exact + matched_confident + manually_verified) / total_campaign_mappings',
@@ -263,7 +263,7 @@ export const METRIC_DEFINITIONS: readonly MetricDefinition[] = [
   },
   {
     metricKey: 'operational_mapping_coverage',
-    displayName: 'Operational coverage (all structure)',
+    displayName: 'Operational mapping coverage (all structure)',
     description:
       'Authoritative mappings plus deterministic high-confidence name matches, across every campaign MART knows about - including ones that stopped running long ago. Use the current-period campaign coverage for how today looks; this one is the all-structure view.',
     formula: '(authoritative + high_confidence_name_matches) / total_campaign_mappings',
@@ -279,7 +279,7 @@ export const METRIC_DEFINITIONS: readonly MetricDefinition[] = [
   },
   {
     metricKey: 'spend_coverage',
-    displayName: 'Spend coverage',
+    displayName: 'Spend coverage (selected period)',
     description:
       "Share of the selected period's network spend on campaigns that resolve to attribution. The number that shows whether the money is accounted for: dormant campaigns cannot drag it down, and one large unmapped campaign will.",
     formula: 'SUM(spend on mapped campaigns) / SUM(spend) over the selected window',
@@ -295,7 +295,7 @@ export const METRIC_DEFINITIONS: readonly MetricDefinition[] = [
   },
   {
     metricKey: 'attribution_coverage',
-    displayName: 'Attribution coverage',
+    displayName: 'Attribution coverage (selected period)',
     description:
       'Share of paid attributed installs on campaigns that resolve to a marketing campaign. Organic is excluded: it belongs to no campaign and is not a mapping gap.',
     formula: 'SUM(mapped paid installs) / SUM(paid attributed installs) over the selected window',
@@ -308,7 +308,7 @@ export const METRIC_DEFINITIONS: readonly MetricDefinition[] = [
   },
   {
     metricKey: 'campaign_operational_coverage',
-    displayName: 'Campaign coverage (this period)',
+    displayName: 'Campaign coverage (selected period)',
     description:
       'Share of the campaigns that actually delivered in the selected period that resolve to attribution. Campaigns with no delivery in the period are excluded - a campaign that stopped running last quarter is not a current-period gap.',
     formula: 'mapped campaigns with delivery / campaigns with delivery, over the selected window',
