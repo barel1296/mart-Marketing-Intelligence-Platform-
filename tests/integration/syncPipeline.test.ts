@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { queryRows, syncRepo, toNumber } from '@mart/db';
+import { query, queryRows, syncRepo, toNumber } from '@mart/db';
 import { campaignCoverage, getRemoteIdResolver } from '@mart/integrations';
 import {
   closeServer,
@@ -2219,5 +2219,149 @@ describe('sync run honesty', () => {
     ).dataHealth;
     expect(health.activeErrors).toHaveLength(0);
     expect(health.resolvedErrors.length).toBeGreaterThan(0);
+  });
+});
+
+describe('KPI audit invariants', () => {
+  beforeAll(() => installFakeProviders());
+  afterAll(async () => {
+    removeFakeProviders();
+    await closeServer();
+  });
+  beforeEach(async () => {
+    await truncateAll();
+    resetControls();
+    controls.marketingRows = structuredClone(BASE_MARKETING);
+    controls.attributionRows = structuredClone(BASE_ATTRIBUTION);
+  });
+
+  /**
+   * The invariants the read-only KPI audit checks, asserted here so they are
+   * enforced by CI rather than only observed by a person running the CLI.
+   */
+  it('never sums cohort revenue into the event-date attributed total', async () => {
+    const ctx = await setup();
+    await triggerSync(ctx, '2026-08-20', '2026-08-21');
+
+    const before = await request(
+      ctx.user,
+      'GET',
+      `/api/v1/organizations/${ctx.user.organizationId}/apps/${ctx.appId}/command-center?from=2026-08-20&to=2026-08-21`,
+    );
+    const revenueOf = (payload: { metrics: Array<{ metricKey: string; value: number | null }> }) =>
+      payload.metrics.find((m) => m.metricKey === 'attributed_revenue')?.value ?? null;
+    const baseline = revenueOf(before.json() as never);
+    expect(baseline).toBeGreaterThan(0);
+
+    // A cohort row for the same campaign and date. It is a different fact and
+    // must not join the event-date total.
+    const connection = await queryRows<{ id: string }>(
+      `SELECT connection_id AS id FROM attribution_revenue_metrics WHERE app_id = $1 LIMIT 1`,
+      [ctx.appId],
+    );
+    await query(
+      `INSERT INTO attribution_revenue_metrics
+         (organization_id, app_id, connection_id, provider_key, grain, activity_date,
+          revenue_type, media_source, normalized_media_source, external_campaign_id,
+          campaign_name, country, platform, currency, revenue, dimension_hash)
+       VALUES ($1,$2,$3,'appsflyer','install_date','2026-08-20','iap','facebook','meta','900',
+               'Summer','US','ios','USD',9999,'cohort-guard')`,
+      [ctx.user.organizationId, ctx.appId, connection[0]?.id],
+    );
+
+    const after = await request(
+      ctx.user,
+      'GET',
+      `/api/v1/organizations/${ctx.user.organizationId}/apps/${ctx.appId}/command-center?from=2026-08-20&to=2026-08-21`,
+    );
+    expect(revenueOf(after.json() as never)).toBe(baseline);
+  });
+
+  it('keeps marketing delivery free of attribution fan-out', async () => {
+    // Two attribution campaigns mapped to one marketing campaign must not
+    // multiply that campaign's spend.
+    controls.attributionRows = [
+      {
+        installDate: '2026-08-20',
+        campaignId: 'mmp-a',
+        campaignName: 'creative a (Summer US)',
+        installs: 40,
+        revenue: 10,
+      },
+      {
+        installDate: '2026-08-20',
+        campaignId: 'mmp-b',
+        campaignName: 'creative b (Summer US)',
+        installs: 20,
+        revenue: 5,
+      },
+    ];
+    controls.marketingRows = [
+      {
+        reportDate: '2026-08-20',
+        campaignId: '900',
+        campaignName: 'Summer US',
+        spend: 100,
+        impressions: 5000,
+        clicks: 400,
+      },
+    ];
+    const ctx = await setup();
+    await triggerSync(ctx, '2026-08-20', '2026-08-20');
+    await reconcile(ctx.user.organizationId, ctx.appId);
+
+    const payload = await request(
+      ctx.user,
+      'GET',
+      `/api/v1/organizations/${ctx.user.organizationId}/apps/${ctx.appId}/command-center?from=2026-08-20&to=2026-08-20`,
+    );
+    const body = payload.json() as {
+      metrics: Array<{ metricKey: string; value: number | null }>;
+      campaigns: { rows: Array<{ spend: number; attributedInstalls: number | null }> };
+    };
+    const value = (key: string) => body.metrics.find((m) => m.metricKey === key)?.value ?? null;
+
+    // Spend counted once; attribution aggregated across both children.
+    expect(value('spend')).toBe(100);
+    expect(body.campaigns.rows).toHaveLength(1);
+    expect(body.campaigns.rows[0]?.spend).toBe(100);
+    expect(body.campaigns.rows[0]?.attributedInstalls).toBe(60);
+    expect(value('mapped_paid_installs')).toBe(60);
+  });
+
+  it('derives every delivery ratio from summed numerator and denominator', async () => {
+    controls.marketingRows = [
+      {
+        reportDate: '2026-08-20',
+        campaignId: '900',
+        campaignName: 'Summer US',
+        spend: 100,
+        impressions: 20000,
+        clicks: 1000,
+      },
+      {
+        reportDate: '2026-08-21',
+        campaignId: '901',
+        campaignName: 'Autumn US',
+        spend: 200,
+        impressions: 5000,
+        clicks: 100,
+      },
+    ];
+    const ctx = await setup();
+    await triggerSync(ctx, '2026-08-20', '2026-08-21');
+
+    const payload = await request(
+      ctx.user,
+      'GET',
+      `/api/v1/organizations/${ctx.user.organizationId}/apps/${ctx.appId}/command-center?from=2026-08-20&to=2026-08-21`,
+    );
+    const body = payload.json() as { metrics: Array<{ metricKey: string; value: number | null }> };
+    const value = (key: string) => body.metrics.find((m) => m.metricKey === key)?.value ?? null;
+
+    // Sums, not the mean of the two days' ratios - which would be 3.5% here.
+    expect(value('ctr')).toBeCloseTo(1100 / 25000, 10);
+    expect(value('cpm')).toBeCloseTo((300 * 1000) / 25000, 10);
+    expect(value('cpc')).toBeCloseTo(300 / 1100, 10);
   });
 });

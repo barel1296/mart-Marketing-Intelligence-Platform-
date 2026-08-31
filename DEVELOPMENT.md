@@ -93,6 +93,27 @@ one, because Tenjin reporting is addressed by saved report UUID
 fits, the diagnostic says which report to create and why each existing one was
 refused - MART reads saved reports and never creates or edits one.
 
+### Auditing the KPIs
+
+Every displayed KPI, traced from stored rows to dashboard value:
+
+```bash
+docker compose exec api node packages/integrations/dist/cli/kpi-audit.js <organization_id> <from> <to> [app_id]
+```
+
+It computes each metric three ways - a direct SQL sum over the normalized
+tables, the production aggregation the API uses, and the formula applied by
+hand - and passes only when all three agree to the last decimal. Display
+rounding is the only difference tolerated.
+
+It is read-only and writes nothing. It also checks what a matching total can
+hide: that delivery rows are not multiplied by attribution mappings, that paid
+and organic installs partition the total, that no combined revenue figure sits
+beside the components it is the sum of, that cohort revenue never joins the
+event-date total, that campaign rows sum to the top line, and that every row is
+stored at the grain its metric claims. Exit status is non-zero when any metric
+fails.
+
 ### Why a campaign is unmatched
 
 Reconciliation reports how many campaigns are unmatched; this explains each one:

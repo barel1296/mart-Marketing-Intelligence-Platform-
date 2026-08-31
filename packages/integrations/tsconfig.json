@@ -11,6 +11,7 @@
     { "path": "../shared" },
     { "path": "../db" },
     { "path": "../config" },
-    { "path": "../observability" }
+    { "path": "../observability" },
+    { "path": "../metrics" }
   ]
 }
