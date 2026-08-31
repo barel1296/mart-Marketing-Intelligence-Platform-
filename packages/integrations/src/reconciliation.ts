@@ -934,11 +934,23 @@ async function eligibleCoverage(
   }>(
     `SELECT CASE
               WHEN COALESCE(a.normalized_media_source, 'organic') = 'organic' THEN 'organic'
+              -- Either direction counts. Reconciliation records a link from
+              -- both sides, and which side wrote it is an artifact of which
+              -- pass matched first, not a difference in the evidence: a
+              -- campaign matched only by the attribution-side pass holds the
+              -- same method and confidence as one matched by the marketing
+              -- side. Reading one direction only made MART report its own
+              -- recorded mappings as coverage gaps.
               WHEN EXISTS (
                 SELECT 1 FROM provider_entity_mappings m
                 WHERE m.organization_id = $1 AND m.app_id = $2
-                  AND m.entity_type = 'campaign' AND m.target_provider = a.provider_key
-                  AND m.target_external_id = a.external_campaign_id AND ${OPERATIONAL_MAPPING}
+                  AND m.entity_type = 'campaign'
+                  AND ((m.target_provider = a.provider_key
+                        AND m.target_external_id = a.external_campaign_id)
+                    OR (m.source_provider = a.provider_key
+                        AND m.source_external_id = a.external_campaign_id
+                        AND m.target_external_id IS NOT NULL))
+                  AND ${OPERATIONAL_MAPPING}
               ) THEN 'mapped'
               WHEN EXISTS (
                 SELECT 1 FROM provider_entity_mappings m
