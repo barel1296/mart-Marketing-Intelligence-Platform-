@@ -221,14 +221,19 @@ export async function loadCampaignTable(
   const limit = Math.min(filters.limit ?? 50, 500);
   const offset = Math.max(filters.offset ?? 0, 0);
 
+  // Qualified on purpose. The select list exposes these measures as ::text for
+  // lossless transport, and a bare name in ORDER BY binds to that output column
+  // first - so `ORDER BY spend DESC` would sort lexically and rank a campaign
+  // that spent 9 above one that spent 100. Qualifying the name binds it to the
+  // numeric column in the CTE instead.
   const sortColumn =
     filters.sort === 'impressions'
-      ? 'impressions'
+      ? 'marketing.impressions'
       : filters.sort === 'clicks'
-        ? 'clicks'
+        ? 'marketing.clicks'
         : filters.sort === 'name'
-          ? 'campaign_name'
-          : 'spend';
+          ? 'marketing.campaign_name'
+          : 'marketing.spend';
   const direction = filters.direction === 'asc' ? 'ASC' : 'DESC';
 
   const params: unknown[] = [
@@ -240,18 +245,30 @@ export async function loadCampaignTable(
     attributionProvider,
   ];
   let extra = '';
+  // The same dimension filters have to reach both halves of the row. Filtering
+  // spend to one country while installs and revenue stay account-wide makes the
+  // per-campaign CPI a ratio between two different populations, and it reads as
+  // a real number because both halves are real. Both sides store `country` and
+  // `platform` under those names, so one list serves every alias.
+  const sharedDimensions: Array<{ column: string; param: number }> = [];
   if (filters.country) {
     params.push(filters.country);
     extra += ` AND m.country = $${params.length}`;
+    sharedDimensions.push({ column: 'country', param: params.length });
   }
   if (filters.platform) {
     params.push(filters.platform);
     extra += ` AND m.platform = $${params.length}`;
+    sharedDimensions.push({ column: 'platform', param: params.length });
   }
+  // Account scoping is a marketing-side concept: the attribution provider does
+  // not carry the ad account, so there is nothing to narrow on that side.
   if (filters.marketingAccountExternalId) {
     params.push(filters.marketingAccountExternalId);
     extra += ` AND m.external_account_id = $${params.length}`;
   }
+  const attributionFilterFor = (alias: string): string =>
+    sharedDimensions.map((d) => ` AND ${alias}.${d.column} = $${d.param}`).join('');
 
   let mappingFilter = '';
   if (filters.mappingStatus) {
@@ -312,6 +329,10 @@ export async function loadCampaignTable(
        WHERE organization_id = $1 AND app_id = $2 AND entity_type = 'campaign'
          AND source_provider = $5
          AND ($6::text IS NULL OR target_provider = $6)
+         -- A link a human rejected, or one still ambiguous, must not add its
+         -- installs to the campaign's total. The row is kept as a record of the
+         -- decision; the decision was that these entities are not the same.
+         AND status NOT IN ('rejected', 'ambiguous', 'not_applicable', 'unmatched')
        GROUP BY source_external_id
      ),
      -- The strongest link the campaign has is the one that describes it.
@@ -358,6 +379,7 @@ export async function loadCampaignTable(
          AND a.install_date BETWEEN $3 AND $4
          AND ($6::text IS NULL OR a.provider_key = $6)
          AND a.external_campaign_id = ANY(map.target_external_ids)
+         ${attributionFilterFor('a')}
      ) attribution ON map.target_external_ids IS NOT NULL
      LEFT JOIN LATERAL (
        SELECT SUM(r.revenue) AS attributed_revenue
@@ -367,6 +389,7 @@ export async function loadCampaignTable(
          AND r.grain = 'event_date'
          AND ($6::text IS NULL OR r.provider_key = $6)
          AND r.external_campaign_id = ANY(map.target_external_ids)
+         ${attributionFilterFor('r')}
      ) attribution_revenue ON map.target_external_ids IS NOT NULL
      WHERE true ${mappingFilter}
      ORDER BY ${sortColumn} ${direction} NULLS LAST
