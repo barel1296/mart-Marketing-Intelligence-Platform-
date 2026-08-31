@@ -348,11 +348,37 @@ async function auditApp(
     [organizationId, appId, marketingProviderKey, from, to],
   );
   const mappedSpend = toNumber(mappedSpendRows[0]?.['mapped_spend']);
-  const mappedCpi = mappedPaid > 0 ? mappedSpend / mappedPaid : null;
+  // The denominator is the delivery-aligned population, not the mapping
+  // population: window spend divided by installs on campaigns that delivered in
+  // that window. Recomputing it the other way made this gate fail a dashboard
+  // that was right, which is worse than having no gate.
+  const alignedRows = await queryRows<Row>(
+    `SELECT COALESCE(SUM(a.attributed_installs), 0)::text AS installs
+       FROM attribution_daily_metrics a
+      WHERE a.organization_id = $1 AND a.app_id = $2 AND a.provider_key = $3
+        AND a.install_date BETWEEN $4 AND $5
+        AND COALESCE(a.normalized_media_source, 'organic') <> 'organic'
+        AND a.external_campaign_id IN (
+          SELECT m.target_external_id FROM provider_entity_mappings m
+           JOIN (SELECT DISTINCT md.external_campaign_id, md.provider_key
+                   FROM marketing_daily_metrics md
+                  WHERE md.organization_id = $1 AND md.app_id = $2
+                    AND md.report_date BETWEEN $4 AND $5
+                    AND (md.spend > 0 OR md.impressions > 0 OR md.clicks > 0)) dl
+             ON dl.external_campaign_id = m.source_external_id
+            AND dl.provider_key = m.source_provider
+           WHERE m.organization_id = $1 AND m.app_id = $2
+             AND m.entity_type = 'campaign' AND m.target_provider = $3
+             AND m.target_external_id IS NOT NULL AND ${OPERATIONAL})`,
+    [organizationId, appId, attributionProviderKey, from, to],
+  );
+  const alignedInstalls = toNumber(alignedRows[0]?.['installs']);
+  const mappedCpi = alignedInstalls > 0 ? mappedSpend / alignedInstalls : null;
   const blendedCpi = total > 0 ? spend / total : null;
 
   line('mapped CPI numerator', mappedSpend.toFixed(6));
-  line('mapped CPI denominator', mappedPaid);
+  line('mapped CPI denominator', `${alignedInstalls} (installs on campaigns that delivered here)`);
+  line('mapping-population installs', `${mappedPaid} (coverage figure, NOT this denominator)`);
   line('mapped CPI exact', mappedCpi === null ? '(none)' : mappedCpi.toFixed(10));
   line('mapped CPI displayed', mappedCpi === null ? '—' : `$${mappedCpi.toFixed(2)}`);
   line('blended CPI numerator', spend.toFixed(6));

@@ -718,6 +718,258 @@ describe('reconciliation', () => {
     expect(kinds).toContain('attribution_without_mapping');
   });
 
+  it('ranks the campaign table by what was spent, not by how the number reads', async () => {
+    // The select list exposes spend as ::text, and a bare column name in ORDER
+    // BY binds to the output column before the CTE's numeric one - so the sort
+    // was lexicographic and put a campaign that spent 9 above one that spent
+    // 100. "Top campaigns by spend" is the table's whole purpose.
+    controls.marketingRows = [
+      {
+        reportDate: '2026-08-20',
+        campaignId: '900',
+        campaignName: 'Big spender',
+        spend: 100,
+        impressions: 5000,
+        clicks: 100,
+      },
+      {
+        reportDate: '2026-08-20',
+        campaignId: '901',
+        campaignName: 'Small spender',
+        spend: 9,
+        impressions: 400,
+        clicks: 9,
+      },
+    ];
+    controls.attributionRows = [];
+    const ctx = await setup();
+    await triggerSync(ctx, '2026-08-20', '2026-08-20');
+
+    const table = await request(
+      ctx.user,
+      'GET',
+      `/api/v1/organizations/${ctx.user.organizationId}/apps/${ctx.appId}/campaigns?from=2026-08-20&to=2026-08-20&sort=spend&direction=desc`,
+    );
+    const rows = (table.json() as { rows: Array<{ externalCampaignId: string; spend: number }> })
+      .rows;
+    expect(rows.map((r) => r.externalCampaignId)).toEqual(['900', '901']);
+  });
+
+  it('applies a country filter to both halves of a campaign row', async () => {
+    // Filtering spend to one country while installs stay account-wide makes the
+    // per-campaign CPI a ratio between two populations - and it reads as a real
+    // number, because both halves are real.
+    controls.marketingRows = [
+      {
+        reportDate: '2026-08-20',
+        campaignId: '900',
+        campaignName: 'Summer',
+        spend: 100,
+        impressions: 5000,
+        clicks: 100,
+        country: 'US',
+      },
+      {
+        reportDate: '2026-08-20',
+        campaignId: '900',
+        campaignName: 'Summer',
+        spend: 60,
+        impressions: 3000,
+        clicks: 60,
+        country: 'GB',
+      },
+    ];
+    controls.attributionRows = [
+      {
+        installDate: '2026-08-20',
+        campaignId: '900',
+        campaignName: 'Summer',
+        installs: 40,
+        country: 'US',
+        revenue: 20,
+      },
+      {
+        installDate: '2026-08-20',
+        campaignId: '900',
+        campaignName: 'Summer',
+        installs: 25,
+        country: 'GB',
+        revenue: 10,
+      },
+    ];
+    const ctx = await setup();
+    await triggerSync(ctx, '2026-08-20', '2026-08-20');
+    await reconcile(ctx.user.organizationId, ctx.appId);
+
+    const table = await request(
+      ctx.user,
+      'GET',
+      `/api/v1/organizations/${ctx.user.organizationId}/apps/${ctx.appId}/campaigns?from=2026-08-20&to=2026-08-20&country=US`,
+    );
+    const row = (
+      table.json() as {
+        rows: Array<{
+          externalCampaignId: string;
+          spend: number;
+          attributedInstalls: number | null;
+          attributedRevenue: number | null;
+        }>;
+      }
+    ).rows.find((r) => r.externalCampaignId === '900');
+    expect(row?.spend).toBe(100);
+    // Not 65: the GB installs belong to the GB spend that was filtered out.
+    expect(row?.attributedInstalls).toBe(40);
+    expect(row?.attributedRevenue).toBe(20);
+  });
+
+  it('serves the selected-period coverage metrics through the metrics endpoint', async () => {
+    // The window is what makes period coverage computable. The endpoint
+    // resolved one and then did not pass it on, so all three metrics were
+    // permanently unavailable, each explaining itself with "no reporting
+    // period" on a request that plainly had one.
+    controls.marketingRows = structuredClone(BASE_MARKETING);
+    controls.attributionRows = structuredClone(BASE_ATTRIBUTION);
+    const ctx = await setup();
+    await triggerSync(ctx, '2026-08-20', '2026-08-21');
+    await reconcile(ctx.user.organizationId, ctx.appId);
+
+    const response = await request(
+      ctx.user,
+      'GET',
+      `/api/v1/organizations/${ctx.user.organizationId}/apps/${ctx.appId}/metrics?from=2026-08-20&to=2026-08-21`,
+    );
+    const metrics = (
+      response.json() as {
+        metrics: Array<{ metricKey: string; availability: string; value: number | null }>;
+      }
+    ).metrics;
+    for (const key of ['campaign_operational_coverage', 'spend_coverage', 'attribution_coverage']) {
+      const metric = metrics.find((m) => m.metricKey === key);
+      expect(metric, key).toBeTruthy();
+      expect(metric?.availability, key).not.toBe('unavailable');
+      expect(metric?.value, key).not.toBeNull();
+    }
+  });
+
+  it('never rolls a rejected link into a campaign total', async () => {
+    // The rollup collected every mapping row for the campaign, whatever its
+    // status, so a link a human had rejected still contributed its installs to
+    // the total displayed beside a different, authoritative link. The row is
+    // kept as the record of the decision; the decision was that these are not
+    // the same campaign.
+    controls.marketingRows = [
+      {
+        reportDate: '2026-08-20',
+        campaignId: '900',
+        campaignName: 'Summer',
+        spend: 100,
+        impressions: 5000,
+        clicks: 100,
+      },
+    ];
+    controls.attributionRows = [
+      { installDate: '2026-08-20', campaignId: '900', campaignName: 'Summer', installs: 40 },
+    ];
+    const ctx = await setup();
+    await triggerSync(ctx, '2026-08-20', '2026-08-20');
+    await reconcile(ctx.user.organizationId, ctx.appId);
+
+    const before = await request(
+      ctx.user,
+      'GET',
+      `/api/v1/organizations/${ctx.user.organizationId}/apps/${ctx.appId}/campaigns?from=2026-08-20&to=2026-08-20`,
+    );
+    type TableRow = { externalCampaignId: string; attributedInstalls: number | null };
+    expect(
+      (before.json() as { rows: TableRow[] }).rows.find((r) => r.externalCampaignId === '900')
+        ?.attributedInstalls,
+    ).toBe(40);
+
+    // A second attribution campaign is linked to the same Meta campaign and
+    // then rejected by a human.
+    await query(
+      `INSERT INTO provider_entity_mappings
+         (organization_id, app_id, entity_type, source_provider, source_external_id,
+          target_provider, target_external_id, mapping_method, mapping_confidence, status)
+       VALUES ($1, $2, 'campaign', 'meta_ads', '900', 'appsflyer', 'other-campaign',
+               'name_fallback', 0.5, 'rejected')`,
+      [ctx.user.organizationId, ctx.appId],
+    );
+    await query(
+      `INSERT INTO attribution_daily_metrics
+         (organization_id, app_id, connection_id, provider_key, grain, install_date,
+          external_campaign_id, attributed_installs, dimension_hash)
+       SELECT $1, $2, connection_id, provider_key, 'install_date', '2026-08-20',
+              'other-campaign', 999, 'rejected-link-fixture'
+         FROM attribution_daily_metrics
+        WHERE app_id = $2 LIMIT 1`,
+      [ctx.user.organizationId, ctx.appId],
+    );
+
+    const after = await request(
+      ctx.user,
+      'GET',
+      `/api/v1/organizations/${ctx.user.organizationId}/apps/${ctx.appId}/campaigns?from=2026-08-20&to=2026-08-20`,
+    );
+    expect(
+      (after.json() as { rows: TableRow[] }).rows.find((r) => r.externalCampaignId === '900')
+        ?.attributedInstalls,
+    ).toBe(40);
+  });
+
+  it('counts a mapping toward coverage whichever pass recorded it', async () => {
+    // Reconciliation writes a link from both sides. Install coverage read only
+    // the marketing->attribution direction, so a campaign matched by the
+    // attribution-side pass alone was reported as a coverage gap - MART calling
+    // its own recorded mapping unmapped.
+    controls.marketingRows = [
+      {
+        reportDate: '2026-08-20',
+        campaignId: '900',
+        campaignName: 'Summer',
+        spend: 100,
+        impressions: 5000,
+        clicks: 100,
+      },
+    ];
+    controls.attributionRows = [
+      { installDate: '2026-08-20', campaignId: 'mmp-only', campaignName: 'Summer', installs: 50 },
+    ];
+    const ctx = await setup();
+    await triggerSync(ctx, '2026-08-20', '2026-08-20');
+    await reconcile(ctx.user.organizationId, ctx.appId);
+
+    // Leave one operational link, recorded on the attribution side only - the
+    // shape reconciliation produces when the marketing pass matched a sibling
+    // by declared id and never reached this campaign by name.
+    await query(
+      `DELETE FROM provider_entity_mappings
+        WHERE app_id = $1 AND source_provider = 'meta_ads' AND target_external_id = 'mmp-only'`,
+      [ctx.appId],
+    );
+    await query(
+      `UPDATE provider_entity_mappings
+          SET status = 'manually_verified', mapping_confidence = 1, mapping_method = 'manual'
+        WHERE app_id = $1 AND source_external_id = 'mmp-only'
+          AND target_external_id IS NOT NULL`,
+      [ctx.appId],
+    );
+    const remaining = await queryRows<{ n: string }>(
+      `SELECT count(*)::text AS n FROM provider_entity_mappings
+        WHERE app_id = $1 AND source_external_id = 'mmp-only' AND target_external_id IS NOT NULL`,
+      [ctx.appId],
+    );
+    expect(Number(remaining[0]?.n)).toBeGreaterThan(0);
+
+    const coverage = await campaignCoverage(ctx.user.organizationId, ctx.appId, 'meta_ads', {
+      from: '2026-08-20',
+      to: '2026-08-20',
+      attributionProviderKey: 'appsflyer',
+    });
+    expect(coverage.eligible?.unmappedPaidInstalls).toBe(0);
+    expect(coverage.eligible?.mappedPaidInstalls).toBe(50);
+  });
+
   it('keeps a human-verified mapping when reconciliation runs again', async () => {
     controls.marketingRows = [
       {
