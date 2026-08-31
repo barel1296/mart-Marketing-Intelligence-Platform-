@@ -59,7 +59,15 @@ export async function registerAnalyticsRoutes(server: FastifyInstance): Promise<
     setNoStore(reply);
 
     const range = resolveRange(query);
-    const { context: metricContext, state } = await buildMetricContext(context.organizationId, app);
+    // The window is what makes the selected-period coverage metrics computable.
+    // Omitting it here left them permanently unavailable, explaining themselves
+    // with "no reporting period" on a request that had resolved one two lines
+    // earlier.
+    const { context: metricContext, state } = await buildMetricContext(
+      context.organizationId,
+      app,
+      range,
+    );
     const filters: MetricFilters = {
       organizationId: context.organizationId,
       appId: app.id,

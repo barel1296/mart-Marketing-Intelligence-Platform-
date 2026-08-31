@@ -56,6 +56,15 @@ export function MetricTile({ metric, currency }: { metric: MetricValue; currency
         </div>
       )}
 
+      {/*
+        A number the metric layer qualified is not the same claim as a plain
+        one. The status chip says "partial"; only this line says what is missing
+        from it - which installs were excluded, which day is not in yet - so the
+        caveat travels with the figure instead of being a word the reader has to
+        interpret.
+      */}
+      {!unavailable && metric.reason ? <div className="tile-caveat">{metric.reason}</div> : null}
+
       <div className="tile-meta">
         <span className="chip chip-grain">{grainText}</span>
         {metric.providers.length > 0 ? <span>{metric.providers.join(' + ')}</span> : null}
