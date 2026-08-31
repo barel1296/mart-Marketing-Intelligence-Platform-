@@ -23,10 +23,19 @@ export type FactScope = {
   syncRunId: string | null;
 };
 
-export type UpsertOutcome = { inserted: number; restated: number; unchanged: number };
+export type UpsertOutcome = {
+  inserted: number;
+  restated: number;
+  unchanged: number;
+  /**
+   * Rows deleted because the incoming write restates the same campaign-day at a
+   * different dimensional grain. Zero for every ordinary refresh.
+   */
+  superseded: number;
+};
 
 function emptyOutcome(): UpsertOutcome {
-  return { inserted: 0, restated: 0, unchanged: 0 };
+  return { inserted: 0, restated: 0, unchanged: 0, superseded: 0 };
 }
 
 function accumulate(
@@ -312,6 +321,74 @@ export function marketingDimensionHash(
 }
 
 /**
+ * Remove rows the incoming write supersedes by changing dimensional grain.
+ *
+ * `dimension_hash` includes every dimension, country among them, so the same
+ * campaign-day fetched with a country breakdown and fetched without one lands
+ * as two different keys. Nothing about the upsert makes the second replace the
+ * first, and the metric queries sum delivery by date with no country predicate,
+ * so both copies are counted: spend and CPM double, ROAS halves. A provider
+ * that degrades a breakdown mid-backfill - or an account that gains one - is
+ * enough to trigger it.
+ *
+ * The rule is narrow on purpose. Within one campaign-day a fetch reports at
+ * exactly one grain, so a stored row for that same campaign-day at the opposite
+ * grain is a strictly superseded duplicate of the measure now arriving. Rows on
+ * other days, other campaigns, and other countries at the same grain are left
+ * alone; a batch that somehow carries both grains for one campaign-day is
+ * ambiguous, so that key is skipped rather than guessed at.
+ */
+async function supersedeMarketingGrainConflicts(
+  scope: FactScope,
+  metrics: readonly CanonicalMarketingDailyMetric[],
+  client?: Queryable,
+): Promise<number> {
+  const grainByKey = new Map<
+    string,
+    {
+      reportDate: string;
+      account: string | null;
+      campaign: string | null;
+      countrySeen: boolean;
+      nullSeen: boolean;
+    }
+  >();
+  for (const metric of metrics) {
+    const key = `${metric.reportDate}\u0000${metric.externalAccountId ?? ''}\u0000${metric.externalCampaignId ?? ''}`;
+    const entry = grainByKey.get(key) ?? {
+      reportDate: metric.reportDate,
+      account: metric.externalAccountId,
+      campaign: metric.externalCampaignId,
+      countrySeen: false,
+      nullSeen: false,
+    };
+    if (metric.country === null) entry.nullSeen = true;
+    else entry.countrySeen = true;
+    grainByKey.set(key, entry);
+  }
+
+  let superseded = 0;
+  for (const entry of grainByKey.values()) {
+    // Both grains in one batch: MART cannot tell which one restates the other.
+    if (entry.countrySeen === entry.nullSeen) continue;
+    const removeCountried = entry.nullSeen;
+    const rows = await queryRows<{ id: string }>(
+      `DELETE FROM marketing_daily_metrics
+        WHERE connection_id = $1 AND app_id = $2
+          AND report_date = $3
+          AND external_account_id IS NOT DISTINCT FROM $4
+          AND external_campaign_id IS NOT DISTINCT FROM $5
+          AND country IS ${removeCountried ? 'NOT NULL' : 'NULL'}
+        RETURNING id`,
+      [scope.connectionId, scope.appId, entry.reportDate, entry.account, entry.campaign],
+      client,
+    );
+    superseded += rows.length;
+  }
+  return superseded;
+}
+
+/**
  * Idempotent, restatement-aware upsert of delivery facts.
  *
  * Re-running the same window updates in place (never duplicates), and
@@ -324,6 +401,7 @@ export async function upsertMarketingDailyMetrics(
   client?: Queryable,
 ): Promise<UpsertOutcome> {
   const outcome = emptyOutcome();
+  outcome.superseded = await supersedeMarketingGrainConflicts(scope, metrics, client);
   const columns = [
     'organization_id',
     'app_id',

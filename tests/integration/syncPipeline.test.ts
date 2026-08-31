@@ -243,6 +243,118 @@ describe('sync pipeline', () => {
     expect(rows[1]?.restatement_generation).toBe(0);
   });
 
+  it('does not double-count spend when a provider changes the dimensional grain', async () => {
+    // Country is part of the dimension hash, so the same campaign-day fetched
+    // with a country breakdown and fetched without one are two different keys
+    // and the upsert cannot supersede one with the other. The metric queries
+    // sum delivery by date with no country predicate, so both copies would be
+    // counted: spend doubles and ROAS halves. Meta reaches this state on its
+    // own - one rejected breakdown degrades the window to a country-null
+    // total, and the restatement lookback re-reads days already stored split.
+    const ctx = await setup();
+    await triggerSync(ctx, '2026-08-20', '2026-08-21');
+
+    const split = await queryRows<{ total: string }>(
+      'SELECT COALESCE(SUM(spend), 0)::text AS total FROM marketing_daily_metrics WHERE app_id = $1',
+      [ctx.appId],
+    );
+    expect(toNumber(split[0]?.total)).toBe(250);
+
+    // The provider degrades: the same days, same campaign, no country split.
+    for (const row of controls.marketingRows) row.country = null;
+    await triggerSync(ctx, '2026-08-20', '2026-08-21');
+
+    const rows = await queryRows<{ report_date: string; country: string | null; spend: string }>(
+      `SELECT report_date::text AS report_date, country, spend
+         FROM marketing_daily_metrics WHERE app_id = $1 ORDER BY report_date, country`,
+      [ctx.appId],
+    );
+    // One row per campaign-day, at the grain that arrived last.
+    expect(rows).toHaveLength(2);
+    expect(rows.every((r) => r.country === null)).toBe(true);
+    expect(rows.reduce((sum, r) => sum + toNumber(r.spend), 0)).toBe(250);
+  });
+
+  it('supersedes a coarser stored row when the breakdown comes back', async () => {
+    // The same rule in the other direction: an account that gains the country
+    // breakdown must not leave yesterday's un-split total behind to be summed
+    // alongside the per-country rows that replace it.
+    const ctx = await setup();
+    for (const row of controls.marketingRows) row.country = null;
+    await triggerSync(ctx, '2026-08-20', '2026-08-21');
+
+    controls.marketingRows = [
+      {
+        reportDate: '2026-08-20',
+        campaignId: '900',
+        campaignName: 'Summer US',
+        spend: 60,
+        impressions: 12_000,
+        clicks: 240,
+        country: 'US',
+      },
+      {
+        reportDate: '2026-08-20',
+        campaignId: '900',
+        campaignName: 'Summer US',
+        spend: 40,
+        impressions: 8_000,
+        clicks: 160,
+        country: 'GB',
+      },
+    ];
+    await triggerSync(ctx, '2026-08-20', '2026-08-20');
+
+    const rows = await queryRows<{ country: string | null; spend: string }>(
+      `SELECT country, spend FROM marketing_daily_metrics
+        WHERE app_id = $1 AND report_date = '2026-08-20' ORDER BY country`,
+      [ctx.appId],
+    );
+    expect(rows.map((r) => r.country)).toEqual(['GB', 'US']);
+    expect(rows.reduce((sum, r) => sum + toNumber(r.spend), 0)).toBe(100);
+  });
+
+  it('leaves a campaign-day alone when only another campaign changed grain', async () => {
+    // Supersession is scoped to the campaign-day that actually restated; a
+    // second campaign still reporting per country keeps its rows.
+    const ctx = await setup();
+    controls.marketingRows = [
+      {
+        reportDate: '2026-08-20',
+        campaignId: '900',
+        campaignName: 'Summer US',
+        spend: 100,
+        impressions: 20_000,
+        clicks: 400,
+        country: 'US',
+      },
+      {
+        reportDate: '2026-08-20',
+        campaignId: '901',
+        campaignName: 'Winter US',
+        spend: 70,
+        impressions: 10_000,
+        clicks: 200,
+        country: 'US',
+      },
+    ];
+    await triggerSync(ctx, '2026-08-20', '2026-08-20');
+
+    const marketingRow = controls.marketingRows[0];
+    if (marketingRow) marketingRow.country = null;
+    await triggerSync(ctx, '2026-08-20', '2026-08-20');
+
+    const rows = await queryRows<{ campaign: string; country: string | null; spend: string }>(
+      `SELECT external_campaign_id AS campaign, country, spend
+         FROM marketing_daily_metrics WHERE app_id = $1 ORDER BY external_campaign_id`,
+      [ctx.appId],
+    );
+    expect(rows).toHaveLength(2);
+    expect(rows[0]?.country).toBeNull();
+    expect(rows[1]?.country).toBe('US');
+    expect(rows.reduce((sum, r) => sum + toNumber(r.spend), 0)).toBe(170);
+  });
+
   it('completes partially when one window fails, keeping the windows that succeeded', async () => {
     const ctx = await setup();
     // Chunk size is 7 days, so this range produces three windows.
