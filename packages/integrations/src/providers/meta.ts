@@ -355,7 +355,10 @@ export class MetaAdsProvider implements MarketingNetworkProvider {
       return { supported: true, detail: { probedAt: new Date().toISOString() } };
     } catch (error) {
       const errorClass = isProviderError(error) ? error.errorClass : 'unknown_error';
-      // Only a rejected request proves absence; an outage proves nothing.
+      // Only a rejected request proves absence, and only a rejection about the
+      // request itself: a throttle or an expired credential also comes back as
+      // a 4xx, and recording either as "this account has no country breakdown"
+      // would turn a passing condition into a permanent capability downgrade.
       if (errorClass === 'invalid_request') {
         return {
           supported: false,
@@ -461,7 +464,7 @@ export class MetaAdsProvider implements MarketingNetworkProvider {
         );
         const fallback = await this.fetchInsights(params, false);
         fallback.warnings.push(
-          'Meta rejected the country breakdown for this account; delivery data was imported without a country dimension.',
+          'Meta rejected the country breakdown for this account; delivery data was imported without a country dimension, superseding any country-split rows already stored for the same campaign-days.',
         );
         return fallback;
       }

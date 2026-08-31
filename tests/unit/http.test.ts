@@ -36,6 +36,55 @@ describe('error classification', () => {
     expect(classifyHttpStatus(504, '')).toBe('timeout');
   });
 
+  it('reads an expired credential a provider reports as a plain 400', () => {
+    // Meta's Graph API answers an expired or invalidated token with HTTP 400
+    // and OAuthException code 190. Classified by status alone that is
+    // `invalid_request`: not retryable, and never enough to flip the
+    // connection to invalid_credentials, so the integration keeps reading
+    // "connected" while every sync fails.
+    expect(
+      classifyHttpStatus(
+        400,
+        '{"error":{"message":"Error validating access token: Session has expired","type":"OAuthException","code":190}}',
+      ),
+    ).toBe('expired_credential');
+    expect(
+      classifyHttpStatus(400, '{"error":{"message":"Invalid OAuth access token.","code":190}}'),
+    ).toBe('authentication_error');
+  });
+
+  it('reads a throttle a provider reports as a plain 400, so the window is retried', () => {
+    // The same status carries Meta's throttling codes. Read as
+    // `invalid_request` the window is abandoned with no backoff, and the run
+    // still ends partially_completed - which advances the incremental cursor
+    // past data that never loaded.
+    const throttle = classifyHttpStatus(
+      400,
+      '{"error":{"message":"(#17) User request limit reached","type":"OAuthException","code":17}}',
+    );
+    expect(throttle).toBe('rate_limited');
+    expect(isRetryableClass(throttle)).toBe(true);
+    expect(
+      classifyHttpStatus(400, '{"error":{"message":"Application request limit reached","code":4}}'),
+    ).toBe('rate_limited');
+  });
+
+  it('still calls a genuinely malformed request invalid, whatever the status carries', () => {
+    expect(classifyHttpStatus(400, '{"error":{"message":"Unknown field: nonsense"}}')).toBe(
+      'invalid_request',
+    );
+    expect(classifyHttpStatus(404, 'not found')).toBe('invalid_request');
+  });
+
+  it('lets the status win when the provider is the thing that failed', () => {
+    // A gateway page may echo anything; a 5xx is an outage, not a verdict on
+    // the credential.
+    expect(classifyHttpStatus(503, 'rate limit exceeded')).toBe('provider_unavailable');
+    expect(classifyHttpStatus(500, 'invalid access token')).toBe('provider_unavailable');
+    // A 401 is about the credential even when the body talks about limits.
+    expect(classifyHttpStatus(401, 'too many requests')).toBe('authentication_error');
+  });
+
   it('marks only transient classes retryable', () => {
     expect(isRetryableClass('rate_limited')).toBe(true);
     expect(isRetryableClass('provider_unavailable')).toBe(true);

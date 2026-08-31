@@ -38,19 +38,68 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_ATTEMPTS = 3;
 
 /**
+ * Signals a provider states in the response body rather than the status line.
+ *
+ * Status alone is not a reliable classifier: several providers answer an
+ * expired token and a throttle with the same generic 4xx they use for a
+ * genuinely malformed request. Meta's Graph API is the case that forced this -
+ * it returns HTTP 400 for `OAuthException` code 190 (expired/invalid token)
+ * and HTTP 400 for its throttling codes - but the patterns are written against
+ * what providers *say*, not against any one vendor, so nothing here is keyed to
+ * a provider, an account, or an id.
+ *
+ * Misreading either one is not cosmetic. A throttle classified as
+ * `invalid_request` is not retryable, so the window is abandoned without
+ * backoff and the run still ends `partially_completed` - which advances the
+ * incremental cursor past the window that never loaded. An expired credential
+ * read the same way never flips the connection to `invalid_credentials`, so
+ * the integration keeps reading "connected" while every sync fails.
+ */
+const EXPIRED_CREDENTIAL_SIGNAL =
+  /expire|session has expired|token (?:is )?(?:no longer|not) valid|reauthenticat|re-?authoriz/i;
+const INVALID_CREDENTIAL_SIGNAL =
+  // The gap absorbs whatever a provider names between the two words -
+  // "invalid OAuth access token", "invalid_token", "invalid bearer token".
+  /invalid[\w _-]{0,20}token|malformed access token|access token[^.]{0,40}(?:invalid|revoked)|invalid[_ ]?credential|oauth ?exception/i;
+const THROTTLE_SIGNAL =
+  /rate[_ ]?limit|too many (?:requests|calls)|throttl|request limit reached|calls? to this api ha(?:s|ve) exceeded|user request limit/i;
+
+/**
+ * What the body states about the failure, or null when it states nothing.
+ *
+ * Separate from the status so an adapter can consult it on a response that is
+ * not an error at all (a capability probe reading why a dimension was refused).
+ */
+export function classifyBody(bodyText: string): ProviderErrorClass | null {
+  if (!bodyText) return null;
+  if (THROTTLE_SIGNAL.test(bodyText)) return 'rate_limited';
+  if (EXPIRED_CREDENTIAL_SIGNAL.test(bodyText)) return 'expired_credential';
+  if (INVALID_CREDENTIAL_SIGNAL.test(bodyText)) return 'authentication_error';
+  return null;
+}
+
+/**
  * Classify a provider HTTP failure.
  *
  * The class drives behaviour (retry vs alert vs ask a human to reconnect), so
- * collapsing everything into `unknown_error` is treated as a bug.
+ * collapsing everything into `unknown_error` is treated as a bug. The body is
+ * consulted first for the classes a status cannot settle, and the status
+ * decides everything the body is silent about.
  */
 export function classifyHttpStatus(status: number, bodyText: string): ProviderErrorClass {
-  if (status === 401) return 'authentication_error';
-  if (status === 403) {
-    // Providers use 403 both for "token lacks permission" and for expiry.
-    return /expire|invalid[_ ]?token|session has expired/i.test(bodyText)
-      ? 'expired_credential'
-      : 'authorization_error';
+  // A 5xx is the provider failing to answer at all; its body is not a verdict
+  // about the credential, so the status wins there.
+  if (status < 500) {
+    const stated = classifyBody(bodyText);
+    if (stated) {
+      // A 403 that talks about limits is the account/page limit, not a bad
+      // credential; a 401 is always about the credential whatever it says.
+      if (stated === 'rate_limited' && status === 401) return 'authentication_error';
+      return stated;
+    }
   }
+  if (status === 401) return 'authentication_error';
+  if (status === 403) return 'authorization_error';
   if (status === 400 || status === 404 || status === 422) return 'invalid_request';
   if (status === 429) return 'rate_limited';
   if (status === 408 || status === 504) return 'timeout';
