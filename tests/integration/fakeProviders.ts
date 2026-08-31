@@ -50,6 +50,12 @@ export type FakeControls = {
   attributionCapabilities: Partial<Record<string, boolean>>;
   /** The MMP's campaign directory, carrying the ad network's campaign id. */
   attributionCampaigns: AttributionCampaignRef[];
+  /** Marketing ad groups, so remote ids can resolve below campaign level. */
+  marketingAdGroups: Array<{
+    externalAdGroupId: string;
+    externalCampaignId: string;
+    name: string;
+  }>;
 };
 
 export const controls: FakeControls = {
@@ -59,6 +65,7 @@ export const controls: FakeControls = {
   failureClass: 'invalid_request',
   calls: { structure: 0, performance: 0, installs: 0, revenue: 0 },
   attributionCampaigns: [],
+  marketingAdGroups: [],
   attributionCapabilities: {},
 };
 
@@ -70,6 +77,7 @@ export function resetControls(): void {
   controls.calls = { structure: 0, performance: 0, installs: 0, revenue: 0 };
   controls.attributionCapabilities = {};
   controls.attributionCampaigns = [];
+  controls.marketingAdGroups = [];
 }
 
 function windowKey(params: SyncParams): string {
@@ -165,7 +173,15 @@ class FakeMetaProvider implements MarketingNetworkProvider {
           currency: 'USD',
           providerCreatedAt: null,
         })),
-        adGroups: [],
+        adGroups: controls.marketingAdGroups.map((group) => ({
+          externalAdGroupId: group.externalAdGroupId,
+          externalCampaignId: group.externalCampaignId,
+          name: group.name,
+          status: 'ACTIVE',
+          effectiveStatus: 'ACTIVE',
+          dailyBudget: null,
+          bidStrategy: null,
+        })),
         ads: [],
         creatives: [],
         dailyMetrics: [],

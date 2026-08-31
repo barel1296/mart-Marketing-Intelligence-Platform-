@@ -14,6 +14,7 @@
  */
 import { closePool, queryRows } from '@mart/db';
 import { attributionNameKeys, embeddedNames, nameKey } from '../reconciliation.js';
+import { getRemoteIdResolver } from '../remoteIds.js';
 
 type MarketingRow = {
   external_campaign_id: string;
@@ -93,6 +94,20 @@ async function main(): Promise<void> {
 
 async function auditApp(organizationId: string, appId: string, appName: string): Promise<void> {
   heading(`APP: ${appName}`);
+
+  // The pair actually bound for this app, so the audit resolves exactly the way
+  // the reconciler does rather than assuming a pair.
+  const bindings = await queryRows<{ role: string; provider_key: string }>(
+    `SELECT b.role, c.provider_key
+       FROM integration_app_bindings b
+       JOIN integration_connections c ON c.id = b.connection_id
+      WHERE b.organization_id = $1 AND b.app_id = $2 AND b.status = 'active'`,
+    [organizationId, appId],
+  );
+  const marketingProviderKey =
+    bindings.find((b) => b.role === 'marketing_network')?.provider_key ?? 'meta_ads';
+  const attributionProviderKey =
+    bindings.find((b) => b.role === 'primary_attribution')?.provider_key ?? 'tenjin';
 
   const [marketing, attribution, mappings] = await Promise.all([
     queryRows<MarketingRow>(
@@ -184,7 +199,7 @@ async function auditApp(organizationId: string, appId: string, appName: string):
   // Everything needed to tell "the MMP published nothing" from "the MMP
   // published something MART cannot use" - which look identical on a
   // dashboard and have completely different fixes.
-  heading('TENJIN CAMPAIGN DIRECTORY');
+  heading('REMOTE ID RESOLUTION');
   const dirRows = await queryRows<{
     external_campaign_id: string;
     name: string | null;
@@ -192,14 +207,10 @@ async function auditApp(organizationId: string, appId: string, appName: string):
     provider_key: string;
     app_id: string;
     observed_at: string;
-    meta_hit: string;
     attribution_hit: string;
   }>(
     `SELECT d.external_campaign_id, d.name, d.remote_campaign_id, d.provider_key,
             d.app_id::text AS app_id, d.observed_at::text AS observed_at,
-            (SELECT count(*)::text FROM marketing_campaigns m
-              WHERE m.organization_id = d.organization_id AND m.app_id = d.app_id
-                AND m.external_campaign_id = d.remote_campaign_id) AS meta_hit,
             (SELECT count(*)::text FROM attribution_daily_metrics a
               WHERE a.organization_id = d.organization_id AND a.app_id = d.app_id
                 AND a.provider_key = d.provider_key
@@ -210,60 +221,89 @@ async function auditApp(organizationId: string, appId: string, appName: string):
     [organizationId, appId],
   );
 
-  line('rows', dirRows.length);
-  if (dirRows.length === 0) {
-    line('REMOTE IDS PRESENT', 'no - the directory is empty');
-    process.stdout.write(
-      '  The installs sync refreshes it. If it is empty after a sync, either the\n' +
-        '  provider has no /campaigns endpoint, or the refresh failed - check the\n' +
-        '  sync run warnings for "campaign directory".\n',
-    );
-  }
-  for (const row of dirRows.slice(0, 20)) {
+  // The same structure the reconciler resolves against, read the same way.
+  const adGroupRows = await queryRows<{
+    external_ad_group_id: string;
+    external_campaign_id: string | null;
+    name: string | null;
+  }>(
+    `SELECT external_ad_group_id, external_campaign_id, name
+       FROM marketing_ad_groups
+      WHERE organization_id = $1 AND app_id = $2 AND provider_key = $3`,
+    [organizationId, appId, marketingProviderKey],
+  );
+  const structure = {
+    campaigns: new Map(marketing.map((row) => [row.external_campaign_id, row.name])),
+    adGroups: new Map(
+      adGroupRows.map((row) => [
+        row.external_ad_group_id,
+        { name: row.name, externalCampaignId: row.external_campaign_id },
+      ]),
+    ),
+  };
+  const resolver = getRemoteIdResolver(attributionProviderKey, marketingProviderKey);
+
+  line('provider pair', `${attributionProviderKey} -> ${marketingProviderKey}`);
+  line('levels tried, in order', resolver.levels.join(' then '));
+  line('directory rows', dirRows.length);
+  line('marketing campaigns', structure.campaigns.size);
+  line('marketing ad groups', structure.adGroups.size);
+
+  let viaAdGroup = 0;
+  let viaCampaign = 0;
+  let outsideStructure = 0;
+  let noRemoteId = 0;
+
+  for (const row of dirRows) {
+    const remote = row.remote_campaign_id;
+    const resolved = remote ? resolver.resolve(remote, structure) : null;
+    if (!remote) noRemoteId += 1;
+    else if (!resolved) outsideStructure += 1;
+    else if (resolved.entityType === 'ad_group') viaAdGroup += 1;
+    else viaCampaign += 1;
+
     process.stdout.write('\n');
-    process.stdout.write(`  tenjinCampaignId  ${row.external_campaign_id}\n`);
-    process.stdout.write(`  name              ${row.name ?? '(none)'}\n`);
-    process.stdout.write(`  remoteCampaignId  ${row.remote_campaign_id ?? '(none published)'}\n`);
-    process.stdout.write(`  provider          ${row.provider_key}\n`);
-    process.stdout.write(`  app_id            ${row.app_id}\n`);
-    process.stdout.write(`  refreshed         ${row.observed_at}\n`);
+    process.stdout.write(`  TENJIN CAMPAIGN ID       ${row.external_campaign_id}\n`);
+    process.stdout.write(`  TENJIN CAMPAIGN NAME     ${row.name ?? '(none)'}\n`);
+    process.stdout.write(`  REMOTE ID                ${remote ?? '(none published)'}\n`);
     process.stdout.write(
-      `  joins to a Meta campaign MART holds?  ${Number(row.meta_hit) > 0 ? 'YES' : 'NO'}\n`,
+      `  REMOTE ENTITY TYPE       ${resolved ? resolved.entityType : remote ? 'unresolved' : 'n/a'}\n`,
+    );
+    process.stdout.write(`  RESOLVED META ENTITY ID  ${resolved?.entityId ?? '(none)'}\n`);
+    process.stdout.write(`  RESOLVED META ENTITY     ${resolved?.entityName ?? '(none)'}\n`);
+    process.stdout.write(`  PARENT META CAMPAIGN ID  ${resolved?.parentCampaignId ?? '(none)'}\n`);
+    process.stdout.write(
+      `  PARENT META CAMPAIGN     ${resolved?.parentCampaignName ?? '(none)'}\n`,
     );
     process.stdout.write(
-      `  joins to attribution rows?            ${Number(row.attribution_hit) > 0 ? 'YES' : 'NO'}\n`,
+      `  MATCH METHOD             ${resolved ? resolved.method : 'falls back to name embedding'}\n`,
+    );
+    process.stdout.write(`  CONFIDENCE               ${resolved ? resolved.confidence : 'n/a'}\n`);
+    process.stdout.write(
+      `  joins to attribution rows?  ${Number(row.attribution_hit) > 0 ? 'YES' : 'NO'}\n`,
     );
   }
 
-  const withRemote = dirRows.filter((r) => r.remote_campaign_id !== null);
-  const joinToMeta = dirRows.filter((r) => Number(r.meta_hit) > 0);
-  const joinToAttribution = dirRows.filter((r) => Number(r.attribution_hit) > 0);
+  const nameFallbacks = mappings.filter(
+    (m) => m.mapping_method === 'provider_name_embedding' && m.status === 'matched_fallback',
+  ).length;
+  const ambiguousCount = mappings.filter((m) => m.status === 'ambiguous').length;
+  const unmatchedCount = mappings.filter((m) => m.status === 'unmatched').length;
 
-  process.stdout.write('\n');
-  line('REMOTE IDS PRESENT', withRemote.length > 0 ? `yes (${withRemote.length})` : 'no');
-  line(
-    'ATTRIBUTION <-> DIRECTORY JOIN',
-    dirRows.length === 0
-      ? 'n/a - directory empty'
-      : joinToAttribution.length > 0
-        ? `works (${joinToAttribution.length} of ${dirRows.length})`
-        : 'DOES NOT WORK - no directory campaign id appears in the attribution rows',
-  );
-  line(
-    'DIRECTORY <-> META JOIN',
-    withRemote.length === 0
-      ? 'n/a - no remote ids published'
-      : joinToMeta.length > 0
-        ? `works (${joinToMeta.length} of ${withRemote.length})`
-        : 'DOES NOT WORK - no published id matches a Meta campaign MART holds',
-  );
-  if (withRemote.length > 0 && joinToMeta.length === 0) {
+  heading('RESOLUTION SUMMARY');
+  line('remote ids resolved as ad groups', viaAdGroup);
+  line('remote ids resolved as campaigns', viaCampaign);
+  line('remote ids outside structure', outsideStructure);
+  line('directory rows with no remote id', noRemoteId);
+  line('name fallbacks', nameFallbacks);
+  line('ambiguous', ambiguousCount);
+  line('unmatched', unmatchedCount);
+  if (outsideStructure > 0 && viaAdGroup === 0 && viaCampaign === 0) {
     process.stdout.write(
-      '\n  The MMP is publishing network campaign ids for campaigns MART does not\n' +
-        '  have. Usually the MMP tracks a different ad account than the one MART is\n' +
-        '  bound to, or the marketing structure sync has not reached them. MART falls\n' +
-        '  back to name matching in this case; a declaration it cannot resolve is\n' +
-        '  never allowed to suppress one.\n',
+      '\n  Every published id resolved at no level. Usually the MMP tracks a\n' +
+        '  different ad account than the one MART is bound to, or the marketing\n' +
+        '  structure sync has not reached those entities. Name matching still\n' +
+        '  applies: an identifier MART cannot resolve never suppresses one.\n',
     );
   }
 

@@ -6,6 +6,7 @@ export * from './registry.js';
 export * from './csv.js';
 export * from './dataQuality.js';
 export * from './reconciliation.js';
+export * from './remoteIds.js';
 export * from './sync/engine.js';
 export * from './sync/freshness.js';
 export * from './sync/planner.js';

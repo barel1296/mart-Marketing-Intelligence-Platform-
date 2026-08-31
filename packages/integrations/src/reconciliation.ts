@@ -9,6 +9,11 @@ import {
   type MappingUpsert,
 } from '@mart/db';
 import { checkReconciliationHealth } from './dataQuality.js';
+import {
+  getRemoteIdResolver,
+  type MarketingStructure,
+  type ResolvedRemoteEntity,
+} from './remoteIds.js';
 
 /**
  * Meta <-> MMP entity reconciliation.
@@ -135,7 +140,6 @@ export async function reconcileCampaigns(input: ReconcileInput): Promise<Reconci
        AND external_campaign_id IS NOT NULL`,
     [input.organizationId, input.appId, input.marketingProviderKey],
   );
-  const marketingIds = new Set(marketing.map((row) => row.external_campaign_id));
 
   // Every attribution campaign, with its media source, so organic rows can be
   // recorded as explicitly not-applicable rather than silently dropped. Only
@@ -150,11 +154,10 @@ export async function reconcileCampaigns(input: ReconcileInput): Promise<Reconci
     [input.organizationId, input.appId, input.attributionProviderKey],
   );
 
-  // The MMP's own campaign directory: its campaign id alongside the ad
-  // network's campaign id, as the MMP resolved it. This is a stable
-  // cross-provider identifier, so a match through it is authoritative - and it
-  // is the only thing that can tell two network campaigns with identical names
-  // apart.
+  // The MMP's own campaign directory: its campaign id alongside the identifier
+  // it published for the ad network. What that identifier *is* - a campaign, an
+  // ad set - is a property of this pair of providers, so the level is resolved
+  // by the pair's resolver rather than assumed from the field's name.
   const directory = await queryRows<{
     external_campaign_id: string;
     remote_campaign_id: string | null;
@@ -165,26 +168,55 @@ export async function reconcileCampaigns(input: ReconcileInput): Promise<Reconci
         AND remote_campaign_id IS NOT NULL`,
     [input.organizationId, input.appId, input.attributionProviderKey],
   );
-  /** Ad-network campaign id -> the MMP campaign ids that declare it. */
-  const byRemoteId = new Map<string, string[]>();
+
+  // The network's structure, at every level the resolver may look at.
+  const adGroupRows = await queryRows<{
+    external_ad_group_id: string;
+    external_campaign_id: string | null;
+    name: string | null;
+  }>(
+    `SELECT external_ad_group_id, external_campaign_id, name
+       FROM marketing_ad_groups
+      WHERE organization_id = $1 AND app_id = $2 AND provider_key = $3`,
+    [input.organizationId, input.appId, input.marketingProviderKey],
+  );
+  const structure: MarketingStructure = {
+    campaigns: new Map(marketing.map((row) => [row.external_campaign_id, row.name])),
+    adGroups: new Map(
+      adGroupRows.map((row) => [
+        row.external_ad_group_id,
+        { name: row.name, externalCampaignId: row.external_campaign_id },
+      ]),
+    ),
+  };
+
+  const resolver = getRemoteIdResolver(input.attributionProviderKey, input.marketingProviderKey);
+
+  /** Parent campaign id -> the MMP campaigns that resolved to it. */
+  const byParentCampaign = new Map<string, Array<{ id: string; resolved: ResolvedRemoteEntity }>>();
   /**
-   * MMP campaign id -> the network campaign id it declares, kept ONLY where
-   * that network campaign is one MART actually holds.
+   * MMP campaign id -> its resolution, kept ONLY where the remote id resolved
+   * against the structure MART holds.
    *
-   * A declaration naming a campaign MART does not have cannot discriminate
-   * between the campaigns it does have, so it must not be allowed to veto the
-   * name evidence. Treating it as a veto is fail-closed: it silently unmatched
-   * every campaign on an account whose MMP tracks a different ad account than
-   * the one MART is bound to.
+   * An identifier MART cannot resolve says nothing about which of the campaigns
+   * it does hold is the right one, so it must never veto the name evidence.
+   * Treating it as a veto is fail-closed and silently unmatches everything.
    */
-  const declaredRemoteFor = new Map<string, string>();
+  const resolvedFor = new Map<string, ResolvedRemoteEntity>();
   let declarationsOutsideStructure = 0;
   for (const row of directory) {
     const remote = row.remote_campaign_id;
     if (!remote) continue;
-    byRemoteId.set(remote, [...(byRemoteId.get(remote) ?? []), row.external_campaign_id]);
-    if (marketingIds.has(remote)) declaredRemoteFor.set(row.external_campaign_id, remote);
-    else declarationsOutsideStructure += 1;
+    const resolved = resolver.resolve(remote, structure);
+    if (!resolved) {
+      declarationsOutsideStructure += 1;
+      continue;
+    }
+    resolvedFor.set(row.external_campaign_id, resolved);
+    byParentCampaign.set(resolved.parentCampaignId, [
+      ...(byParentCampaign.get(resolved.parentCampaignId) ?? []),
+      { id: row.external_campaign_id, resolved },
+    ]);
   }
 
   const organic = allAttribution.filter((row) => isOrganicSource(row.media_source));
@@ -247,13 +279,17 @@ export async function reconcileCampaigns(input: ReconcileInput): Promise<Reconci
 
   for (const campaign of marketing) {
     if (humanDecided.has(campaign.external_campaign_id)) continue;
-    // The MMP declared this network campaign id itself. An identifier beats
-    // every name rule, so it is checked first and recorded as authoritative.
-    const declared = (byRemoteId.get(campaign.external_campaign_id) ?? [])
-      .map((id) => attributionById.get(id))
-      .filter((row): row is AttributionCampaign => row !== undefined);
+    // The MMP published an identifier that resolved, through the network's own
+    // structure, to this campaign. Several of its campaigns resolving to one
+    // campaign - two ad sets under it - is aggregation, not ambiguity.
+    const declared = (byParentCampaign.get(campaign.external_campaign_id) ?? [])
+      .map((entry) => ({ entry, row: attributionById.get(entry.id) }))
+      .filter(
+        (pair): pair is { entry: typeof pair.entry; row: AttributionCampaign } =>
+          pair.row !== undefined,
+      );
     if (declared.length > 0) {
-      for (const candidate of declared) {
+      for (const { entry, row } of declared) {
         summary.matchedExact += 1;
         mappings.push({
           entityType: 'campaign',
@@ -261,18 +297,27 @@ export async function reconcileCampaigns(input: ReconcileInput): Promise<Reconci
           sourceExternalId: campaign.external_campaign_id,
           sourceName: campaign.name,
           targetProvider: input.attributionProviderKey,
-          targetExternalId: candidate.external_campaign_id,
-          targetName: candidate.campaign_name,
-          // The MMP published the network's id for this campaign: an explicit
-          // provider-supplied link, not something MART inferred.
-          mappingMethod: 'explicit_provider_mapping',
-          mappingConfidence: 1,
+          targetExternalId: row.external_campaign_id,
+          targetName: row.campaign_name,
+          mappingMethod: entry.resolved.method,
+          mappingConfidence: entry.resolved.confidence,
           status: 'matched_exact',
-          candidates: declared.map(toCandidate),
+          candidates: declared.map(({ row: candidate }) => toCandidate(candidate)),
+          // The whole resolution path, so a mapping explains itself.
           evidence: {
-            matchedOn: 'remote_campaign_id',
-            remoteCampaignId: campaign.external_campaign_id,
-            note: 'The attribution provider published this network campaign id for its own campaign. A stable identifier, not a name.',
+            matchedOn: entry.resolved.method,
+            sourceAttributionCampaignId: row.external_campaign_id,
+            sourceRemoteId: entry.resolved.remoteId,
+            resolvedEntityType: entry.resolved.entityType,
+            resolvedEntityId: entry.resolved.entityId,
+            resolvedEntityName: entry.resolved.entityName,
+            parentCampaignId: entry.resolved.parentCampaignId,
+            parentCampaignName: entry.resolved.parentCampaignName,
+            authoritative: entry.resolved.authoritative,
+            note:
+              entry.resolved.entityType === 'campaign'
+                ? 'The attribution provider published this network campaign id. A stable identifier, not a name.'
+                : `The attribution provider published a network ${entry.resolved.entityType} id, resolved to its parent campaign through the network's own structure.`,
           },
         });
       }
@@ -309,10 +354,10 @@ export async function reconcileCampaigns(input: ReconcileInput): Promise<Reconci
     // what separates two network campaigns with identical names. A declaration
     // MART cannot resolve is not in this map at all, so it never vetoes.
     const nameCandidates = (key ? (attributionByName.get(key) ?? []) : []).filter((candidate) => {
-      const declaredFor = candidate.external_campaign_id
-        ? declaredRemoteFor.get(candidate.external_campaign_id)
+      const resolved = candidate.external_campaign_id
+        ? resolvedFor.get(candidate.external_campaign_id)
         : undefined;
-      return declaredFor === undefined || declaredFor === campaign.external_campaign_id;
+      return resolved === undefined || resolved.parentCampaignId === campaign.external_campaign_id;
     });
 
     // Several marketing campaigns sharing one name is the mirror image of the
@@ -452,10 +497,11 @@ export async function reconcileCampaigns(input: ReconcileInput): Promise<Reconci
 
   // Reverse direction, so attribution campaigns with no marketing counterpart
   // stay visible instead of disappearing from the reconciliation view.
+  // Already linked by identifier from the other direction.
   const declaredAttributionIds = new Set(
-    [...byRemoteId.entries()]
-      .filter(([remote]) => marketingById.has(remote))
-      .flatMap(([, ids]) => ids),
+    [...byParentCampaign.entries()]
+      .filter(([parent]) => marketingById.has(parent))
+      .flatMap(([, entries]) => entries.map((entry) => entry.id)),
   );
 
   for (const row of attribution) {

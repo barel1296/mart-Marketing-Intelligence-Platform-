@@ -261,42 +261,59 @@ unreachable there). Whatever the API does, MART reports what it received.
   Phase 0A does not import cohort data — declaring a capability is not the same as
   using it, and cohort ROAS remains unavailable (see [METRICS.md](METRICS.md)).
 
-### The campaign directory settles what names cannot
+### The campaign directory settles what names cannot — at whichever level it means
 
 `GET /v2/campaigns?app_id={uuid}` returns each Tenjin campaign with a
-`remote_campaign_id`: **the ad network's own campaign id**, as Tenjin resolved
-it. Reporting rows do not carry it, which is why reconciliation began with
-names.
+`remote_campaign_id`. Reporting rows do not carry it, which is why matching
+began with names.
 
-It matters because names are not unique. A real account has pairs of Meta
-campaigns with byte-identical names — the static and the video variant of one
-launch — and both appear inside Tenjin campaign names in parentheses. No name
-rule can tell them apart, and MART correctly refuses to guess. The directory
-does tell them apart:
+**The field name does not tell you its entity level.** On real accounts every
+one of those values is a Meta **ad set** id, not a campaign id:
 
 ```
-CPI_Broad_US_static (FB_Reveal_Rush_CPI_Broad_US_26/08/26) -> 120254846425720119
-CPI_Broad_US_video  (FB_Reveal_Rush_CPI_Broad_US_26/08/26) -> 120254846425690119
+120254846425720119 -> marketing_ad_groups.external_ad_group_id -> campaign 120254846425650119
+120254846425690119 -> marketing_ad_groups.external_ad_group_id -> campaign 120254846425650119
+120254889912050119 -> marketing_ad_groups.external_ad_group_id -> campaign 120254889912060119
 ```
 
-MART refreshes the directory alongside the installs sync and matches on it
-first. A match through it is `explicit_provider_mapping` at confidence 1 and
-status `matched_exact` — **authoritative**, because it is an identifier the
-provider published, not an inference MART made. Names are only consulted where
-no id was published. A directory refresh that fails degrades matching to names
-with a warning; it never fails the sync.
+Reading it as a campaign id resolves nothing, and looks identical to a provider
+that published nothing at all.
 
-**A declaration MART cannot resolve never vetoes a name match.** If the MMP
-publishes an id for a campaign MART's structure does not contain — a different
-ad account, or a structure sync that has not reached it — that id cannot
-discriminate between the campaigns MART does hold, so the name evidence stands.
-Treating it as a veto is fail-closed and unmatched every campaign on exactly
-that configuration; `declarationsOutsideStructure` on the reconcile summary
-counts them, and the audit CLI prints the directory-to-marketing join so the
-two cases are told apart rather than guessed at.
+So the level is a property of the **provider pair**, and it lives in
+`remoteIds.ts` next to that pair rather than in the reconciliation core. The
+core asks "what marketing entity is this, and which campaign does it belong
+to"; it never assumes an answer.
 
-Where the published ids do resolve, this moves spend coverage from 9.9% to
-100% and gives authoritative coverage a real value for the first time.
+| Pair              | Levels tried, in order  |
+| ----------------- | ----------------------- |
+| Tenjin → Meta Ads | ad group, then campaign |
+| anything else     | campaign                |
+
+The default is deliberately conservative: a pair MART has not verified gets
+campaign-only, so one pair's semantics can never leak into another's.
+
+Resolution order for a marketing campaign:
+
+1. an attribution campaign whose remote id resolves to an **ad group** under it
+   → `provider_remote_ad_group`, confidence 1, `matched_exact`, authoritative
+2. …or resolves directly to the **campaign** → `provider_remote_campaign`, same
+3. otherwise the deterministic name-embedding fallback (non-authoritative)
+4. otherwise unmatched, or ambiguous where several parents remain possible
+
+**Several attribution campaigns resolving to one marketing campaign is
+aggregation, not ambiguity** — a static and a video ad set under one campaign is
+the normal shape. Their metrics are summed onto the parent. Ambiguity is
+reserved for the case where a _name_ leaves more than one parent possible.
+
+Every mapping records its whole path — source attribution campaign, source
+remote id, resolved entity type and id, parent campaign, method, confidence,
+authoritative — so it explains itself rather than asserting itself.
+
+**A remote id that resolves at no level never vetoes a name match.** It cannot
+discriminate between campaigns MART holds, so the name evidence stands; it is
+counted as `declarationsOutsideStructure` and surfaced by the audit CLI, which
+prints the full resolution path per directory row plus counts by resolution
+type.
 
 ### Events are `not_implemented`, not fresh
 

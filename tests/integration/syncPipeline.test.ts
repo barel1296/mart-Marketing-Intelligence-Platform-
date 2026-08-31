@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { queryRows, syncRepo, toNumber } from '@mart/db';
-import { campaignCoverage } from '@mart/integrations';
+import { campaignCoverage, getRemoteIdResolver } from '@mart/integrations';
 import {
   closeServer,
   connectProvider,
@@ -653,6 +653,328 @@ describe('reconciliation', () => {
   });
 
   /**
+   * Remote identifiers whose entity level is not what their field name says.
+   *
+   * Tenjin publishes `remote_campaign_id` for Meta and, on real accounts, every
+   * value is a Meta **ad set** id. Nothing below refers to a particular
+   * campaign, id or account: the shape is the subject.
+   */
+  describe('provider remote id resolution', () => {
+    const CAMPAIGN_A = 'FB_App_CPI_Broad_US_26/08/26';
+    const CAMPAIGN_B = 'FB_App_CPI_Broad_US_NEW_CR__29/08/26';
+
+    /** Two ad sets under one campaign, and one under another. */
+    function structure(): void {
+      controls.marketingRows = [
+        {
+          reportDate: '2026-08-28',
+          campaignId: 'c-1',
+          campaignName: CAMPAIGN_A,
+          spend: 100,
+          impressions: 8000,
+          clicks: 700,
+        },
+        {
+          reportDate: '2026-08-28',
+          campaignId: 'c-2',
+          campaignName: CAMPAIGN_B,
+          spend: 40,
+          impressions: 2000,
+          clicks: 200,
+        },
+      ];
+      controls.marketingAdGroups = [
+        { externalAdGroupId: 'ag-1a', externalCampaignId: 'c-1', name: 'static' },
+        { externalAdGroupId: 'ag-1b', externalCampaignId: 'c-1', name: 'video' },
+        { externalAdGroupId: 'ag-2a', externalCampaignId: 'c-2', name: 'broad' },
+      ];
+      controls.attributionRows = [
+        {
+          installDate: '2026-08-28',
+          campaignId: 'mmp-1',
+          campaignName: `static (${CAMPAIGN_A})`,
+          installs: 300,
+          revenue: 90,
+        },
+        {
+          installDate: '2026-08-28',
+          campaignId: 'mmp-2',
+          campaignName: `video (${CAMPAIGN_A})`,
+          installs: 100,
+          revenue: 30,
+        },
+        {
+          installDate: '2026-08-28',
+          campaignId: 'mmp-3',
+          campaignName: `broad (${CAMPAIGN_B})`,
+          installs: 60,
+          revenue: 12,
+        },
+      ];
+      // Every published id is an AD SET id, as the real provider pair does.
+      controls.attributionCampaigns = [
+        {
+          externalCampaignId: 'mmp-1',
+          name: `static (${CAMPAIGN_A})`,
+          remoteCampaignId: 'ag-1a',
+          channelId: '3',
+          channelName: 'Meta',
+        },
+        {
+          externalCampaignId: 'mmp-2',
+          name: `video (${CAMPAIGN_A})`,
+          remoteCampaignId: 'ag-1b',
+          channelId: '3',
+          channelName: 'Meta',
+        },
+        {
+          externalCampaignId: 'mmp-3',
+          name: `broad (${CAMPAIGN_B})`,
+          remoteCampaignId: 'ag-2a',
+          channelId: '3',
+          channelName: 'Meta',
+        },
+      ];
+    }
+
+    it('resolves a remote ad-group id up to its parent campaign, authoritatively', async () => {
+      structure();
+      const ctx = await setup('tenjin');
+      await triggerSync(ctx, '2026-08-28', '2026-08-28');
+      const summary = await reconcile(ctx.user.organizationId, ctx.appId, 'meta_ads', 'tenjin');
+
+      expect(summary.matchedExact).toBe(3);
+      expect(summary.matchedNameEmbedded).toBe(0);
+      expect(summary.ambiguous).toBe(0);
+      expect(summary.declarationsOutsideStructure).toBe(0);
+
+      const mappings = await queryRows<{
+        source_external_id: string;
+        target_external_id: string;
+        mapping_method: string;
+        mapping_confidence: string;
+        evidence: Record<string, unknown>;
+      }>(
+        `SELECT source_external_id, target_external_id, mapping_method,
+                mapping_confidence::text, evidence
+           FROM provider_entity_mappings
+          WHERE app_id = $1 AND source_provider = 'meta_ads'
+          ORDER BY target_external_id`,
+        [ctx.appId],
+      );
+      expect(mappings).toHaveLength(3);
+      for (const mapping of mappings) {
+        expect(mapping.mapping_method).toBe('provider_remote_ad_group');
+        expect(Number(mapping.mapping_confidence)).toBe(1);
+        expect(mapping.evidence['resolvedEntityType']).toBe('ad_group');
+        expect(mapping.evidence['authoritative']).toBe(true);
+      }
+      // The whole path is recorded, not just the conclusion.
+      const first = mappings[0];
+      expect(first?.evidence['sourceRemoteId']).toBe('ag-1a');
+      expect(first?.evidence['resolvedEntityId']).toBe('ag-1a');
+      expect(first?.evidence['resolvedEntityName']).toBe('static');
+      expect(first?.evidence['parentCampaignId']).toBe('c-1');
+      expect(first?.evidence['parentCampaignName']).toBe(CAMPAIGN_A);
+    });
+
+    it('treats two ad sets under one campaign as aggregation, never ambiguity', async () => {
+      structure();
+      const ctx = await setup('tenjin');
+      await triggerSync(ctx, '2026-08-28', '2026-08-28');
+      const summary = await reconcile(ctx.user.organizationId, ctx.appId, 'meta_ads', 'tenjin');
+      expect(summary.ambiguous).toBe(0);
+
+      const forA = await queryRows<{ target_external_id: string }>(
+        `SELECT target_external_id FROM provider_entity_mappings
+          WHERE app_id = $1 AND source_external_id = 'c-1'
+          ORDER BY target_external_id`,
+        [ctx.appId],
+      );
+      expect(forA.map((r) => r.target_external_id)).toEqual(['mmp-1', 'mmp-2']);
+
+      // And the campaign table shows one row carrying both ad sets' installs.
+      const table = await request(
+        ctx.user,
+        'GET',
+        `/api/v1/organizations/${ctx.user.organizationId}/apps/${ctx.appId}/campaigns?from=2026-08-28&to=2026-08-28`,
+      );
+      const rows = (
+        table.json() as {
+          rows: Array<{
+            externalCampaignId: string;
+            mappedChildren: number;
+            attributedInstalls: number | null;
+            attributedRevenue: number | null;
+          }>;
+        }
+      ).rows;
+      const rowA = rows.find((r) => r.externalCampaignId === 'c-1');
+      expect(rowA?.mappedChildren).toBe(2);
+      expect(rowA?.attributedInstalls).toBe(400);
+      expect(rowA?.attributedRevenue).toBe(120);
+    });
+
+    it('resolves a campaign-level remote id where the provider publishes one', async () => {
+      structure();
+      // This account's MMP published the campaign id itself.
+      controls.attributionCampaigns = [
+        {
+          externalCampaignId: 'mmp-1',
+          name: `static (${CAMPAIGN_A})`,
+          remoteCampaignId: 'c-1',
+          channelId: '3',
+          channelName: 'Meta',
+        },
+      ];
+      controls.attributionRows = controls.attributionRows.slice(0, 1);
+      const ctx = await setup('tenjin');
+      await triggerSync(ctx, '2026-08-28', '2026-08-28');
+      await reconcile(ctx.user.organizationId, ctx.appId, 'meta_ads', 'tenjin');
+
+      const mapping = await queryRows<{
+        mapping_method: string;
+        evidence: Record<string, unknown>;
+      }>(
+        `SELECT mapping_method, evidence FROM provider_entity_mappings
+          WHERE app_id = $1 AND source_external_id = 'c-1' AND target_external_id IS NOT NULL`,
+        [ctx.appId],
+      );
+      expect(mapping[0]?.mapping_method).toBe('provider_remote_campaign');
+      expect(mapping[0]?.evidence['resolvedEntityType']).toBe('campaign');
+    });
+
+    it('falls back to the name when a remote id resolves at no level', async () => {
+      structure();
+      // Ids for a structure MART does not hold - another ad account, say.
+      controls.attributionCampaigns = controls.attributionCampaigns.map((c) => ({
+        ...c,
+        remoteCampaignId: `outside-${c.externalCampaignId}`,
+      }));
+      const ctx = await setup('tenjin');
+      await triggerSync(ctx, '2026-08-28', '2026-08-28');
+      const summary = await reconcile(ctx.user.organizationId, ctx.appId, 'meta_ads', 'tenjin');
+
+      expect(summary.matchedExact).toBe(0);
+      // The deterministic name evidence still stands.
+      expect(summary.matchedNameEmbedded).toBe(3);
+      expect(summary.unmatchedMarketing).toBe(0);
+      expect(summary.declarationsOutsideStructure).toBe(3);
+    });
+
+    it('leaves a campaign unmatched when neither an id nor a name resolves', async () => {
+      structure();
+      controls.attributionRows = [
+        {
+          installDate: '2026-08-28',
+          campaignId: 'mmp-9',
+          campaignName: 'A campaign naming nothing',
+          installs: 5,
+          revenue: 1,
+        },
+      ];
+      controls.attributionCampaigns = [];
+      const ctx = await setup('tenjin');
+      await triggerSync(ctx, '2026-08-28', '2026-08-28');
+      const summary = await reconcile(ctx.user.organizationId, ctx.appId, 'meta_ads', 'tenjin');
+      expect(summary.matchedExact).toBe(0);
+      expect(summary.matchedNameEmbedded).toBe(0);
+      expect(summary.unmatchedMarketing).toBe(2);
+    });
+
+    it('is still ambiguous only when several parent campaigns remain possible', async () => {
+      structure();
+      // Two campaigns with one name and no usable identifier: a name cannot say
+      // which parent an attribution campaign belongs to.
+      controls.marketingRows = controls.marketingRows.map((row) => ({
+        ...row,
+        campaignName: CAMPAIGN_A,
+      }));
+      controls.attributionCampaigns = [];
+      controls.attributionRows = [
+        {
+          installDate: '2026-08-28',
+          campaignId: 'mmp-1',
+          campaignName: `static (${CAMPAIGN_A})`,
+          installs: 300,
+          revenue: 90,
+        },
+      ];
+      const ctx = await setup('tenjin');
+      await triggerSync(ctx, '2026-08-28', '2026-08-28');
+      const summary = await reconcile(ctx.user.organizationId, ctx.appId, 'meta_ads', 'tenjin');
+      expect(summary.ambiguous).toBe(2);
+      expect(summary.matchedExact).toBe(0);
+    });
+
+    it('does not leak one provider pair semantics into another', async () => {
+      structure();
+      // Identical data, a different attribution provider. MART has not verified
+      // what that provider's remote id means, so the conservative reading
+      // applies: campaign level only. An ad-set id resolves at no level, and
+      // the deterministic name evidence carries the match instead.
+      const ctx = await setup('appsflyer');
+      await triggerSync(ctx, '2026-08-28', '2026-08-28');
+      const summary = await reconcile(ctx.user.organizationId, ctx.appId, 'meta_ads', 'appsflyer');
+
+      expect(summary.matchedExact).toBe(0);
+      expect(summary.declarationsOutsideStructure).toBe(3);
+      // Still matched - just not by an identifier MART has no basis to read.
+      expect(summary.matchedNameEmbedded).toBe(3);
+    });
+
+    it('resolves at the levels the pair declares, and only those', () => {
+      // The registry is the whole semantic surface: a pair MART has verified,
+      // and a conservative default for every pair it has not.
+      expect(getRemoteIdResolver('tenjin', 'meta_ads').levels).toEqual(['ad_group', 'campaign']);
+      expect(getRemoteIdResolver('appsflyer', 'meta_ads').levels).toEqual(['campaign']);
+      expect(getRemoteIdResolver('tenjin', 'tiktok_ads').levels).toEqual(['campaign']);
+    });
+
+    it('excludes organic from resolution entirely', async () => {
+      structure();
+      controls.attributionRows.push({
+        installDate: '2026-08-28',
+        campaignId: 'organic-app',
+        campaignName: 'Organic',
+        installs: 90,
+        revenue: 20,
+        mediaSource: 'Organic',
+      });
+      controls.attributionCampaigns.push({
+        externalCampaignId: 'organic-app',
+        name: 'Organic',
+        // Even if the MMP publishes something for organic, it belongs to no
+        // paid campaign.
+        remoteCampaignId: 'ag-1a',
+        channelId: '0',
+        channelName: 'Organic',
+      });
+      const ctx = await setup('tenjin');
+      await triggerSync(ctx, '2026-08-28', '2026-08-28');
+      const summary = await reconcile(ctx.user.organizationId, ctx.appId, 'meta_ads', 'tenjin');
+
+      expect(summary.organicEntities).toBe(1);
+      expect(summary.notApplicable).toBe(1);
+      const organic = await queryRows<{ status: string; target_external_id: string | null }>(
+        `SELECT status, target_external_id FROM provider_entity_mappings
+          WHERE app_id = $1 AND source_name = 'Organic'`,
+        [ctx.appId],
+      );
+      expect(organic[0]?.status).toBe('not_applicable');
+      expect(organic[0]?.target_external_id).toBeNull();
+      // And it never became a child of a paid campaign.
+      const paid = await queryRows<{ count: string }>(
+        `SELECT count(*)::text AS count FROM provider_entity_mappings
+          WHERE app_id = $1 AND source_provider = 'meta_ads'
+            AND target_external_id = 'organic-app'`,
+        [ctx.appId],
+      );
+      expect(Number(paid[0]?.count)).toBe(0);
+    });
+  });
+
+  /**
    * The real Reveal Rush shape: two Tenjin creative campaigns naming one Meta
    * campaign in parentheses, plus organic. Before this, every one of these was
    * unmatched and mapping coverage was 0%.
@@ -1129,7 +1451,7 @@ describe('reconciliation', () => {
       expect(mappings[1]?.target_external_id).toBe('b47f71fd-4c12-48ba-b49a-f78e5d7a7fa3');
       for (const mapping of mappings) {
         expect(mapping.status).toBe('matched_exact');
-        expect(mapping.mapping_method).toBe('explicit_provider_mapping');
+        expect(mapping.mapping_method).toBe('provider_remote_campaign');
         expect(Number(mapping.mapping_confidence)).toBe(1);
       }
 

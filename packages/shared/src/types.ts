@@ -169,6 +169,14 @@ export const MAPPING_METHODS = [
   'tracking_parameter',
   'explicit_provider_mapping',
   /**
+   * The attribution provider published a network identifier, and it resolved
+   * against the network's own structure at ad-group level - the level Tenjin
+   * publishes for Meta. Attribution is rolled up to the parent campaign.
+   */
+  'provider_remote_ad_group',
+  /** The same, resolved at campaign level. */
+  'provider_remote_campaign',
+  /**
    * One provider's campaign name is embedded verbatim inside the other's, the
    * way an MMP wraps the network's name: `Creative_A (NETWORK_CAMPAIGN_NAME)`.
    * Deterministic - an exact match of an extracted substring, never a fuzzy
