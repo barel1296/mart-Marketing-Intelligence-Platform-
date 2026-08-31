@@ -351,6 +351,65 @@ describe('Tenjin adapter', () => {
     expect(install?.country).toBe('US');
   });
 
+  it('drops rows an account-wide saved report cannot attribute to an app', async () => {
+    // A saved report with an empty app_ids covers every app in the account,
+    // and is admitted only because MART filters the rows by app_id. The
+    // grouping MART itself ranks highest, campaign+country, carries no app
+    // dimension - so this is exactly where the column is missing, and a filter
+    // that skips when the column is absent writes another app's installs
+    // against the bound app with no warning at all.
+    const accountWide = JSON.stringify({
+      data: [
+        {
+          id: 'bb22cc33-dd44-ee55-ff66-778899001122',
+          type: 'saved_report',
+          attributes: {
+            name: 'Account-wide UA',
+            report_type: 'user_acquisition',
+            app_ids: [],
+            metrics: ['tracked_installs'],
+            granularity: 'daily',
+            group_by: 'campaign,country',
+            past_number_days: 30,
+          },
+        },
+      ],
+    });
+    const rowsWithoutApp = JSON.stringify({
+      data: [
+        { date: '2026-08-20', campaign_id: '900', country: 'US', tracked_installs: 100 },
+        { date: '2026-08-20', campaign_id: '901', country: 'GB', tracked_installs: 40 },
+      ],
+    });
+    const stub = stubFetch([{ body: accountWide }, { body: rowsWithoutApp }]);
+    const provider = new TenjinAttributionProvider({
+      credentials: { kind: 'tenjin', apiKey: 'k'.repeat(30) },
+      baseUrl: 'https://tenjin.example.com',
+      http: client(stub.impl, 'tenjin'),
+    });
+    const result = await provider.syncInstalls({ ...params, externalAccountId: 'app-1' });
+    expect(result.batch.installs).toHaveLength(0);
+    expect(result.rowsRejected).toBe(2);
+    expect(result.warnings.join(' ')).toMatch(/no app_id column/i);
+  });
+
+  it('keeps every row of a report Tenjin already scoped to the bound app', async () => {
+    // The same rows, from a report saved for this app alone: Tenjin has done
+    // the scoping, so a missing app_id column proves nothing and drops nothing.
+    const rowsWithoutApp = JSON.stringify({
+      data: [{ date: '2026-08-20', campaign_id: '900', country: 'US', tracked_installs: 100 }],
+    });
+    const stub = stubFetch([{ body: savedReports }, { body: rowsWithoutApp }]);
+    const provider = new TenjinAttributionProvider({
+      credentials: { kind: 'tenjin', apiKey: 'k'.repeat(30) },
+      baseUrl: 'https://tenjin.example.com',
+      http: client(stub.impl, 'tenjin'),
+    });
+    const result = await provider.syncInstalls({ ...params, externalAccountId: 'app-1' });
+    expect(result.batch.installs).toHaveLength(1);
+    expect(result.rowsRejected).toBe(0);
+  });
+
   it('emits IAP and ad revenue at event-date grain', async () => {
     const revenueBody = JSON.stringify({
       data: [

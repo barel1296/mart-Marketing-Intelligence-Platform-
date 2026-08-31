@@ -162,13 +162,30 @@ Each definition is parsed down to the fields compatibility turns on: `id`,
 
 A saved report is usable for a stream only if **all** of these hold:
 
-| Rule                                | Why                                                                                           |
-| ----------------------------------- | --------------------------------------------------------------------------------------------- |
-| `report_type` is `user_acquisition` | Other families report different facts                                                         |
-| covers the bound app                | `app_ids` contains it, or is empty (account-wide). Rows are then filtered by `app_id` on read |
-| has the metrics                     | installs need `tracked_installs`; revenue needs any one usable revenue metric (below)         |
-| `granularity` is `daily`            | Weekly, monthly and totals buckets cannot be split back into days without inventing data      |
-| `group_by` is one MART stores       | Every dimension the report splits on must be one MART keeps                                   |
+| Rule                                | Why                                                                                                                                  |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `report_type` is `user_acquisition` | Other families report different facts                                                                                                |
+| covers the bound app                | `app_ids` contains it, or is empty (account-wide). A report wider than the bound app imports only rows that carry an `app_id` for it |
+| has the metrics                     | installs need `tracked_installs`; revenue needs any one usable revenue metric (below)                                                |
+| `granularity` is `daily`            | Weekly, monthly and totals buckets cannot be split back into days without inventing data                                             |
+| `group_by` is one MART stores       | Every dimension the report splits on must be one MART keeps                                                                          |
+
+#### A wider report imports only rows that name their app
+
+`app_ids` empty means "every app in the account", and a report may also list
+several. MART admits both, because the operator's report is not MART's to
+change — but the admission rests entirely on filtering the rows by `app_id`,
+and a row can only be filtered if it carries one. The grouping MART itself
+ranks highest, `campaign,country`, carries no app dimension at all.
+
+So a row without an `app_id` from a report wider than the bound app is
+**dropped and counted**, never assumed to belong to the bound app: writing it
+would sum another app's installs and revenue into this app's KPIs, silently and
+with no warning, since a filter that never matched reports nothing skipped. The
+run says how many rows could not be attributed and what to change (add `app` to
+the report's `group_by`, or save a report for this app alone). A report Tenjin
+has already scoped to exactly the bound app needs none of this, and is
+preferred when several reports are compatible.
 
 #### `group_by` is normalized, never string-compared
 

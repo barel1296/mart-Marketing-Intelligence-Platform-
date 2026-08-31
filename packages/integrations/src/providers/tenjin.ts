@@ -295,9 +295,13 @@ export function evaluateSavedReport(
   if (report.appIds.length > 0 && !report.appIds.includes(requirement.appId)) {
     blockers.push('app_ids does not include the bound app');
   } else if (report.appIds.length === 0) {
-    notes.push('covers every app in the account; rows are filtered to the bound app');
+    notes.push(
+      'covers every app in the account; only rows carrying an app_id for the bound app are imported',
+    );
   } else if (report.appIds.length > 1) {
-    notes.push(`covers ${report.appIds.length} apps; rows are filtered to the bound app`);
+    notes.push(
+      `covers ${report.appIds.length} apps; only rows carrying an app_id for the bound app are imported`,
+    );
   }
 
   const missing = requirement.requiredMetrics.filter((metric) => !report.metrics.includes(metric));
@@ -378,8 +382,16 @@ export function selectSavedReport(
   const usable = evaluated.filter((candidate) => candidate.usable);
   const componentScore = (candidate: TenjinReportCompatibility): number =>
     TENJIN_REVENUE_COMPONENT_METRICS.filter((m) => candidate.report.metrics.includes(m)).length;
+  // A report Tenjin has already scoped to this app needs no per-row app_id to
+  // be safe to import, so it outranks a wider report that MART would have to
+  // filter row by row.
+  const appScoped = (candidate: TenjinReportCompatibility): number =>
+    candidate.report.appIds.length === 1 && candidate.report.appIds[0] === requirement.appId
+      ? 1
+      : 0;
   usable.sort(
     (a, b) =>
+      appScoped(b) - appScoped(a) ||
       groupByRank(b.groupBy) - groupByRank(a.groupBy) ||
       // A report that splits IAP from ad beats one carrying only a total.
       componentScore(b) - componentScore(a) ||
@@ -1064,7 +1076,16 @@ export class TenjinAttributionProvider implements AttributionProvider {
     let pages = 0;
     let rowsFetched = 0;
     let otherApp = 0;
+    let unattributableApp = 0;
     let outsideWindow = 0;
+
+    // A report bound to exactly this app needs no per-row proof of ownership:
+    // Tenjin already scoped it. Any wider report is admitted only on the
+    // promise that MART filters the rows, so each row has to say which app it
+    // belongs to - a row that does not is dropped rather than assumed to be
+    // this app's.
+    const reportIsAppScoped =
+      report.appIds.length === 1 && report.appIds[0] === params.externalAccountId;
     let earliest: string | null = null;
     let latest: string | null = null;
 
@@ -1093,8 +1114,13 @@ export class TenjinAttributionProvider implements AttributionProvider {
           if (!latest || date > latest) latest = date;
         }
         const rowApp = str(row['app_id']);
-        if (rowApp && rowApp !== params.externalAccountId) {
-          otherApp += 1;
+        if (rowApp) {
+          if (rowApp !== params.externalAccountId) {
+            otherApp += 1;
+            continue;
+          }
+        } else if (!reportIsAppScoped) {
+          unattributableApp += 1;
           continue;
         }
         if (date && (date < params.from || date > params.to)) {
@@ -1126,6 +1152,11 @@ export class TenjinAttributionProvider implements AttributionProvider {
         `Saved report "${report.name ?? report.id}" also covers other apps: ${otherApp} row(s) for a different app_id were not imported.`,
       );
     }
+    if (unattributableApp > 0) {
+      warnings.push(
+        `Saved report "${report.name ?? report.id}" covers more than the bound app but returns no app_id column, so ${unattributableApp} row(s) could not be attributed to an app and were not imported. Add "app" to the report's group_by, or point MART at a report saved for this app alone.`,
+      );
+    }
     if (outsideWindow > 0) {
       warnings.push(
         `${outsideWindow} row(s) fell outside the requested window ${params.from}..${params.to} and were not imported; the saved report returned ${earliest ?? '?'}..${latest ?? '?'}.`,
@@ -1141,7 +1172,13 @@ export class TenjinAttributionProvider implements AttributionProvider {
       );
     }
 
-    return { rows, pages, rowsFetched, rowsSkipped: otherApp + outsideWindow, warnings };
+    return {
+      rows,
+      pages,
+      rowsFetched,
+      rowsSkipped: otherApp + unattributableApp + outsideWindow,
+      warnings,
+    };
   }
 
   /**

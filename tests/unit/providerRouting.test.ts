@@ -1094,10 +1094,14 @@ describe('tenjin saved-report compatibility', () => {
     expect(evaluateSavedReport(report(), installs).usable).toBe(true);
   });
 
-  it('accepts an account-wide report, noting that rows are filtered', () => {
+  it('accepts an account-wide report, stating what makes a row importable', () => {
+    // The note is the contract the reader relies on. "Rows are filtered to the
+    // bound app" overstates it: filtering needs an app_id on the row, and a
+    // report grouped by campaign and country does not carry one. The note says
+    // which rows are imported, so the promise matches what the reader does.
     const verdict = evaluateSavedReport(report({ appIds: [] }), installs);
     expect(verdict.usable).toBe(true);
-    expect(verdict.notes.join(' ')).toContain('filtered to the bound app');
+    expect(verdict.notes.join(' ')).toContain('rows carrying an app_id for the bound app');
   });
 
   it('refuses a report for other apps, another type, or a missing metric', () => {
