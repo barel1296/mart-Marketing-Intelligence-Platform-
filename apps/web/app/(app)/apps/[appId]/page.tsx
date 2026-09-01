@@ -220,30 +220,25 @@ export default async function CommandCenterPage({
     `/api/v1/organizations/${organization.id}/apps/${appId}/filters`,
   );
 
-  const metricByKey = new Map(data.metrics.map((m) => [m.metricKey, m]));
-  // Ordered so the honest denominators sit beside the ratios computed from
-  // them: total installs, then the mapped subset, then the CPI each supports.
-  const primaryOrder = [
-    'spend',
-    'impressions',
-    'clicks',
-    'ctr',
-    'cpm',
-    'cpc',
-    'attributed_installs',
-    'mapped_paid_installs',
-    'organic_installs',
-    'mapped_cpi',
-    'blended_cpi',
-    'attributed_revenue',
-    'mapped_attributed_revenue',
-    'campaign_operational_coverage',
-    'spend_coverage',
-    'attribution_coverage',
-    'mapping_coverage',
-    'operational_mapping_coverage',
-    'cohort_roas',
+  // Sections come from each metric's declared family, not from a list kept
+  // here. A hand-ordered array of keys is a second definition of the metric
+  // set: it silently drops anything the registry adds - as it had already
+  // dropped five metrics - and it lets this page disagree with the registry
+  // about what a section contains.
+  const familyOrder: Array<{ family: string; title: string }> = [
+    { family: 'delivery', title: 'Core delivery' },
+    { family: 'attribution', title: 'Attribution' },
+    { family: 'revenue', title: 'Revenue' },
+    { family: 'efficiency', title: 'Efficiency' },
+    { family: 'coverage', title: 'Coverage' },
+    { family: 'cohort', title: 'Cohort' },
   ];
+  const metricsByFamily = new Map<string, MetricValue[]>();
+  for (const metric of data.metrics) {
+    const bucket = metricsByFamily.get(metric.family);
+    if (bucket) bucket.push(metric);
+    else metricsByFamily.set(metric.family, [metric]);
+  }
 
   return (
     <>
@@ -417,15 +412,21 @@ export default async function CommandCenterPage({
       </Card>
 
       {/* --------------------------------------------------- 2. core metrics */}
-      <div className="section-title">2 — Core delivery and attribution metrics</div>
-      <div className="tile-grid">
-        {primaryOrder
-          .map((key) => metricByKey.get(key))
-          .filter((m): m is MetricValue => Boolean(m))
-          .map((metric) => (
-            <MetricTile key={metric.metricKey} metric={metric} currency={currency} />
-          ))}
-      </div>
+      <div className="section-title">2 — Metrics</div>
+      {familyOrder.map(({ family, title }) => {
+        const metrics = metricsByFamily.get(family) ?? [];
+        if (metrics.length === 0) return null;
+        return (
+          <div key={family}>
+            <div className="subsection-title">{title}</div>
+            <div className="tile-grid">
+              {metrics.map((metric) => (
+                <MetricTile key={metric.metricKey} metric={metric} currency={currency} />
+              ))}
+            </div>
+          </div>
+        );
+      })}
 
       {/* ------------------------------------------------------- 3. trend */}
       <div className="section-title">3 — Performance trend</div>

@@ -1,14 +1,28 @@
 import { formatMetric, statusLabel, statusTone } from '../lib/format';
 
+/**
+ * The metric contract as it arrives over the wire.
+ *
+ * Structural only: the fields the API sends. Every business meaning - what a
+ * metric measures, its formula, its population, whether it can be shown at all
+ * - is decided by the registry in @mart/metrics and travels with the value.
+ * Nothing here restates a definition, because a second definition is how two
+ * screens start disagreeing about what a number means.
+ */
 export type MetricValue = {
   metricKey: string;
   displayName: string;
   value: number | null;
   numerator: number | null;
   denominator: number | null;
-  availability: 'available' | 'partial' | 'stale' | 'unavailable';
+  availability: 'available' | 'partial' | 'stale' | 'blocked' | 'unavailable';
   reason?: string;
   grain: { primary: string; mixed?: string[]; note: string };
+  family: string;
+  unit: string;
+  aggregation: string;
+  semanticClass: string;
+  population: { numerator: string; denominator?: string; note: string };
   sources: string[];
   format: string;
   formula: string;

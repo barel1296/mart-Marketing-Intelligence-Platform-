@@ -271,6 +271,16 @@ h3 {
 }
 /* The qualification that belongs to a number, kept quieter than the number
    itself but on the tile rather than behind a tooltip. */
+/* A family heading inside the metric grid: present enough to separate the
+   sections, quiet enough not to compete with the section titles above them. */
+.subsection-title {
+  margin: 14px 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
 .tile-caveat {
   margin-top: 4px;
   font-size: 11px;

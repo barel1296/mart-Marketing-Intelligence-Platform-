@@ -685,6 +685,18 @@ export type MetricValue = {
   sources: MetricSource[];
   format: MetricFormat;
   formula: string;
+  /**
+   * The semantic contract, carried with the value rather than left in the
+   * registry for consumers to look up. A number that travels without saying
+   * what it measures and over which population can only be trusted, and the
+   * consumers that most need to check it - the audit CLIs, and later anything
+   * reasoning over these figures - are exactly the ones that cannot ask.
+   */
+  family: MetricFamily;
+  unit: MetricUnit;
+  aggregation: MetricAggregation;
+  semanticClass: MetricClass;
+  population: MetricPopulationSpec;
   /** Provenance: which providers contributed to this number. */
   providers: string[];
   freshnessStatus?: string;
