@@ -373,22 +373,59 @@ export async function listRecentSyncErrors(
 }
 
 /**
- * Mark every open error for this app/provider/stream as resolved by this run.
+ * Close the earlier errors a successful run has actually superseded.
  *
- * Called when a run succeeds. Audit history is never deleted - the row stays,
- * with the run that superseded it recorded - so a fixed problem stops being
- * presented as a current one without the evidence disappearing.
+ * Called when a run finishes having read something. A failure recorded at
+ * 09:43 and a clean re-read of the same window at 10:21 describe one incident
+ * that is over, but the row stays open until something says so - and an open
+ * error is what the operator, the integrations card and the Phase 0 audit all
+ * read as "this stream is broken right now".
+ *
+ * Resolution is proof-based, never a blanket clear. The scope is one stream -
+ * organization, app, connection and data type - and within it an error is
+ * closed only where this run demonstrably covered the ground the error was
+ * recorded on:
+ *
+ *  - A **windowed error** needs a window this run actually completed. For a
+ *    retryable failure - a timeout, a throttle, a provider outage - any
+ *    completed window containing it is proof: the same dates were re-read and
+ *    they loaded. For a non-retryable one - a rejected request, a credential or
+ *    configuration problem - only the same window exactly counts, because that
+ *    class of error is a statement about a specific request rather than about
+ *    the provider's mood, and the narrower rule is the honest one.
+ *  - A **stream-level error carrying no window** cannot be matched to any
+ *    range, so it is closed only by a run that completed every window it
+ *    planned. A partial run proves the stream is reachable, not that whatever
+ *    failed has stopped failing.
+ *
+ * Everything else stays open, including errors on another provider, another
+ * stream, or a window nothing has re-read since. History is never deleted: the
+ * row stays exactly as recorded, with the run that superseded it named, so a
+ * fixed problem stops being presented as a current one without the evidence
+ * disappearing.
  */
-export async function resolveOpenSyncErrors(
+export async function resolveSupersededSyncErrors(
   input: {
     organizationId: string;
     appId: string;
     connectionId: string;
     dataType: SyncDataType;
+    /** The run offering the proof. Its own errors are never self-resolved. */
     syncRunId: string;
+    /** Windows this run actually completed. An attempted window is not proof. */
+    coveredWindows: ReadonlyArray<{ from: IsoDate; to: IsoDate }>;
+    /**
+     * Whether the run completed every window it planned. Only a run with
+     * nothing left failing can close an error that names no window.
+     */
+    complete: boolean;
   },
   client?: Queryable,
 ): Promise<number> {
+  if (input.coveredWindows.length === 0 && !input.complete) return 0;
+  const froms = input.coveredWindows.map((w) => w.from);
+  const tos = input.coveredWindows.map((w) => w.to);
+
   const rows = await queryRows<{ id: string }>(
     `UPDATE sync_errors e
         SET resolved_at = now(), resolved_by_sync_run_id = $5
@@ -400,8 +437,30 @@ export async function resolveOpenSyncErrors(
         AND r.data_type = $4
         AND e.resolved_at IS NULL
         AND e.sync_run_id <> $5
+        AND (
+          (e.window_start IS NOT NULL AND e.window_end IS NOT NULL
+           AND EXISTS (
+             SELECT 1 FROM unnest($6::date[], $7::date[]) AS w(covered_from, covered_to)
+              WHERE CASE WHEN e.retryable
+                         THEN w.covered_from <= e.window_start
+                          AND w.covered_to >= e.window_end
+                         ELSE w.covered_from = e.window_start
+                          AND w.covered_to = e.window_end
+                    END
+           ))
+          OR (e.window_start IS NULL AND e.window_end IS NULL AND $8::boolean)
+        )
       RETURNING e.id`,
-    [input.organizationId, input.appId, input.connectionId, input.dataType, input.syncRunId],
+    [
+      input.organizationId,
+      input.appId,
+      input.connectionId,
+      input.dataType,
+      input.syncRunId,
+      froms,
+      tos,
+      input.complete,
+    ],
     client,
   );
   return rows.length;

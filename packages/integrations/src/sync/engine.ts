@@ -127,6 +127,8 @@ export async function runSync(run: SyncRunRow, request: SyncRequest): Promise<Sy
     latestDataDate: null,
   };
 
+  const coveredWindows: Array<{ from: IsoDate; to: IsoDate }> = [];
+
   const scope: FactScope = {
     organizationId: request.organizationId,
     appId: request.appId,
@@ -258,6 +260,10 @@ export async function runSync(run: SyncRunRow, request: SyncRequest): Promise<Sy
       }
 
       await syncRepo.checkpointWindow(run.id, windowKey);
+      // Recorded only here, after the window's rows are persisted: an attempted
+      // window is not evidence that anything loaded, and this list is what
+      // later closes the earlier errors this run supersedes.
+      coveredWindows.push({ from: chunk.from, to: chunk.to });
       summary.windowsCompleted += 1;
       counters.increment('sync_windows_completed_total', { provider: request.providerKey });
     } catch (error) {
@@ -320,6 +326,25 @@ export async function runSync(run: SyncRunRow, request: SyncRequest): Promise<Sy
 
   const succeeded = status !== 'failed';
 
+  // An earlier failure this run has superseded should stop being presented as a
+  // live problem. Only a run that actually read something can prove that, so a
+  // stream the adapter does not implement - which made no request at all - is
+  // excluded along with a run that failed outright.
+  if (succeeded && !support && summary.windowsCompleted > 0) {
+    const resolved = await syncRepo.resolveSupersededSyncErrors({
+      organizationId: request.organizationId,
+      appId: request.appId,
+      connectionId: request.connectionId,
+      dataType: request.dataType,
+      syncRunId: run.id,
+      coveredWindows,
+      complete: summary.windowsFailed === 0,
+    });
+    if (resolved > 0) {
+      log.info({ resolved, syncRunId: run.id }, 'resolved superseded sync errors');
+    }
+  }
+
   // Advance the incremental cursor only on success, and only as far as data we
   // actually stored: a failed window must not be skipped next time.
   if (succeeded && summary.latestDataDate) {
@@ -351,18 +376,6 @@ export async function runSync(run: SyncRunRow, request: SyncRequest): Promise<Sy
     }),
     lastErrorClass: failure?.errorClass ?? null,
   });
-
-  // A successful run supersedes the open errors for this stream. The rows stay
-  // for audit; they simply stop being reported as current problems.
-  if (status === 'completed' || status === 'partially_completed') {
-    await syncRepo.resolveOpenSyncErrors({
-      organizationId: request.organizationId,
-      appId: request.appId,
-      connectionId: request.connectionId,
-      dataType: request.dataType,
-      syncRunId: run.id,
-    });
-  }
 
   if (request.syncJobId) await syncRepo.setSyncJobStatus(request.syncJobId, status);
 
