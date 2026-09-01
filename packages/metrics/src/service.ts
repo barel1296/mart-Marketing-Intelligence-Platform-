@@ -150,6 +150,14 @@ export type AttributionAggregate = {
    */
   deliveryAlignedPaidInstalls: number;
   deliveryAlignedRevenue: number;
+  /**
+   * Attributed revenue split by what produced it. In-app purchases and ad
+   * mediation are different businesses with different margins, and a single
+   * "revenue" number hides which one moved. Both are event-date, and they sum
+   * to the attributed total for rows that report components.
+   */
+  iapRevenue: number;
+  adRevenue: number;
   /** Unpaid traffic. Never part of a paid campaign's CPI or ROAS. */
   organicInstalls: number;
   organicRevenue: number;
@@ -308,6 +316,8 @@ export async function loadAttributionAggregate(
     mapped_revenue: string;
     delivery_aligned_revenue: string;
     organic_revenue: string;
+    iap_revenue: string;
+    ad_revenue: string;
     latest_date: string | null;
   }>(
     `SELECT COALESCE(SUM(revenue), 0)::text AS revenue,
@@ -317,6 +327,8 @@ export async function loadAttributionAggregate(
               WHERE ${NOT_ORGANIC} AND ${DELIVERY_ALIGNED_CAMPAIGN}), 0)::text
               AS delivery_aligned_revenue,
             COALESCE(SUM(revenue) FILTER (WHERE NOT (${NOT_ORGANIC})), 0)::text AS organic_revenue,
+            COALESCE(SUM(revenue) FILTER (WHERE revenue_type = 'iap'), 0)::text AS iap_revenue,
+            COALESCE(SUM(revenue) FILTER (WHERE revenue_type = 'ad'), 0)::text AS ad_revenue,
             MAX(activity_date)::text AS latest_date
      FROM attribution_revenue_metrics t WHERE ${revenueWhere}`,
     revenueParams,
@@ -335,6 +347,8 @@ export async function loadAttributionAggregate(
     deliveryAlignedRevenue: toNumber(revenueRows[0]?.delivery_aligned_revenue),
     organicInstalls,
     organicRevenue: toNumber(revenueRows[0]?.organic_revenue),
+    iapRevenue: toNumber(revenueRows[0]?.iap_revenue),
+    adRevenue: toNumber(revenueRows[0]?.ad_revenue),
     // Paid installs MART cannot yet attach to a marketing campaign. Reported
     // rather than folded into either side.
     unmappedPaidInstalls: attributedInstalls - organicInstalls - mappedPaidInstalls,
@@ -501,6 +515,24 @@ function buildMetricValue(
         ...base,
         value: attribution.attributedRevenue,
         numerator: attribution.attributedRevenue,
+      });
+    case 'paid_attributed_installs':
+      return withFreshness({
+        ...base,
+        value: attribution.attributedInstalls - attribution.organicInstalls,
+        numerator: attribution.attributedInstalls - attribution.organicInstalls,
+      });
+    case 'iap_revenue':
+      return withFreshness({
+        ...base,
+        value: attribution.iapRevenue,
+        numerator: attribution.iapRevenue,
+      });
+    case 'ad_revenue':
+      return withFreshness({
+        ...base,
+        value: attribution.adRevenue,
+        numerator: attribution.adRevenue,
       });
     case 'mapped_paid_installs':
       return withFreshness({

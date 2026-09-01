@@ -218,9 +218,112 @@ export const AUTHORITATIVE_MAPPING_STATUSES: readonly MappingStatus[] = [
  */
 export const OPERATIONAL_MAPPING_CONFIDENCE = 0.9;
 
-/** Governed-metric availability. `unavailable` always carries a reason. */
-export const METRIC_AVAILABILITY = ['available', 'partial', 'stale', 'unavailable'] as const;
+/**
+ * Governed-metric availability.
+ *
+ * `partial`, `stale` and `blocked` all carry a reason, and so does
+ * `unavailable`: a number the reader has to qualify is a different claim from a
+ * plain one, and a missing number is a different claim again.
+ *
+ * `blocked` is not a softer `unavailable`. It says MART could compute the
+ * metric arithmetically but refuses to, because doing so would state something
+ * untrue - summing two currencies, dividing populations that do not correspond.
+ * The distinction matters to anything reading these values downstream: an
+ * unavailable metric may become available when data arrives, while a blocked
+ * one needs the blocker resolved.
+ */
+export const METRIC_AVAILABILITY = [
+  'available',
+  'partial',
+  'stale',
+  'blocked',
+  'unavailable',
+] as const;
 export type MetricAvailability = (typeof METRIC_AVAILABILITY)[number];
+
+/**
+ * Why a metric is blocked. Each names a condition MART can detect, never a
+ * judgement call, so the same data always produces the same blocker.
+ */
+export const METRIC_BLOCKERS = [
+  /** The stream this metric reads has not synced recently enough to be trusted. */
+  'provider_stale',
+  /** No provider is bound for one of the metric's sources. */
+  'missing_provider',
+  /** The mapping this metric depends on has candidates rather than an answer. */
+  'ambiguous_mapping',
+  /** The rows carry more than one currency; summing them would invent a number. */
+  'mixed_currency',
+  /** Numerator and denominator are expressed in grains that do not correspond. */
+  'incompatible_grain',
+  /** Too little of the population is mapped for the figure to describe the account. */
+  'insufficient_coverage',
+  /** The provider does not offer the capability this metric needs. */
+  'unsupported_metric',
+  /** The denominator is zero, absent, or below the metric's floor. */
+  'missing_denominator',
+] as const;
+export type MetricBlocker = (typeof METRIC_BLOCKERS)[number];
+
+/**
+ * What a metric measures. Families group the Command Center and let the UI stop
+ * carrying its own list of which metric belongs where.
+ */
+export const METRIC_FAMILIES = [
+  'delivery',
+  'attribution',
+  'revenue',
+  'efficiency',
+  'coverage',
+  'cohort',
+] as const;
+export type MetricFamily = (typeof METRIC_FAMILIES)[number];
+
+/** The unit a value is expressed in, independent of how it is formatted. */
+export const METRIC_UNITS = ['currency', 'count', 'ratio', 'percentage', 'duration'] as const;
+export type MetricUnit = (typeof METRIC_UNITS)[number];
+
+/** How a metric combines across rows - the thing a naive SUM gets wrong. */
+export const METRIC_AGGREGATIONS = ['sum', 'ratio_of_sums', 'weighted', 'latest'] as const;
+export type MetricAggregation = (typeof METRIC_AGGREGATIONS)[number];
+
+/**
+ * The semantic class of a metric, which decides how it may be read.
+ *
+ * An operational figure describes what happened in a reporting window. A cohort
+ * figure describes a group of users followed over time, and the two must never
+ * be compared as if they were the same measurement.
+ */
+export const METRIC_CLASSES = ['operational', 'cohort', 'mapping', 'structural'] as const;
+export type MetricClass = (typeof METRIC_CLASSES)[number];
+
+/**
+ * The named populations a metric can be computed over.
+ *
+ * Naming them is the point. A ratio is only meaningful when its numerator and
+ * denominator describe the same set of things, and the way that goes wrong is
+ * never dramatic: two populations that are each individually correct get
+ * divided, and the answer looks entirely plausible.
+ */
+export const METRIC_POPULATIONS = [
+  /** Every attributed install, paid and organic alike. */
+  'all_attribution',
+  /** Attributed installs excluding organic. */
+  'paid_attribution',
+  /** Paid installs on an attribution campaign linked to a marketing campaign. */
+  'mapped_paid_attribution',
+  /** Mapped paid installs whose marketing campaign also delivered in this window. */
+  'delivery_aligned_paid_attribution',
+  /** Organic installs only. */
+  'organic_attribution',
+  /** Marketing campaigns with delivery inside the selected window. */
+  'current_period_marketing',
+  /** Every marketing entity MART knows, whenever it last delivered. */
+  'all_structure',
+  /** The metric is not a share of anything - a raw measure. */
+  'not_applicable',
+] as const;
+export type MetricPopulation = (typeof METRIC_POPULATIONS)[number];
 
 export type Iso8601 = string;
 /** Calendar date in YYYY-MM-DD, always interpreted in the app's reporting timezone. */
