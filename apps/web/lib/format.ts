@@ -60,10 +60,14 @@ export function statusTone(status: string | null | undefined): string {
     case 'pending':
     case 'matched_fallback':
       return 'chip-warning';
+    // `blocked` sits here rather than with the failures: MART could do the
+    // arithmetic and refuses to, because the result would state something
+    // untrue. The data is fine; the combination is not.
     case 'stale':
     case 'degraded':
     case 'ambiguous':
     case 'serious':
+    case 'blocked':
       return 'chip-serious';
     case 'error':
     case 'failed':

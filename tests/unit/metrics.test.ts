@@ -47,6 +47,9 @@ const attribution = {
   deliveryAlignedRevenue: 180,
   organicInstalls: 100,
   organicRevenue: 70,
+  iapRevenue: 180,
+  adRevenue: 70,
+  currencies: ['USD'],
   unmappedPaidInstalls: 0,
   rows: 20,
   latestInstallDate: '2026-08-26',
@@ -336,5 +339,49 @@ describe('safeRatio', () => {
     expect(safeRatio(5, 0, 0).value).toBeNull();
     expect(safeRatio(0, 0, 0).value).toBeNull();
     expect(safeRatio(5, 10, 0).value).toBe(0.5);
+  });
+});
+
+describe('currency isolation', () => {
+  it('refuses a money metric drawn from more than one currency', () => {
+    // 100 USD + 100 EUR is not 200 of anything. The sum would look entirely
+    // ordinary, which is exactly why this has to be refused rather than shown.
+    const mixed = { ...marketing, currencies: ['USD', 'EUR'] };
+    const value = metric('spend', context(), mixed);
+    expect(value?.availability).toBe('blocked');
+    expect(value?.blocker).toBe('mixed_currency');
+    expect(value?.value).toBeNull();
+    expect(value?.reason).toMatch(/EUR/);
+    expect(value?.reason).toMatch(/does not convert/i);
+  });
+
+  it('blocks a derived money metric too, not only the raw sum', () => {
+    const mixed = { ...marketing, currencies: ['USD', 'GBP'] };
+    for (const key of ['cpm', 'cpc', 'mapped_cpi', 'blended_cpi']) {
+      const value = metric(key, context(), mixed);
+      expect(value?.availability, key).toBe('blocked');
+      expect(value?.blocker, key).toBe('mixed_currency');
+    }
+  });
+
+  it('leaves counts and ratios alone - they are not denominated in anything', () => {
+    const mixed = { ...marketing, currencies: ['USD', 'EUR'] };
+    for (const key of ['impressions', 'clicks', 'ctr']) {
+      const value = metric(key, context(), mixed);
+      expect(value?.availability, key).not.toBe('blocked');
+    }
+  });
+
+  it('blocks a revenue metric on mixed attribution currencies', () => {
+    const mixed = { ...attribution, currencies: ['USD', 'JPY'] };
+    const value = metric('attributed_revenue', context(), marketing, mixed);
+    expect(value?.availability).toBe('blocked');
+    expect(value?.blocker).toBe('mixed_currency');
+  });
+
+  it('says nothing about currency when there is only one', () => {
+    const value = metric('spend');
+    expect(value?.availability).not.toBe('blocked');
+    expect(value?.blocker).toBeUndefined();
   });
 });

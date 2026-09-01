@@ -46,7 +46,11 @@ const GRAIN_LABEL: Record<string, string> = {
  * number - a zero would be a different claim.
  */
 export function MetricTile({ metric, currency }: { metric: MetricValue; currency?: string }) {
-  const unavailable = metric.availability === 'unavailable';
+  // Blocked shows its reason in place of the number for the same reason
+  // unavailable does: there is no figure to show, and a zero would be a
+  // different claim. The chip keeps the two apart - unavailable may resolve
+  // itself when data arrives, blocked needs the blocker cleared.
+  const unavailable = metric.availability === 'unavailable' || metric.availability === 'blocked';
   const grainText = metric.grain.mixed
     ? `mixed: ${metric.grain.mixed.map((g) => GRAIN_LABEL[g] ?? g).join(' / ')}`
     : (GRAIN_LABEL[metric.grain.primary] ?? metric.grain.primary);

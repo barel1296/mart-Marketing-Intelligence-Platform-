@@ -1,6 +1,7 @@
 import type {
   MetricAggregation,
   MetricAvailability,
+  MetricBlocker,
   MetricClass,
   MetricFamily,
   MetricGrain,
@@ -681,6 +682,12 @@ export type MetricValue = {
   availability: MetricAvailability;
   /** Always populated when availability is not 'available'. */
   reason?: string;
+  /**
+   * Present exactly when availability is 'blocked': the machine-readable
+   * condition that stopped the metric, so a consumer can act on it without
+   * parsing the prose.
+   */
+  blocker?: MetricBlocker;
   grain: MetricGrainSpec;
   sources: MetricSource[];
   format: MetricFormat;

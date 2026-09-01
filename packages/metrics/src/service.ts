@@ -128,6 +128,11 @@ export type AttributionAggregate = {
    */
   iapRevenue: number;
   adRevenue: number;
+  /**
+   * Every distinct currency present in the revenue rows. More than one means
+   * the total is not a number: summing them would invent an exchange rate.
+   */
+  currencies: string[];
   /** Unpaid traffic. Never part of a paid campaign's CPI or ROAS. */
   organicInstalls: number;
   organicRevenue: number;
@@ -294,6 +299,7 @@ export async function loadAttributionAggregate(
     organic_revenue: string;
     iap_revenue: string;
     ad_revenue: string;
+    currencies: string[];
     latest_date: string | null;
   }>(
     `SELECT COALESCE(SUM(revenue), 0)::text AS revenue,
@@ -305,6 +311,8 @@ export async function loadAttributionAggregate(
             COALESCE(SUM(revenue) FILTER (WHERE NOT (${NOT_ORGANIC})), 0)::text AS organic_revenue,
             COALESCE(SUM(revenue) FILTER (WHERE revenue_type = 'iap'), 0)::text AS iap_revenue,
             COALESCE(SUM(revenue) FILTER (WHERE revenue_type = 'ad'), 0)::text AS ad_revenue,
+            COALESCE(array_agg(DISTINCT currency) FILTER (WHERE currency IS NOT NULL), '{}')
+              AS currencies,
             MAX(activity_date)::text AS latest_date
      FROM attribution_revenue_metrics t WHERE ${revenueWhere}`,
     revenueParams,
@@ -325,6 +333,7 @@ export async function loadAttributionAggregate(
     organicRevenue: toNumber(revenueRows[0]?.organic_revenue),
     iapRevenue: toNumber(revenueRows[0]?.iap_revenue),
     adRevenue: toNumber(revenueRows[0]?.ad_revenue),
+    currencies: revenueRows[0]?.currencies ?? [],
     // Paid installs MART cannot yet attach to a marketing campaign. Reported
     // rather than folded into either side.
     unmappedPaidInstalls: attributedInstalls - organicInstalls - mappedPaidInstalls,
@@ -431,6 +440,26 @@ function buildMetricValue(
       availability: 'unavailable',
       ...(gate.reason ? { reason: gate.reason } : {}),
     };
+  }
+
+  // A money metric drawn from rows in more than one currency is not a number
+  // MART can state. Adding 100 USD to 100 EUR requires a rate MART does not
+  // have and must not invent, and the sum would look entirely ordinary. Blocked
+  // rather than unavailable: the arithmetic is possible, the meaning is not.
+  if (definition.unit === 'currency') {
+    const currencies = new Set<string>([
+      ...(definition.sources.includes('marketing') ? marketing.currencies : []),
+      ...(definition.sources.includes('attribution') ? attribution.currencies : []),
+    ]);
+    if (currencies.size > 1) {
+      const listed = [...currencies].sort().join(', ');
+      return {
+        ...base,
+        availability: 'blocked',
+        blocker: 'mixed_currency',
+        reason: `The rows behind this figure are in ${currencies.size} currencies (${listed}). MART does not convert between them, so there is no single number to show.`,
+      };
+    }
   }
 
   const freshness = definition.sources.includes('attribution')
