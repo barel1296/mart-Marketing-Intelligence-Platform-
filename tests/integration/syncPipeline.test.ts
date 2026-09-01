@@ -970,6 +970,72 @@ describe('reconciliation', () => {
     expect(coverage.eligible?.mappedPaidInstalls).toBe(50);
   });
 
+  it('can hold two cohort ages for one cohort without either overwriting the other', async () => {
+    // Phase 1 only needs the model to REPRESENT cohort age safely - nothing
+    // computes cohort ROAS yet. But identity was (grain, date, revenue_type,
+    // source, campaign, country, platform, currency) with no notion of age, so
+    // D1 and D7 revenue for one cohort collided on a single dimension_hash and
+    // the second write silently replaced the first. The loss would have looked
+    // exactly like a restatement.
+    const ctx = await setup();
+    await triggerSync(ctx, '2026-08-20', '2026-08-20');
+
+    const scope = await queryRows<{ connection_id: string; provider_key: string }>(
+      `SELECT connection_id, provider_key FROM attribution_revenue_metrics WHERE app_id = $1 LIMIT 1`,
+      [ctx.appId],
+    );
+    const connectionId = scope[0]?.connection_id ?? ctx.mmpConnectionId;
+    const providerKey = scope[0]?.provider_key ?? 'appsflyer';
+
+    for (const age of [1, 7]) {
+      await query(
+        `INSERT INTO attribution_revenue_metrics
+           (organization_id, app_id, connection_id, provider_key, grain, activity_date,
+            revenue_type, media_source, external_campaign_id, country, platform,
+            cohort_age_days, currency, revenue, dimension_hash)
+         VALUES ($1, $2, $3, $4, 'cohort_date', '2026-08-20', 'iap', 'facebook', '900',
+                 'US', 'ios', $5, 'USD', $6, $7)`,
+        [
+          ctx.user.organizationId,
+          ctx.appId,
+          connectionId,
+          providerKey,
+          age,
+          age * 10,
+          `cohort-fixture-d${age}`,
+        ],
+      );
+    }
+
+    const cohorts = await queryRows<{ cohort_age_days: number; revenue: string }>(
+      `SELECT cohort_age_days, revenue FROM attribution_revenue_metrics
+        WHERE app_id = $1 AND grain = 'cohort_date' ORDER BY cohort_age_days`,
+      [ctx.appId],
+    );
+    expect(cohorts.map((c) => c.cohort_age_days)).toEqual([1, 7]);
+    expect(cohorts.map((c) => toNumber(c.revenue))).toEqual([10, 70]);
+
+    // And the schema refuses a cohort row that cannot say which day it is.
+    await expect(
+      query(
+        `INSERT INTO attribution_revenue_metrics
+           (organization_id, app_id, connection_id, provider_key, grain, activity_date,
+            revenue_type, media_source, currency, revenue, dimension_hash)
+         VALUES ($1, $2, $3, $4, 'cohort_date', '2026-08-20', 'iap', 'facebook',
+                 'USD', 5, 'cohort-fixture-noage')`,
+        [ctx.user.organizationId, ctx.appId, connectionId, providerKey],
+      ),
+    ).rejects.toThrow();
+
+    // Event-date revenue is untouched: it never carries an age.
+    const eventDate = await queryRows<{ n: string }>(
+      `SELECT count(*)::text AS n FROM attribution_revenue_metrics
+        WHERE app_id = $1 AND grain = 'event_date' AND cohort_age_days IS NOT NULL`,
+      [ctx.appId],
+    );
+    expect(Number(eventDate[0]?.n)).toBe(0);
+  });
+
   it('answers performance without the caller naming a provider', async () => {
     // The whole point of the unified object: a business consumer asks one
     // question and never learns which network is bound, what the MMP calls an

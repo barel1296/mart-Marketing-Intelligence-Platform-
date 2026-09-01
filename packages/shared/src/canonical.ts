@@ -122,6 +122,14 @@ export type CanonicalAttributionEventMetric = {
  * revenue recognized on the day it happened is not the same fact as cohort LTV.
  */
 export type CanonicalAttributionRevenueMetric = {
+  /**
+   * Days since the install cohort anchor: 0 for D0, 7 for D7.
+   *
+   * Set only when grain is 'cohort_date', and required then - a cohort row
+   * without an age cannot say which cohort day it describes, and two ages for
+   * one cohort would otherwise share an identity and overwrite each other.
+   */
+  cohortAgeDays?: number | null;
   activityDate: IsoDate;
   grain: 'event_date' | 'install_date';
   revenueType: 'iap' | 'ad' | 'total' | 'subscription';

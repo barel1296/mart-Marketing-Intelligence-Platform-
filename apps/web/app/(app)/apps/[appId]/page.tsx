@@ -216,6 +216,14 @@ export default async function CommandCenterPage({
   );
 
   const currency = data.app.default_currency;
+  // Provider names come from the payload, never from this file. Hardcoding
+  // "Meta" here means the dashboard lies the moment a second network is bound,
+  // and it is exactly the provider knowledge the semantic layer exists to keep
+  // out of business and presentation code.
+  const providerFor = (role: string): string =>
+    data.dataHealth.integrations.find((i) => i.role === role)?.providerKey ?? 'provider';
+  const marketingProvider = providerFor('marketing_network');
+  const attributionProvider = providerFor('primary_attribution');
   const filters = await apiGet<{ countries: string[]; platforms: string[] }>(
     `/api/v1/organizations/${organization.id}/apps/${appId}/filters`,
   );
@@ -438,21 +446,21 @@ export default async function CommandCenterPage({
             color="var(--series-1)"
             format="currency"
             currency={currency}
-            grainLabel="report date · Meta"
+            grainLabel={`report date · ${marketingProvider}`}
           />
           <SmallMultiple
             title="Impressions"
             points={data.timeseries.points.map((p) => ({ date: p.date, value: p.impressions }))}
             color="var(--series-1)"
             format="integer"
-            grainLabel="report date · Meta"
+            grainLabel={`report date · ${marketingProvider}`}
           />
           <SmallMultiple
             title="Clicks"
             points={data.timeseries.points.map((p) => ({ date: p.date, value: p.clicks }))}
             color="var(--series-1)"
             format="integer"
-            grainLabel="report date · Meta"
+            grainLabel={`report date · ${marketingProvider}`}
           />
           <SmallMultiple
             title="Attributed installs"
@@ -462,7 +470,7 @@ export default async function CommandCenterPage({
             }))}
             color="var(--series-2)"
             format="integer"
-            grainLabel="install date · MMP"
+            grainLabel={`install date · ${attributionProvider}`}
           />
           <SmallMultiple
             title="Attributed revenue"
@@ -473,7 +481,7 @@ export default async function CommandCenterPage({
             color="var(--series-3)"
             format="currency"
             currency={currency}
-            grainLabel="event date · MMP"
+            grainLabel={`event date · ${attributionProvider}`}
           />
         </div>
       </Card>
@@ -481,14 +489,14 @@ export default async function CommandCenterPage({
       {/* ---------------------------------------------------- 4. campaigns */}
       <div className="section-title">4 — Campaigns</div>
       <Card
-        hint={`${data.campaigns.total} campaign${data.campaigns.total === 1 ? '' : 's'} with delivery in range. Attribution columns are populated only where the campaign mapping is authoritative.`}
+        hint={`${data.campaigns.total} campaign${data.campaigns.total === 1 ? '' : 's'} with delivery in range. Attribution columns are populated where the campaign mapping is authoritative, or a deterministic high-confidence match.`}
       >
         <div className="table-wrap">
           <table>
             <thead>
               <tr>
                 <th>Campaign</th>
-                <th>Meta campaign ID</th>
+                <th>{marketingProvider} campaign ID</th>
                 <th>Mapping</th>
                 <th className="num">Spend</th>
                 <th className="num">Impressions</th>

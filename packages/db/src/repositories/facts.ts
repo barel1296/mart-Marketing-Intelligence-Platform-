@@ -710,6 +710,7 @@ export async function upsertAttributionRevenue(
     'campaign_name',
     'country',
     'platform',
+    'cohort_age_days',
     'currency',
     'revenue',
     'dimension_hash',
@@ -732,6 +733,7 @@ export async function upsertAttributionRevenue(
         metric.campaignName,
         metric.country,
         metric.platform,
+        metric.cohortAgeDays ?? null,
         metric.currency,
         metric.revenue,
         dimensionHash({
@@ -744,6 +746,14 @@ export async function upsertAttributionRevenue(
           country: metric.country,
           platform: metric.platform,
           currency: metric.currency,
+          // Included only when present. The hash covers every key it is given,
+          // including null ones, so adding the field unconditionally would
+          // change the identity of every revenue row already stored and the
+          // next sync would insert duplicates beside them. Cohort rows get a
+          // distinct identity; event-date rows keep the one they have.
+          ...(metric.cohortAgeDays === null || metric.cohortAgeDays === undefined
+            ? {}
+            : { cohort_age_days: metric.cohortAgeDays }),
         }),
         scope.syncRunId,
       );
