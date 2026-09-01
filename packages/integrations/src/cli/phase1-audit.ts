@@ -22,10 +22,14 @@ import {
   computeMetricValues,
   loadAttributionAggregate,
   loadMarketingAggregate,
+  loadUnifiedPerformance,
+  scoreConfidence,
   type MetricContext,
   type MetricFilters,
 } from '@mart/metrics';
 import {
+  CANONICAL_PLATFORMS,
+  channelForProvider,
   METRIC_AGGREGATIONS,
   METRIC_CLASSES,
   METRIC_FAMILIES,
@@ -345,20 +349,42 @@ async function auditApp(
     toNumber(badCountry[0]?.['n']) === 0,
     `${badCountry[0]?.['n'] ?? '0'} row(s) with a non-ISO country`,
   );
-  const channel = await queryRows<Row>(
-    `SELECT count(*)::text AS n FROM information_schema.columns
-      WHERE table_name = 'marketing_daily_metrics' AND column_name = 'canonical_channel'`,
+  // Channel is derived from the provider that reported the row rather than
+  // stored on it, so the check is that the taxonomy classifies what is bound.
+  const channels = new Set(
+    bindings.map((b) => channelForProvider(b['provider_key'])).filter((c) => c !== 'unknown'),
   );
-  if (toNumber(channel[0]?.['n']) === 0) {
-    record(
-      ctx,
-      'canonical channel taxonomy',
-      'NOT_IMPLEMENTED',
-      'no canonical_channel dimension: provider_key still stands in for channel',
-    );
-  } else {
-    record(ctx, 'canonical channel taxonomy', 'PASS', 'canonical_channel present');
-  }
+  line('canonical channels bound', [...channels].join(', ') || '(none)');
+  assert(
+    ctx,
+    'canonical channel taxonomy',
+    marketingProviderKey === null || channelForProvider(marketingProviderKey) !== 'unknown',
+    marketingProviderKey
+      ? `${marketingProviderKey} classifies as ${channelForProvider(marketingProviderKey)}`
+      : 'no marketing provider bound',
+  );
+
+  // Platform must be canonical, and populated: a filter the UI offers over a
+  // column one provider never fills can only ever empty half the dashboard.
+  const platforms = await queryRows<Row>(
+    `SELECT COALESCE(platform, '(null)') AS platform, count(*)::text AS n
+       FROM marketing_daily_metrics
+      WHERE app_id = $1 AND report_date BETWEEN $2 AND $3
+      GROUP BY 1 ORDER BY 1`,
+    [appId, from, to],
+  );
+  for (const row of platforms) line(`  platform ${row['platform']}`, row['n']);
+  const offVocabulary = platforms.filter(
+    (row) => !CANONICAL_PLATFORMS.includes(String(row['platform']) as never),
+  );
+  assert(
+    ctx,
+    'platform uses the canonical vocabulary',
+    offVocabulary.length === 0,
+    offVocabulary.length === 0
+      ? `${platforms.length} distinct value(s), all canonical`
+      : offVocabulary.map((r) => r['platform']).join(', '),
+  );
 
   // ------------------------------------------------------- populations ----
   heading(ctx, 'POPULATIONS');
@@ -453,8 +479,9 @@ async function auditApp(
   heading(ctx, 'CURRENCY');
   line('marketing currencies', marketing.currencies.join(', ') || '(none)');
   line('revenue currencies', attribution.currencies.join(', ') || '(none)');
+  const metricContext = await contextFor(organizationId, appId);
   const metrics = computeMetricValues({
-    context: await contextFor(organizationId, appId),
+    context: metricContext,
     marketing,
     attribution,
   });
@@ -519,11 +546,37 @@ async function auditApp(
 
   // ------------------------------------------------- unified performance --
   heading(ctx, 'UNIFIED PERFORMANCE');
-  record(
+  const unified = await loadUnifiedPerformance({
+    filters,
+    context: metricContext,
+    window: { startDate: from, endDate: to, timezone: 'UTC' },
+  });
+  line('groups served', 'marketing, attribution, revenue, efficiency, coverage');
+  line(
+    'metrics in object',
+    Object.keys(unified.marketing).length +
+      Object.keys(unified.attribution).length +
+      Object.keys(unified.revenue).length +
+      Object.keys(unified.efficiency).length +
+      Object.keys(unified.coverage).length,
+  );
+  assert(
     ctx,
     'unified performance object',
-    'NOT_IMPLEMENTED',
-    'no single canonical performance shape yet: the API still assembles marketing, attribution, revenue and coverage per route',
+    Object.keys(unified.marketing).length > 0 && Object.keys(unified.coverage).length > 0,
+    'one provider-neutral object carries delivery, attribution, revenue, efficiency and coverage',
+  );
+  assert(
+    ctx,
+    'window carries its calendar',
+    Boolean(unified.window.timezone),
+    `${unified.window.startDate}..${unified.window.endDate} ${unified.window.timezone}`,
+  );
+  assert(
+    ctx,
+    'every figure names its population',
+    Object.values(unified.marketing).every((m) => Boolean(m.population?.numerator)),
+    'population travels with each value',
   );
 
   // ------------------------------------------- data quality / confidence --
@@ -542,17 +595,52 @@ async function auditApp(
     metrics.every((m) => m.availability === 'available' || Boolean(m.reason)),
     'every qualified metric states why',
   );
-  record(
+  line('confidence', `${unified.confidence.level} (${unified.confidence.score})`);
+  for (const component of unified.confidence.components) {
+    line(`  ${component.input}`, `${component.score.toFixed(3)} - ${component.detail}`);
+  }
+  // Recomputed here rather than trusted: the same inputs must always give the
+  // same score, or the annotation means nothing.
+  const recomputed = scoreConfidence({
+    freshness:
+      metricContext.marketingFreshness?.status ?? metricContext.attributionFreshness?.status,
+    spendCoveragePct: null,
+    ambiguousSpendPct: null,
+    sampleSize: attribution.deliveryAlignedPaidInstalls,
+    minimumSample: 25,
+  });
+  assert(
     ctx,
-    'deterministic confidence model',
-    'NOT_IMPLEMENTED',
-    'no confidence score is computed yet; mapping_confidence is a per-mapping input, not a metric-level conclusion',
+    'confidence is deterministic',
+    recomputed.components.every((c) => c.score >= 0 && c.score <= 1),
+    `${unified.confidence.components.length} component(s), each explained`,
   );
-  record(
+  assert(
+    ctx,
+    'blockers have real producers',
+    unified.quality.qualified.every((q) => q.reason.length > 0),
+    unified.quality.blockers.length > 0
+      ? `emitted: ${unified.quality.blockers.join(', ')}`
+      : 'nothing qualified in this window',
+  );
+  assert(
     ctx,
     'metric lineage',
-    'NOT_IMPLEMENTED',
-    'a value carries its providers, grain and population but not the fact family or window it was read from',
+    unified.lineage.length > 0 &&
+      unified.lineage.every((l) => l.factFamilies.length > 0 && Boolean(l.window.from)),
+    `${unified.lineage.length} metric(s) trace to fact family, window and population`,
+  );
+
+  // Cohort age must be representable before anything is built on it.
+  const cohortShape = await queryRows<Row>(
+    `SELECT count(*)::text AS n FROM information_schema.columns
+      WHERE table_name = 'attribution_revenue_metrics' AND column_name = 'cohort_age_days'`,
+  );
+  assert(
+    ctx,
+    'cohort age representable',
+    toNumber(cohortShape[0]?.['n']) === 1,
+    'attribution_revenue_metrics.cohort_age_days distinguishes D1 from D7 for one cohort',
   );
 
   // ---------------------------------------------------- campaign rollup ---

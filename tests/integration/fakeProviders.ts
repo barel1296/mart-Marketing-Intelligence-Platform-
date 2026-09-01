@@ -1,5 +1,5 @@
 import type { CanonicalAttributionBatch, CanonicalMarketingBatch, IsoDate } from '@mart/shared';
-import { ProviderError } from '@mart/shared';
+import { ProviderError, normalizePlatform } from '@mart/shared';
 import {
   clearProviderOverrides,
   declare,
@@ -219,7 +219,7 @@ class FakeMetaProvider implements MarketingNetworkProvider {
         externalAdId: null,
         externalCreativeId: null,
         country: row.country ?? null,
-        platform: row.platform ?? null,
+        platform: normalizePlatform(row.platform),
         currency: 'USD',
         spend: row.spend,
         impressions: row.impressions,
@@ -308,7 +308,7 @@ class FakeAttributionProvider implements AttributionProvider {
         externalCreativeId: null,
         creativeName: null,
         country: row.country ?? null,
-        platform: row.platform ?? 'ios',
+        platform: normalizePlatform(row.platform ?? 'ios'),
         attributionCertainty: 'deterministic' as const,
         attributedInstalls: row.installs,
         attributedClicks: null,
@@ -357,7 +357,7 @@ class FakeAttributionProvider implements AttributionProvider {
       externalCampaignId: row.campaignId,
       campaignName: row.campaignName,
       country: row.country ?? null,
-      platform: row.platform ?? 'ios',
+      platform: normalizePlatform(row.platform ?? 'ios'),
       currency: 'USD',
       revenue: row.revenue ?? 0,
     }));

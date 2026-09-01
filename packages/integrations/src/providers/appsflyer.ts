@@ -345,7 +345,11 @@ export class AppsFlyerAttributionProvider implements AttributionProvider {
         externalCreativeId: null,
         creativeName: null,
         country: normalizeCountryCode(pick(row, ['country_code', 'geo', 'country'])),
-        platform: null,
+        // This aggregate report carries no device column. The row exists and
+        // MART does not know its platform, which is 'unknown' - not NULL, which
+        // would read as "nobody looked" and make a platform filter behave
+        // differently here than on every other stream.
+        platform: canonicalPlatform(null),
         attributionCertainty: 'unknown',
         attributedInstalls: csvNumber(row['installs'] ?? row['total_installs']),
         attributedClicks: optionalNumber(row['clicks']),
