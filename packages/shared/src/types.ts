@@ -219,6 +219,46 @@ export const AUTHORITATIVE_MAPPING_STATUSES: readonly MappingStatus[] = [
 export const OPERATIONAL_MAPPING_CONFIDENCE = 0.9;
 
 /**
+ * Canonical platform vocabulary.
+ *
+ * Deliberately tiny and stable. Providers spell the same device a dozen ways -
+ * iphone, ipad, android_smartphone, android_tablet, mobile_web - and a
+ * dimension that admits every spelling is not a dimension anyone can filter on.
+ *
+ * `unknown` is a real member, not a gap. A provider that does not report the
+ * device still produced the row, and recording that as `unknown` rather than
+ * NULL keeps "we asked and it does not say" distinct from "nobody looked" -
+ * which is what lets a platform filter behave predictably across providers
+ * instead of silently emptying one side of the dashboard.
+ */
+export const CANONICAL_PLATFORMS = ['ios', 'android', 'web', 'unknown'] as const;
+export type CanonicalPlatform = (typeof CANONICAL_PLATFORMS)[number];
+
+/**
+ * Map a provider's platform spelling onto the canonical vocabulary.
+ *
+ * One definition for every adapter. Two normalizers had already diverged - one
+ * passed unrecognised values through as free text, the other dropped them - so
+ * the same device could be stored two ways depending on which stream carried
+ * it, and neither could be filtered reliably.
+ *
+ * Anything unrecognised becomes `unknown` rather than being passed through.
+ * Inventing a canonical value from a string MART does not understand is how a
+ * filter starts silently excluding real rows.
+ */
+export function normalizePlatform(value: string | null | undefined): CanonicalPlatform {
+  if (!value) return 'unknown';
+  const lower = value.trim().toLowerCase();
+  if (!lower) return 'unknown';
+  // iPhone, iPad and iPod are all iOS. The test also catches "ios_app",
+  // "iOS 17" and Meta's impression_device spellings.
+  if (/(^|[^a-z])i(os|phone|pad|pod)/.test(lower) || lower.startsWith('ios')) return 'ios';
+  if (lower.includes('android')) return 'android';
+  if (lower.includes('web') || lower.includes('desktop') || lower.includes('browser')) return 'web';
+  return 'unknown';
+}
+
+/**
  * Governed-metric availability.
  *
  * `partial`, `stale` and `blocked` all carry a reason, and so does

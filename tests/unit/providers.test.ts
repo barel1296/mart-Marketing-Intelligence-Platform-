@@ -183,8 +183,94 @@ describe('Meta Ads adapter', () => {
     });
     const result = await provider.syncPerformance(params);
     expect(result.batch.dailyMetrics).toHaveLength(1);
-    expect(result.warnings.join(' ')).toMatch(/country breakdown/i);
+    expect(result.warnings.join(' ')).toMatch(/country/i);
     expect(call).toBeGreaterThan(1);
+    // Nothing was reported about the device, so the row says so rather than
+    // claiming a platform it does not know.
+    expect(result.batch.dailyMetrics[0]?.platform).toBe('unknown');
+  });
+
+  it('keeps the country split when only the device breakdown is refused', async () => {
+    // The common case: an account that reports country but not
+    // impression_device. Dropping both because one was unavailable would be a
+    // worse answer than either, so MART steps back one dimension at a time.
+    const requested: string[] = [];
+    const impl = async (url: string): Promise<Response> => {
+      requested.push(url);
+      if (url.includes('impression_device')) {
+        return new Response(JSON.stringify({ error: { message: 'unsupported breakdown' } }), {
+          status: 400,
+        });
+      }
+      return new Response(
+        JSON.stringify({
+          data: [
+            {
+              date_start: '2026-08-20',
+              campaign_id: '900',
+              country: 'US',
+              spend: '1',
+              impressions: '10',
+              clicks: '1',
+            },
+          ],
+        }),
+      );
+    };
+    const provider = new MetaAdsProvider({
+      credentials: { kind: 'meta_ads', accessToken: 't'.repeat(30) },
+      baseUrl: 'https://graph.example.com',
+      apiVersion: 'v21.0',
+      http: client(impl, 'meta_ads'),
+    });
+    const result = await provider.syncPerformance(params);
+    const row = result.batch.dailyMetrics[0];
+    expect(row?.country).toBe('US');
+    expect(row?.platform).toBe('unknown');
+    expect(result.warnings.join(' ')).toMatch(/device/i);
+    // It asked for both first, then for country alone - never for neither.
+    expect(requested.some((u) => u.includes('impression_device'))).toBe(true);
+    expect(requested.some((u) => u.includes('breakdowns=country&') || u.endsWith('country'))).toBe(
+      true,
+    );
+  });
+
+  it('maps the device Meta reports onto the canonical platform vocabulary', async () => {
+    const impl = async (): Promise<Response> =>
+      new Response(
+        JSON.stringify({
+          data: [
+            {
+              date_start: '2026-08-20',
+              campaign_id: '900',
+              country: 'US',
+              impression_device: 'iphone',
+              spend: '1',
+              impressions: '10',
+              clicks: '1',
+            },
+            {
+              date_start: '2026-08-20',
+              campaign_id: '900',
+              country: 'US',
+              impression_device: 'android_smartphone',
+              spend: '2',
+              impressions: '20',
+              clicks: '2',
+            },
+          ],
+        }),
+      );
+    const provider = new MetaAdsProvider({
+      credentials: { kind: 'meta_ads', accessToken: 't'.repeat(30) },
+      baseUrl: 'https://graph.example.com',
+      apiVersion: 'v21.0',
+      http: client(impl, 'meta_ads'),
+    });
+    const rows = (await provider.syncPerformance(params)).batch.dailyMetrics;
+    expect(rows.map((r) => r.platform)).toEqual(['ios', 'android']);
+    // The provider's own spelling survives beside the canonical value.
+    expect(rows.map((r) => r.nativePlatform)).toEqual(['iphone', 'android_smartphone']);
   });
 });
 

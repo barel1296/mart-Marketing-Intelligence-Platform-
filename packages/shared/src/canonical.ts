@@ -65,7 +65,15 @@ export type CanonicalMarketingDailyMetric = {
   externalAdId: string | null;
   externalCreativeId: string | null;
   country: string | null;
+  /** Canonical vocabulary: ios | android | web | unknown. Never free text. */
   platform: string | null;
+  /**
+   * What the provider actually called it - "iphone", "android_smartphone".
+   * Kept beside the canonical value because normalization is lossy and the
+   * original is what a support question is asked about. It is an attribute,
+   * not a dimension: it never enters the identity hash.
+   */
+  nativePlatform?: string | null;
   currency: string;
   spend: number;
   impressions: number;

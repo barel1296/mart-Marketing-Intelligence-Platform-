@@ -5,6 +5,7 @@ import type {
   CanonicalAttributionRevenueMetric,
   IsoDate,
 } from '@mart/shared';
+import { normalizePlatform as canonicalPlatform } from '@mart/shared';
 import { isProviderError, ProviderError } from '@mart/shared';
 import { ProviderHttpClient, userMessageFor } from '../http.js';
 import { declare, type CapabilityDeclaration } from '../capabilities.js';
@@ -517,12 +518,13 @@ export function normalizeCountryCode(value: string | null): string | null {
   return /^[A-Z]{2}$/.test(upper) ? upper : null;
 }
 
-export function normalizePlatform(value: string | null): string | null {
-  if (!value) return null;
-  const lower = value.trim().toLowerCase();
-  if (lower.includes('ios')) return 'ios';
-  if (lower.includes('android')) return 'android';
-  return lower || null;
+/**
+ * Re-exported for the tests that pin this adapter's normalization, but the
+ * rule itself lives in @mart/shared so every adapter agrees on what "ios"
+ * means.
+ */
+export function normalizePlatform(value: string | null): string {
+  return canonicalPlatform(value);
 }
 
 function optionalNumber(value: string | undefined): number | null {

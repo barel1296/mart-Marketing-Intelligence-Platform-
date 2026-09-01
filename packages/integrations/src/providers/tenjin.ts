@@ -4,7 +4,12 @@ import type {
   CanonicalAttributionRevenueMetric,
   IsoDate,
 } from '@mart/shared';
-import { ProviderError, SENSITIVE_KEY_PATTERN, isProviderError } from '@mart/shared';
+import {
+  ProviderError,
+  SENSITIVE_KEY_PATTERN,
+  isProviderError,
+  normalizePlatform,
+} from '@mart/shared';
 import { getLogger } from '@mart/observability';
 import { ProviderHttpClient, userMessageFor } from '../http.js';
 import { declare, type CapabilityDeclaration } from '../capabilities.js';
@@ -1261,13 +1266,14 @@ function countryCode(value: string | null): string | null {
   return /^[A-Z]{2}$/.test(upper) ? upper : null;
 }
 
-function platform(value: string | null): string | null {
-  if (!value) return null;
-  const lower = value.trim().toLowerCase();
-  if (lower.includes('ios')) return 'ios';
-  if (lower.includes('android')) return 'android';
-  return lower;
-}
+/**
+ * The canonical normalizer, shared with every other adapter.
+ *
+ * This file previously carried its own, which passed unrecognised values
+ * through as free text while the MMP's other normalizer dropped them - so the
+ * same device could land two different ways depending on the stream.
+ */
+const platform = normalizePlatform;
 
 /**
  * Candidate field names for each identifying attribute, most specific first.

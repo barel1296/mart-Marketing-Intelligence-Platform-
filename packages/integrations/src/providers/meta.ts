@@ -7,7 +7,7 @@ import type {
   CanonicalMarketingDailyMetric,
   IsoDate,
 } from '@mart/shared';
-import { ProviderError, isProviderError } from '@mart/shared';
+import { ProviderError, isProviderError, normalizePlatform } from '@mart/shared';
 import { getLogger } from '@mart/observability';
 import { ProviderHttpClient, userMessageFor } from '../http.js';
 import { declare, type CapabilityDeclaration } from '../capabilities.js';
@@ -86,6 +86,8 @@ type MetaAd = {
 };
 
 type MetaInsightRow = {
+  /** Present only when the impression_device breakdown was requested. */
+  impression_device?: string;
   date_start?: string;
   date_stop?: string;
   account_id?: string;
@@ -307,7 +309,9 @@ export class MetaAdsProvider implements MarketingNetworkProvider {
         ad_id: true,
         creative: true,
         creative_id: true,
-        platform: false,
+        // Reported through the impression_device breakdown, where the account
+        // allows it; the run says so when it does not.
+        platform: true,
         impressions: true,
         clicks: true,
         link_clicks: true,
@@ -454,28 +458,51 @@ export class MetaAdsProvider implements MarketingNetworkProvider {
     return { batch, pagesFetched, rowsFetched, rowsRejected: 0, warnings, latestDataDate: null };
   }
 
+  /**
+   * Delivery, split as finely as the account permits.
+   *
+   * MART asks for country and device together and steps back one dimension at a
+   * time if the account refuses, rather than dropping both on the first
+   * rejection - losing the country split because the device split was
+   * unavailable would be a worse answer than either. Each step says in the run
+   * what it gave up, because a narrower report presented silently is
+   * indistinguishable from an account with no such traffic.
+   */
   async syncPerformance(params: SyncParams): Promise<SyncResult<CanonicalMarketingBatch>> {
-    const attempt = await this.fetchInsights(params, true).catch(async (error) => {
-      // Degrade to no breakdown rather than failing the window outright.
-      if (isProviderError(error) && error.errorClass === 'invalid_request') {
-        getLogger().warn(
-          { provider: 'meta_ads', account: params.externalAccountId },
-          'country breakdown rejected; retrying without breakdown',
-        );
-        const fallback = await this.fetchInsights(params, false);
-        fallback.warnings.push(
-          'Meta rejected the country breakdown for this account; delivery data was imported without a country dimension, superseding any country-split rows already stored for the same campaign-days.',
-        );
-        return fallback;
+    const ladder: ReadonlyArray<{ breakdowns: readonly string[]; lost: string | null }> = [
+      { breakdowns: ['country', 'impression_device'], lost: null },
+      { breakdowns: ['country'], lost: 'device' },
+      { breakdowns: [], lost: 'country and device' },
+    ];
+
+    let lastError: unknown = null;
+    for (const step of ladder) {
+      try {
+        const result = await this.fetchInsights(params, step.breakdowns);
+        if (step.lost) {
+          result.warnings.push(
+            `Meta rejected the ${step.lost} breakdown for this account; delivery was imported without ${step.lost === 'device' ? 'a device dimension, so platform reads "unknown"' : 'country or device dimensions'}. Rows already stored at a finer split for these campaign-days are superseded.`,
+          );
+          getLogger().warn(
+            { provider: 'meta_ads', account: params.externalAccountId, lost: step.lost },
+            'insights breakdown rejected; retried with fewer dimensions',
+          );
+        }
+        return result;
+      } catch (error) {
+        // Only a rejected request means "this account cannot do that". An
+        // outage, a throttle or an expired token says nothing about the
+        // breakdown and must not quietly coarsen the data.
+        if (!isProviderError(error) || error.errorClass !== 'invalid_request') throw error;
+        lastError = error;
       }
-      throw error;
-    });
-    return attempt;
+    }
+    throw lastError;
   }
 
   private async fetchInsights(
     params: SyncParams,
-    withCountry: boolean,
+    breakdowns: readonly string[],
   ): Promise<SyncResult<CanonicalMarketingBatch>> {
     const batch = emptyMarketingBatch();
     const warnings: string[] = [];
@@ -490,7 +517,7 @@ export class MetaAdsProvider implements MarketingNetworkProvider {
       time_range: JSON.stringify({ since: params.from, until: params.to }),
       time_increment: 1,
       limit: PAGE_LIMIT,
-      ...(withCountry ? { breakdowns: 'country' } : {}),
+      ...(breakdowns.length > 0 ? { breakdowns: breakdowns.join(',') } : {}),
     };
 
     for await (const page of this.paginate<MetaInsightRow>(
@@ -611,7 +638,13 @@ export function toCanonicalMetric(
     externalAdId: row.ad_id ?? null,
     externalCreativeId: null,
     country: normalizeCountry(row.country),
-    platform: null,
+    // impression_device is the field that carries the device: iphone, ipad,
+    // android_smartphone, desktop. Absent when the breakdown was not requested
+    // or the account refused it, and normalizePlatform turns that into
+    // 'unknown' - a row MART did produce, whose device it does not know, which
+    // is a different claim from no row at all.
+    platform: normalizePlatform(row.impression_device ?? null),
+    nativePlatform: row.impression_device ?? null,
     currency: row.account_currency ?? params.currency,
     spend: numberOrZero(row.spend),
     impressions: numberOrZero(row.impressions),

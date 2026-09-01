@@ -321,66 +321,70 @@ export function marketingDimensionHash(
 }
 
 /**
- * Remove rows the incoming write supersedes by changing dimensional grain.
+ * Remove the rows an incoming write supersedes by reporting a campaign-day
+ * differently.
  *
- * `dimension_hash` includes every dimension, country among them, so the same
- * campaign-day fetched with a country breakdown and fetched without one lands
- * as two different keys. Nothing about the upsert makes the second replace the
- * first, and the metric queries sum delivery by date with no country predicate,
- * so both copies are counted: spend and CPM double, ROAS halves. A provider
- * that degrades a breakdown mid-backfill - or an account that gains one - is
- * enough to trigger it.
+ * `dimension_hash` includes every dimension, so the same campaign-day fetched
+ * with a country breakdown and fetched without one lands as two different keys.
+ * Nothing about the upsert makes the second replace the first, and the metric
+ * queries sum delivery by date with no country or platform predicate, so both
+ * copies are counted: spend and CPM double, ROAS halves. A provider that
+ * degrades a breakdown mid-backfill - or an account that gains one, or an
+ * adapter that starts reporting a dimension it used to leave null - is enough
+ * to trigger it.
  *
- * The rule is narrow on purpose. Within one campaign-day a fetch reports at
- * exactly one grain, so a stored row for that same campaign-day at the opposite
- * grain is a strictly superseded duplicate of the measure now arriving. Rows on
- * other days, other campaigns, and other countries at the same grain are left
- * alone; a batch that somehow carries both grains for one campaign-day is
- * ambiguous, so that key is skipped rather than guessed at.
+ * The rule: a fetch reports a campaign-day completely, so any stored row for
+ * that campaign-day which this write did not produce is a superseded variant of
+ * it. Scoped to exactly the campaign-days present in the write, so other days
+ * and other campaigns are untouched, and it holds for any dimensional change
+ * rather than only the country case it was first written for.
+ *
+ * Runs after the insert, so the rows that survive are the ones just written.
  */
-async function supersedeMarketingGrainConflicts(
+async function supersedeRestatedDimensions(
   scope: FactScope,
   metrics: readonly CanonicalMarketingDailyMetric[],
   client?: Queryable,
 ): Promise<number> {
-  const grainByKey = new Map<
+  const byCampaignDay = new Map<
     string,
     {
       reportDate: string;
       account: string | null;
       campaign: string | null;
-      countrySeen: boolean;
-      nullSeen: boolean;
+      hashes: string[];
     }
   >();
   for (const metric of metrics) {
     const key = `${metric.reportDate}\u0000${metric.externalAccountId ?? ''}\u0000${metric.externalCampaignId ?? ''}`;
-    const entry = grainByKey.get(key) ?? {
+    const entry = byCampaignDay.get(key) ?? {
       reportDate: metric.reportDate,
       account: metric.externalAccountId,
       campaign: metric.externalCampaignId,
-      countrySeen: false,
-      nullSeen: false,
+      hashes: [],
     };
-    if (metric.country === null) entry.nullSeen = true;
-    else entry.countrySeen = true;
-    grainByKey.set(key, entry);
+    entry.hashes.push(marketingDimensionHash(scope, metric));
+    byCampaignDay.set(key, entry);
   }
 
   let superseded = 0;
-  for (const entry of grainByKey.values()) {
-    // Both grains in one batch: MART cannot tell which one restates the other.
-    if (entry.countrySeen === entry.nullSeen) continue;
-    const removeCountried = entry.nullSeen;
+  for (const entry of byCampaignDay.values()) {
     const rows = await queryRows<{ id: string }>(
       `DELETE FROM marketing_daily_metrics
         WHERE connection_id = $1 AND app_id = $2
           AND report_date = $3
           AND external_account_id IS NOT DISTINCT FROM $4
           AND external_campaign_id IS NOT DISTINCT FROM $5
-          AND country IS ${removeCountried ? 'NOT NULL' : 'NULL'}
+          AND dimension_hash <> ALL($6::text[])
         RETURNING id`,
-      [scope.connectionId, scope.appId, entry.reportDate, entry.account, entry.campaign],
+      [
+        scope.connectionId,
+        scope.appId,
+        entry.reportDate,
+        entry.account,
+        entry.campaign,
+        entry.hashes,
+      ],
       client,
     );
     superseded += rows.length;
@@ -401,7 +405,6 @@ export async function upsertMarketingDailyMetrics(
   client?: Queryable,
 ): Promise<UpsertOutcome> {
   const outcome = emptyOutcome();
-  outcome.superseded = await supersedeMarketingGrainConflicts(scope, metrics, client);
   const columns = [
     'organization_id',
     'app_id',
@@ -415,6 +418,7 @@ export async function upsertMarketingDailyMetrics(
     'external_creative_id',
     'country',
     'platform',
+    'native_platform',
     'currency',
     'spend',
     'impressions',
@@ -443,6 +447,7 @@ export async function upsertMarketingDailyMetrics(
         metric.externalCreativeId,
         metric.country,
         metric.platform,
+        metric.nativePlatform ?? null,
         metric.currency,
         metric.spend,
         metric.impressions,
@@ -477,6 +482,10 @@ export async function upsertMarketingDailyMetrics(
     );
     accumulate(outcome, rows);
   }
+
+  // Now that this write's rows are in place, drop any earlier variant of the
+  // same campaign-days that it replaced.
+  outcome.superseded = await supersedeRestatedDimensions(scope, metrics, client);
 
   // Attach foreign keys once the dimension rows exist. Kept as a separate pass
   // so a missing dimension row never blocks fact ingestion.
