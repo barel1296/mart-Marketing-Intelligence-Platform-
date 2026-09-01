@@ -1,12 +1,13 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import {
-  addDays,
   AppError,
-  toIsoDate,
+  resolveReportingWindow,
   CANONICAL_CHANNELS,
   CANONICAL_PLATFORMS,
   MAPPING_STATUSES,
+  type IsoDate,
+  type ReportingWindow,
 } from '@mart/shared';
 import { auditRepo, dataQualityRepo, integrationsRepo, mappingsRepo, syncRepo } from '@mart/db';
 import { campaignCoverage, providerEndpointInfo, reconcileCampaigns } from '@mart/integrations';
@@ -40,12 +41,28 @@ const filterQuery = z.object({
   marketingAccountExternalId: z.string().max(200).optional(),
 });
 
-/** Default window: the last 7 complete days plus today. */
-function resolveRange(query: { from?: string; to?: string }): { from: string; to: string } {
-  const to = query.to ?? toIsoDate(new Date());
-  const from = query.from ?? addDays(to, -6);
-  if (from > to) throw new AppError('validation_failed', '`from` must not be after `to`');
-  return { from, to };
+/**
+ * Default window: the last 7 days, in the APP's reporting calendar.
+ *
+ * "Today" used to mean UTC today even where the app declared a timezone, so an
+ * app in America/Los_Angeles asking for the last week at 17:00 local was handed
+ * a window ending tomorrow - a day with no data in it, quietly diluting every
+ * average across it.
+ *
+ * Returns the named window so the calendar travels with the dates; callers that
+ * still speak from/to destructure it. Provider-reported daily facts are never
+ * re-bucketed by this: the timezone decides what MART asks for, not what the
+ * provider reported.
+ */
+function resolveWindow(
+  query: { from?: string; to?: string },
+  timezone: string,
+): ReportingWindow & { from: IsoDate; to: IsoDate } {
+  const window = resolveReportingWindow(query, timezone);
+  if (window.startDate > window.endDate) {
+    throw new AppError('validation_failed', '`from` must not be after `to`');
+  }
+  return { ...window, from: window.startDate, to: window.endDate };
 }
 
 export async function registerAnalyticsRoutes(server: FastifyInstance): Promise<void> {
@@ -66,7 +83,7 @@ export async function registerAnalyticsRoutes(server: FastifyInstance): Promise<
     );
     setNoStore(reply);
 
-    const range = resolveRange(query);
+    const range = resolveWindow(query, app.timezone);
     // The window is what makes the selected-period coverage metrics computable.
     // Omitting it here left them permanently unavailable, explaining themselves
     // with "no reporting period" on a request that had resolved one two lines
@@ -126,7 +143,7 @@ export async function registerAnalyticsRoutes(server: FastifyInstance): Promise<
     );
     setNoStore(reply);
 
-    const range = resolveRange(query);
+    const range = resolveWindow(query, app.timezone);
     const { state } = await buildMetricContext(context.organizationId, app);
     const series = await loadTimeseries({
       organizationId: context.organizationId,
@@ -162,7 +179,7 @@ export async function registerAnalyticsRoutes(server: FastifyInstance): Promise<
     );
     setNoStore(reply);
 
-    const range = resolveRange(query);
+    const range = resolveWindow(query, app.timezone);
     const { state } = await buildMetricContext(context.organizationId, app);
     if (!state.marketingProviderKey) {
       return {
@@ -207,7 +224,7 @@ export async function registerAnalyticsRoutes(server: FastifyInstance): Promise<
       );
       setNoStore(reply);
 
-      const range = resolveRange(query);
+      const range = resolveWindow(query, app.timezone);
       const { state } = await buildMetricContext(context.organizationId, app);
       if (!state.marketingProviderKey || !state.attributionProviderKey) {
         return {
@@ -408,7 +425,7 @@ export async function registerAnalyticsRoutes(server: FastifyInstance): Promise<
       );
       setNoStore(reply);
 
-      const range = resolveRange(query);
+      const range = resolveWindow(query, app.timezone);
       // One coverage computation for the whole response: the KPI cards and the
       // reconciliation panel must be the same numbers, not two calls that can
       // drift apart.

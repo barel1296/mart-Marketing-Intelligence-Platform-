@@ -69,3 +69,73 @@ export function minutesSince(
   if (Number.isNaN(t)) return null;
   return (now.getTime() - t) / 60000;
 }
+
+/**
+ * A reporting period, and the calendar it is expressed in.
+ *
+ * The dates travel with their timezone because a date without one is not a
+ * point in time anybody can agree on: "2026-09-01" in UTC and in
+ * America/Los_Angeles name overlapping but different spans, and an app whose
+ * reporting day rolls over at local midnight will disagree with a UTC "today"
+ * for seven hours out of every twenty-four.
+ *
+ * MART's storage rule, which this type exists to make explicit:
+ *
+ *  - Timestamps (observed_at, occurred_at, sync times) are stored in UTC.
+ *  - Provider-reported daily facts keep the PROVIDER's reporting date exactly
+ *    as supplied. They are not re-bucketed into another calendar: a network's
+ *    "spend on 2026-09-01" is a statement about that network's reporting day,
+ *    and shifting it would invent numbers the provider never reported.
+ *  - The app's reporting timezone decides what "today" and "yesterday" mean
+ *    when MART chooses a window on the user's behalf.
+ *
+ * So a window is compared against provider dates as written, and the timezone
+ * is metadata that says whose calendar produced the bounds - not an instruction
+ * to convert the facts.
+ */
+export type ReportingWindow = {
+  startDate: IsoDate;
+  endDate: IsoDate;
+  /** IANA zone name, e.g. 'UTC' or 'America/Los_Angeles'. */
+  timezone: string;
+};
+
+/**
+ * Today's calendar date in a given zone.
+ *
+ * `new Date().toISOString().slice(0,10)` is UTC today, which is the wrong day
+ * for a good part of the world for a good part of the day. An app in
+ * America/Los_Angeles asking for "the last 7 days" at 17:00 local would
+ * otherwise be handed a window ending tomorrow.
+ */
+export function todayInTimezone(timezone: string, now: Date = new Date()): IsoDate {
+  try {
+    // en-CA renders as YYYY-MM-DD, which is the format MART stores.
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(now);
+  } catch {
+    // An unknown zone must not take the request down; UTC is the documented
+    // fallback and the window still states which calendar it used.
+    return toIsoDate(now);
+  }
+}
+
+/**
+ * Resolve an explicit or defaulted window in the app's reporting calendar.
+ *
+ * Bounds are inclusive, unchanged: every query compares with BETWEEN, and the
+ * end date is a day that is in the report, not a boundary before it.
+ */
+export function resolveReportingWindow(
+  input: { from?: string | undefined; to?: string | undefined },
+  timezone: string,
+  now: Date = new Date(),
+): ReportingWindow {
+  const endDate = input.to ?? todayInTimezone(timezone, now);
+  const startDate = input.from ?? addDays(endDate, -6);
+  return { startDate, endDate, timezone };
+}
