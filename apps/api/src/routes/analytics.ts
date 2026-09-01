@@ -1,6 +1,13 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { addDays, AppError, toIsoDate, MAPPING_STATUSES } from '@mart/shared';
+import {
+  addDays,
+  AppError,
+  toIsoDate,
+  CANONICAL_CHANNELS,
+  CANONICAL_PLATFORMS,
+  MAPPING_STATUSES,
+} from '@mart/shared';
 import { auditRepo, dataQualityRepo, integrationsRepo, mappingsRepo, syncRepo } from '@mart/db';
 import { campaignCoverage, providerEndpointInfo, reconcileCampaigns } from '@mart/integrations';
 import {
@@ -28,7 +35,8 @@ const filterQuery = z.object({
   from: isoDate.optional(),
   to: isoDate.optional(),
   country: z.string().length(2).optional(),
-  platform: z.string().max(20).optional(),
+  platform: z.enum(CANONICAL_PLATFORMS).optional(),
+  channel: z.enum(CANONICAL_CHANNELS).optional(),
   marketingAccountExternalId: z.string().max(200).optional(),
 });
 
@@ -75,6 +83,7 @@ export async function registerAnalyticsRoutes(server: FastifyInstance): Promise<
       to: range.to,
       country: query.country ?? null,
       platform: query.platform ?? null,
+      channel: query.channel ?? null,
       marketingProviderKey: state.marketingProviderKey,
       attributionProviderKey: state.attributionProviderKey,
       marketingAccountExternalId: query.marketingAccountExternalId ?? null,
@@ -126,6 +135,7 @@ export async function registerAnalyticsRoutes(server: FastifyInstance): Promise<
       to: range.to,
       country: query.country ?? null,
       platform: query.platform ?? null,
+      channel: query.channel ?? null,
       marketingProviderKey: state.marketingProviderKey,
       attributionProviderKey: state.attributionProviderKey,
       marketingAccountExternalId: query.marketingAccountExternalId ?? null,
@@ -170,6 +180,7 @@ export async function registerAnalyticsRoutes(server: FastifyInstance): Promise<
       to: range.to,
       country: query.country ?? null,
       platform: query.platform ?? null,
+      channel: query.channel ?? null,
       marketingProviderKey: state.marketingProviderKey,
       attributionProviderKey: state.attributionProviderKey,
       marketingAccountExternalId: query.marketingAccountExternalId ?? null,

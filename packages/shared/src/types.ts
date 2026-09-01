@@ -219,6 +219,112 @@ export const AUTHORITATIVE_MAPPING_STATUSES: readonly MappingStatus[] = [
 export const OPERATIONAL_MAPPING_CONFIDENCE = 0.9;
 
 /**
+ * Canonical channel taxonomy.
+ *
+ * The question "how much of this came from paid social" must not require
+ * knowing which networks MART happens to be connected to. Channel is the axis
+ * that survives adding TikTok next quarter; provider_key stays beside it and
+ * answers the narrower question of who reported the row.
+ *
+ * Deliberately small. A taxonomy invented ahead of the providers that would
+ * populate it is a taxonomy nobody can validate, so this covers the shapes MART
+ * actually has and leaves room for the rest.
+ */
+export const CANONICAL_CHANNELS = [
+  'paid_social',
+  'paid_search',
+  'paid_network',
+  'organic',
+  'unknown',
+] as const;
+export type CanonicalChannel = (typeof CANONICAL_CHANNELS)[number];
+
+/**
+ * What a provider is, as a channel.
+ *
+ * Declared per provider key, never inferred from a campaign name. Campaign
+ * names are free text an operator can change at any time; deriving a business
+ * dimension from them means the dimension changes when somebody renames a
+ * campaign, which is not a property of the traffic.
+ *
+ * A provider MART does not yet classify is `unknown`, not a guess: downstream,
+ * a guess is indistinguishable from knowledge.
+ */
+const PROVIDER_CHANNELS: Readonly<Record<string, CanonicalChannel>> = {
+  meta_ads: 'paid_social',
+  tiktok_ads: 'paid_social',
+  google_ads: 'paid_search',
+  unity_ads: 'paid_network',
+  applovin: 'paid_network',
+};
+
+/**
+ * How an MMP spells a network, mapped to MART's provider key.
+ *
+ * MMPs report the network that delivered the install - "facebook", "google
+ * adwords" - and never MART's key. Keeping the aliases beside the channel table
+ * means a new spelling is one line here rather than a second classification
+ * rule somewhere else.
+ */
+const MEDIA_SOURCE_PROVIDERS: Readonly<Record<string, string>> = {
+  facebook: 'meta_ads',
+  facebook_ads: 'meta_ads',
+  meta: 'meta_ads',
+  meta_ads: 'meta_ads',
+  tiktok: 'tiktok_ads',
+  tiktok_ads: 'tiktok_ads',
+  bytedance: 'tiktok_ads',
+  google: 'google_ads',
+  google_ads: 'google_ads',
+  googleadwords_int: 'google_ads',
+  adwords: 'google_ads',
+  unity: 'unity_ads',
+  unity_ads: 'unity_ads',
+  applovin: 'applovin',
+  applovin_int: 'applovin',
+};
+
+export function channelForProvider(providerKey: string | null | undefined): CanonicalChannel {
+  if (!providerKey) return 'unknown';
+  return PROVIDER_CHANNELS[providerKey] ?? 'unknown';
+}
+
+/**
+ * The channel an attributed row belongs to.
+ *
+ * Organic is its own channel rather than an absent one: unpaid traffic is a
+ * real acquisition source, and calling it `unknown` would put it in the same
+ * bucket as a provider MART has simply not classified yet.
+ */
+export function channelForMediaSource(
+  normalizedMediaSource: string | null | undefined,
+): CanonicalChannel {
+  const source = (normalizedMediaSource ?? 'organic').trim().toLowerCase();
+  if (!source || source === 'organic') return 'organic';
+  const providerKey = MEDIA_SOURCE_PROVIDERS[source];
+  return providerKey ? channelForProvider(providerKey) : 'unknown';
+}
+
+/** Whether a channel is bought traffic. Organic is the only unpaid member. */
+export function isPaidChannel(channel: CanonicalChannel): boolean {
+  return channel !== 'organic' && channel !== 'unknown';
+}
+
+/**
+ * The normalized media-source names that belong to a channel.
+ *
+ * Derived by inverting the alias table rather than written out again, so a
+ * query filtering on channel and a metric labelled with one cannot disagree.
+ */
+export function mediaSourcesForChannel(channel: CanonicalChannel): string[] {
+  if (channel === 'organic') return ['organic'];
+  return Object.entries(MEDIA_SOURCE_PROVIDERS)
+    .filter(([, providerKey]) => channelForProvider(providerKey) === channel)
+    .map(([source]) => source)
+    .sort();
+}
+
+/**
  * Canonical platform vocabulary.
  *
  * Deliberately tiny and stable. Providers spell the same device a dozen ways -

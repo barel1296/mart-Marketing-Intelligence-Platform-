@@ -1,9 +1,11 @@
 import type { IsoDate, MetricAvailability } from '@mart/shared';
+import { channelForProvider, mediaSourcesForChannel, type CanonicalChannel } from '@mart/shared';
 import {
   deliveryAlignedCampaign,
   mappedAttributionCampaign,
   notOrganic,
   operationalMapping,
+  organic,
 } from './populations.js';
 import { queryRows, toNumber } from '@mart/db';
 
@@ -41,6 +43,14 @@ export type MetricFilters = {
   to: IsoDate;
   country?: string | null;
   platform?: string | null;
+  /**
+   * Canonical channel - paid_social, paid_search, paid_network, organic.
+   *
+   * Resolved against the providers that reported the rows rather than stored on
+   * them: channel is a property of who delivered the traffic, and deriving it
+   * per row would make it drift the moment a provider's classification changed.
+   */
+  channel?: string | null;
   marketingProviderKey?: string | null;
   attributionProviderKey?: string | null;
   marketingAccountExternalId?: string | null;
@@ -165,9 +175,29 @@ function marketingWhere(filters: MetricFilters, params: unknown[]): string {
   return sql;
 }
 
+/**
+ * Whether the bound providers can serve this channel filter at all.
+ *
+ * Channel is provider-derived, so a filter naming a channel no bound provider
+ * belongs to selects nothing. Saying so is the honest answer; returning zeros
+ * would look like an account with no such traffic.
+ */
+export function channelMatchesProvider(
+  channel: string | null | undefined,
+  providerKey: string | null | undefined,
+): boolean {
+  if (!channel) return true;
+  return channelForProvider(providerKey ?? null) === channel;
+}
+
 export async function loadMarketingAggregate(filters: MetricFilters): Promise<MarketingAggregate> {
   const params: unknown[] = [];
-  const where = marketingWhere(filters, params);
+  // Channel is derived from the provider that reported the row, so a filter
+  // naming a channel the bound network does not belong to matches nothing.
+  // Narrowing the WHERE to a contradiction says that in one place rather than
+  // leaving each measure to arrive at zero separately.
+  const channelExcluded = !channelMatchesProvider(filters.channel, filters.marketingProviderKey);
+  const where = channelExcluded ? 'false' : marketingWhere(filters, params);
   const rows = await queryRows<{
     spend: string;
     mapped_spend: string;
@@ -231,6 +261,16 @@ export async function loadAttributionAggregate(
     installParams.push(filters.attributionProviderKey);
     installWhere += ` AND provider_key = $${installParams.length}`;
   }
+  // Channel on the attribution side is a property of the media source that
+  // delivered the install, so it narrows rows rather than short-circuiting.
+  // The source list is generated from the same taxonomy the labels use.
+  if (filters.channel === 'organic') {
+    installWhere += ` AND ${organic('t')}`;
+  } else if (filters.channel) {
+    installParams.push(mediaSourcesForChannel(filters.channel as CanonicalChannel));
+    installWhere += ` AND normalized_media_source = ANY($${installParams.length}::text[])`;
+  }
+
   let installDelivery = '';
   if (filters.country) {
     installParams.push(filters.country);
@@ -279,6 +319,13 @@ export async function loadAttributionAggregate(
     revenueParams.push(filters.attributionProviderKey);
     revenueWhere += ` AND provider_key = $${revenueParams.length}`;
   }
+  if (filters.channel === 'organic') {
+    revenueWhere += ` AND ${organic('t')}`;
+  } else if (filters.channel) {
+    revenueParams.push(mediaSourcesForChannel(filters.channel as CanonicalChannel));
+    revenueWhere += ` AND normalized_media_source = ANY($${revenueParams.length}::text[])`;
+  }
+
   let revenueDelivery = '';
   if (filters.country) {
     revenueParams.push(filters.country);

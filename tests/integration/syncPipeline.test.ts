@@ -970,6 +970,65 @@ describe('reconciliation', () => {
     expect(coverage.eligible?.mappedPaidInstalls).toBe(50);
   });
 
+  it('filters by canonical channel without naming a provider', async () => {
+    // The business question is "how much came from paid social", which must not
+    // require knowing which networks are connected this quarter.
+    controls.marketingRows = [
+      {
+        reportDate: '2026-08-20',
+        campaignId: '900',
+        campaignName: 'Summer',
+        spend: 100,
+        impressions: 5000,
+        clicks: 100,
+      },
+    ];
+    controls.attributionRows = [
+      { installDate: '2026-08-20', campaignId: '900', campaignName: 'Summer', installs: 40 },
+      {
+        installDate: '2026-08-20',
+        campaignId: null,
+        campaignName: 'Organic',
+        installs: 15,
+        mediaSource: 'Organic',
+      },
+    ];
+    const ctx = await setup();
+    await triggerSync(ctx, '2026-08-20', '2026-08-20');
+    await reconcile(ctx.user.organizationId, ctx.appId);
+
+    const read = async (suffix: string): Promise<Map<string, number | null>> => {
+      const response = await request(
+        ctx.user,
+        'GET',
+        `/api/v1/organizations/${ctx.user.organizationId}/apps/${ctx.appId}/metrics?from=2026-08-20&to=2026-08-20${suffix}`,
+      );
+      const body = response.json() as {
+        metrics: Array<{ metricKey: string; value: number | null }>;
+      };
+      return new Map(body.metrics.map((m) => [m.metricKey, m.value]));
+    };
+
+    const all = await read('');
+    expect(all.get('spend')).toBe(100);
+    expect(all.get('attributed_installs')).toBe(55);
+
+    // Meta is paid_social, so its spend survives that filter.
+    const social = await read('&channel=paid_social');
+    expect(social.get('spend')).toBe(100);
+    expect(social.get('attributed_installs')).toBe(40);
+
+    // Organic is a channel of its own: no paid spend belongs to it.
+    const organicOnly = await read('&channel=organic');
+    expect(organicOnly.get('spend')).toBe(0);
+    expect(organicOnly.get('attributed_installs')).toBe(15);
+
+    // A channel no bound provider belongs to selects nothing, rather than
+    // returning the account total under a label that does not describe it.
+    const search = await read('&channel=paid_search');
+    expect(search.get('spend')).toBe(0);
+  });
+
   it('narrows coverage to the filtered slice, not the whole account', async () => {
     // Coverage sits beside the KPIs and has to describe the same population.
     // Account-wide coverage over a country-filtered dashboard reads as though
