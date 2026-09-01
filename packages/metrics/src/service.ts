@@ -495,9 +495,15 @@ export function determineAvailability(
   ) {
     const coveragePct = (eligible.mappedSpend / eligible.totalSpend) * 100;
     if (coveragePct < MINIMUM_SPEND_COVERAGE_PCT) {
+      // Qualified, not withheld. The arithmetic is sound and an operator may
+      // legitimately want the figure; what they must not do is read it as a
+      // description of the whole account. Blocking it outright would remove a
+      // usable number to make a point the caveat already makes - and the
+      // difference between "here, with this caveat" and "no" is the difference
+      // between a gate and an opinion.
       return {
-        availability: 'blocked',
-        reason: `Only ${coveragePct.toFixed(1)}% of spend in this period is on mapped campaigns, below the ${MINIMUM_SPEND_COVERAGE_PCT}% this figure needs to describe the account.`,
+        availability: 'partial',
+        reason: `Only ${coveragePct.toFixed(1)}% of spend in this period is on mapped campaigns, below the ${MINIMUM_SPEND_COVERAGE_PCT}% this figure needs to describe the whole account.`,
         blocker: 'insufficient_coverage',
       };
     }

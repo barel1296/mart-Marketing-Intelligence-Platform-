@@ -342,6 +342,91 @@ describe('safeRatio', () => {
   });
 });
 
+describe('quality gates', () => {
+  const coverage = (mappedSpend: number, totalSpend: number, ambiguousSpend = 0) => ({
+    total: 10,
+    authoritative: 8,
+    operational: 9,
+    eligible: {
+      eligibleCampaigns: 5,
+      mappedCampaigns: 4,
+      ambiguousCampaigns: 0,
+      unmappedCampaigns: 1,
+      historicalCampaigns: 0,
+      totalSpend,
+      mappedSpend,
+      ambiguousSpend,
+      unmappedSpend: totalSpend - mappedSpend - ambiguousSpend,
+      totalPaidInstalls: 400,
+      mappedPaidInstalls: 300,
+      ambiguousPaidInstalls: 0,
+      unmappedPaidInstalls: 100,
+    },
+  });
+
+  it('qualifies a figure drawn from thin coverage rather than withholding it', () => {
+    // The arithmetic is sound and an operator may legitimately want the number;
+    // what they must not do is read it as a description of the whole account.
+    // Blocking it outright would remove a usable figure to make a point the
+    // caveat already makes.
+    const ctx = { ...context(), mappingCoverage: coverage(20, 100) };
+    const value = metric('mapped_cpi', ctx);
+    expect(value?.availability).toBe('partial');
+    expect(value?.blocker).toBe('insufficient_coverage');
+    expect(value?.value).not.toBeNull();
+    expect(value?.reason).toMatch(/20.0% of spend/);
+  });
+
+  it('says nothing about coverage when there is enough of it', () => {
+    const ctx = { ...context(), mappingCoverage: coverage(95, 100) };
+    const value = metric('mapped_cpi', ctx);
+    expect(value?.availability).toBe('available');
+    expect(value?.blocker).toBeUndefined();
+  });
+
+  it('flags ambiguity that a human has not resolved', () => {
+    const ctx = { ...context(), mappingCoverage: coverage(85, 100, 15) };
+    const value = metric('mapped_cpi', ctx);
+    expect(value?.availability).toBe('partial');
+    expect(value?.blocker).toBe('ambiguous_mapping');
+    expect(value?.reason).toMatch(/equally good/);
+  });
+
+  it('names the condition behind a missing provider, not just the prose', () => {
+    const value = metric('spend', { ...context(), hasMarketingConnection: false });
+    expect(value?.availability).toBe('unavailable');
+    expect(value?.blocker).toBe('missing_provider');
+  });
+
+  it('enforces the per-metric staleness tolerance the registry declares', () => {
+    // The field was declared on every metric and read by nothing.
+    const ctx = {
+      ...context(),
+      marketingFreshness: {
+        status: 'fresh',
+        latestDataDate: '2026-08-26',
+        minutesSinceSuccess: 60 * 30,
+      },
+    };
+    const value = metric('spend', ctx);
+    expect(value?.availability).toBe('stale');
+    expect(value?.blocker).toBe('provider_stale');
+    expect(value?.reason).toMatch(/30h ago/);
+  });
+
+  it('leaves a metric alone while it is inside its tolerance', () => {
+    const ctx = {
+      ...context(),
+      marketingFreshness: {
+        status: 'fresh',
+        latestDataDate: '2026-08-26',
+        minutesSinceSuccess: 60 * 3,
+      },
+    };
+    expect(metric('spend', ctx)?.availability).toBe('available');
+  });
+});
+
 describe('currency isolation', () => {
   it('refuses a money metric drawn from more than one currency', () => {
     // 100 USD + 100 EUR is not 200 of anything. The sum would look entirely
