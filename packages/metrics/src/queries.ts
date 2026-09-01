@@ -3,6 +3,7 @@ import { OPERATIONAL_MAPPING_CONFIDENCE } from '@mart/shared';
 import { queryRows, toNumber, toNullableNumber } from '@mart/db';
 import type { MetricFilters } from './service.js';
 import { safeRatio } from './registry.js';
+import { operationalMapping } from './populations.js';
 
 /**
  * When the campaign table may show attribution beside delivery.
@@ -12,9 +13,7 @@ import { safeRatio } from './registry.js';
  * link. Withholding a figure that genuinely exists is its own failure though -
  * a campaign whose mapped children have installs must not render an em dash.
  */
-const DISPLAYABLE = `(map_best.status IN ('matched_exact','matched_confident','manually_verified')
-  OR (map_best.status = 'matched_fallback'
-      AND map_best.mapping_confidence >= ${OPERATIONAL_MAPPING_CONFIDENCE}))`;
+const DISPLAYABLE = operationalMapping('map_best');
 
 /**
  * Time series.
@@ -501,7 +500,7 @@ export async function loadReconciliationDiscrepancies(
             ON map.app_id = m.app_id AND map.entity_type = 'campaign'
            AND map.source_provider = m.provider_key
            AND map.source_external_id = m.external_campaign_id
-           AND map.status IN ('matched_exact','matched_confident','manually_verified')
+           AND ${operationalMapping('map')}
      WHERE m.organization_id = $1 AND m.app_id = $2
        AND m.report_date BETWEEN $3 AND $4
        AND m.provider_key = $5
@@ -538,7 +537,7 @@ export async function loadReconciliationDiscrepancies(
             ON map.app_id = a.app_id AND map.entity_type = 'campaign'
            AND map.target_provider = a.provider_key
            AND map.target_external_id = a.external_campaign_id
-           AND map.status IN ('matched_exact','matched_confident','manually_verified')
+           AND ${operationalMapping('map')}
      WHERE a.organization_id = $1 AND a.app_id = $2
        AND a.install_date BETWEEN $3 AND $4
        AND ($5::text IS NULL OR a.provider_key = $5)

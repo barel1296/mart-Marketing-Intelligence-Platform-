@@ -1,5 +1,6 @@
 import type { IsoDate, MappingStatus } from '@mart/shared';
 import { OPERATIONAL_MAPPING_CONFIDENCE } from '@mart/shared';
+import { operationalMapping } from '@mart/metrics';
 import {
   queryRows,
   dataQualityRepo,
@@ -767,8 +768,8 @@ export type EligibleCoverage = {
 };
 
 /** SQL for "this mapping is strong enough to operate on". */
-const OPERATIONAL_MAPPING = `(m.status IN ('matched_exact', 'matched_confident', 'manually_verified')
-  OR (m.status = 'matched_fallback' AND m.mapping_confidence >= ${OPERATIONAL_MAPPING_CONFIDENCE}))`;
+/** One definition, shared with the metric layer, so coverage cannot disagree. */
+const OPERATIONAL_MAPPING = operationalMapping('m');
 
 export async function campaignCoverage(
   organizationId: string,

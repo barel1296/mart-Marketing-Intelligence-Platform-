@@ -1,61 +1,23 @@
 import type { IsoDate, MetricAvailability } from '@mart/shared';
-import { OPERATIONAL_MAPPING_CONFIDENCE } from '@mart/shared';
+import {
+  deliveryAlignedCampaign,
+  mappedAttributionCampaign,
+  notOrganic,
+  operationalMapping,
+} from './populations.js';
 import { queryRows, toNumber } from '@mart/db';
 
 /**
- * Organic is unpaid traffic. It is real attribution and stays in the totals,
- * but it can never belong to a paid campaign, so it is excluded from every
- * mapped figure.
- */
-const NOT_ORGANIC = `COALESCE(t.normalized_media_source, 'organic') <> 'organic'`;
-
-/**
- * The attribution campaign resolves to a marketing campaign, by stable id,
- * human verification, or a deterministic high-confidence name match.
- */
-const MAPPED_ATTRIBUTION_CAMPAIGN = `t.external_campaign_id IN (
-  SELECT m.target_external_id FROM provider_entity_mappings m
-  WHERE m.organization_id = t.organization_id AND m.app_id = t.app_id
-    AND m.entity_type = 'campaign'
-    AND m.target_provider = t.provider_key
-    AND m.target_external_id IS NOT NULL
-    AND (m.status IN ('matched_exact', 'matched_confident', 'manually_verified')
-         OR (m.status = 'matched_fallback'
-             AND m.mapping_confidence >= ${OPERATIONAL_MAPPING_CONFIDENCE}))
-)`;
-
-/**
- * The attribution campaign resolves to a marketing campaign that actually
- * DELIVERED in the selected window.
+ * The population predicates every figure below is built from.
  *
- * This is a different population from "mapped", and the difference is the
- * reason a mapped CPI can be wrong: spend is summed over the window, so a
- * campaign that spent nothing in it contributes zero to the numerator - while
- * its installs, mapped perfectly well, still land in the denominator. Dividing
- * one population by the other understates cost per install.
- *
- * $3 and $4 are the window bounds. Both call sites bind
- * [organizationId, appId, from, to, ...] in that order.
+ * Defined once in ./populations.ts and bound to this file's table aliases here,
+ * so mapped spend, mapped installs and the coverage cards cannot drift apart.
  */
-const DELIVERY_ALIGNED_CAMPAIGN = `t.external_campaign_id IN (
-  SELECT m.target_external_id FROM provider_entity_mappings m
-  JOIN (
-    SELECT DISTINCT md.external_campaign_id, md.provider_key
-    FROM marketing_daily_metrics md
-    WHERE md.organization_id = t.organization_id AND md.app_id = t.app_id
-      AND md.report_date BETWEEN $3 AND $4
-      AND (md.spend > 0 OR md.impressions > 0 OR md.clicks > 0)
-  ) delivered
-    ON delivered.external_campaign_id = m.source_external_id
-   AND delivered.provider_key = m.source_provider
-  WHERE m.organization_id = t.organization_id AND m.app_id = t.app_id
-    AND m.entity_type = 'campaign'
-    AND m.target_provider = t.provider_key
-    AND m.target_external_id IS NOT NULL
-    AND (m.status IN ('matched_exact', 'matched_confident', 'manually_verified')
-         OR (m.status = 'matched_fallback'
-             AND m.mapping_confidence >= ${OPERATIONAL_MAPPING_CONFIDENCE}))
-)`;
+const NOT_ORGANIC = notOrganic('t');
+const MAPPED_ATTRIBUTION_CAMPAIGN = mappedAttributionCampaign('t');
+/** $3 and $4 are the window bounds; both call sites bind them in that order. */
+const DELIVERY_ALIGNED_CAMPAIGN = deliveryAlignedCampaign({ from: '$3', to: '$4' }, 't');
+
 import {
   getMetricDefinition,
   listMetricDefinitions,
@@ -214,9 +176,7 @@ export async function loadMarketingAggregate(filters: MetricFilters): Promise<Ma
                 AND m.entity_type = 'campaign'
                 AND m.source_provider = marketing_daily_metrics.provider_key
                 AND m.target_external_id IS NOT NULL
-                AND (m.status IN ('matched_exact', 'matched_confident', 'manually_verified')
-                     OR (m.status = 'matched_fallback'
-                         AND m.mapping_confidence >= ${OPERATIONAL_MAPPING_CONFIDENCE}))
+                AND ${operationalMapping('m')}
             )), 0)::text AS mapped_spend,
             COALESCE(SUM(impressions), 0)::text AS impressions,
             COALESCE(SUM(clicks), 0)::text AS clicks,

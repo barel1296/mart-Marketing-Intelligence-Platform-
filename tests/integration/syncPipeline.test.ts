@@ -970,6 +970,63 @@ describe('reconciliation', () => {
     expect(coverage.eligible?.mappedPaidInstalls).toBe(50);
   });
 
+  it('never reports a campaign as covered and as a discrepancy at once', async () => {
+    // Coverage counted a deterministic name match as mapped while the
+    // discrepancy list counted the same campaign as unmapped, so the Command
+    // Center could show 100% coverage above a list of unmapped campaigns.
+    // Nobody wrote that rule - it emerged from two copies of the same predicate
+    // drifting apart, which is why there is now only one.
+    controls.marketingRows = [
+      {
+        reportDate: '2026-08-20',
+        campaignId: '900',
+        campaignName: 'FB_App_CPI_Broad_US_26/08/26',
+        spend: 100,
+        impressions: 5000,
+        clicks: 100,
+      },
+    ];
+    controls.attributionRows = [
+      {
+        installDate: '2026-08-20',
+        campaignId: 'mmp-1',
+        campaignName: 'CPI_Broad_US_static (FB_App_CPI_Broad_US_26/08/26)',
+        installs: 40,
+      },
+    ];
+    const ctx = await setup();
+    await triggerSync(ctx, '2026-08-20', '2026-08-20');
+    await reconcile(ctx.user.organizationId, ctx.appId);
+
+    const mappings = await queryRows<{ status: string; mapping_confidence: string }>(
+      `SELECT status, mapping_confidence FROM provider_entity_mappings
+        WHERE app_id = $1 AND source_provider = 'meta_ads' AND target_external_id IS NOT NULL`,
+      [ctx.appId],
+    );
+    // The premise: a non-authoritative link that is nonetheless operational.
+    expect(mappings[0]?.status).toBe('matched_fallback');
+    expect(Number(mappings[0]?.mapping_confidence)).toBeGreaterThanOrEqual(0.9);
+
+    const response = await request(
+      ctx.user,
+      'GET',
+      `/api/v1/organizations/${ctx.user.organizationId}/apps/${ctx.appId}/reconciliation?from=2026-08-20&to=2026-08-20`,
+    );
+    const body = response.json() as {
+      coverage: { eligible: { mappedCampaigns: number; unmappedCampaigns: number } | null };
+      discrepancies: Array<{ kind: string; externalId: string | null }>;
+    };
+
+    // Covered by the operational population...
+    expect(body.coverage.eligible?.mappedCampaigns).toBe(1);
+    expect(body.coverage.eligible?.unmappedCampaigns).toBe(0);
+    // ...and therefore absent from the list of things that are not covered.
+    const unmapped = body.discrepancies.filter(
+      (d) => d.kind === 'delivery_without_attribution' || d.kind === 'attribution_without_mapping',
+    );
+    expect(unmapped).toEqual([]);
+  });
+
   it('keeps a human-verified mapping when reconciliation runs again', async () => {
     controls.marketingRows = [
       {
