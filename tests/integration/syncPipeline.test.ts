@@ -970,6 +970,89 @@ describe('reconciliation', () => {
     expect(coverage.eligible?.mappedPaidInstalls).toBe(50);
   });
 
+  it('answers performance without the caller naming a provider', async () => {
+    // The whole point of the unified object: a business consumer asks one
+    // question and never learns which network is bound, what the MMP calls an
+    // install, or how a remote id resolves.
+    controls.marketingRows = structuredClone(BASE_MARKETING);
+    controls.attributionRows = structuredClone(BASE_ATTRIBUTION);
+    const ctx = await setup();
+    await triggerSync(ctx, '2026-08-20', '2026-08-21');
+    await reconcile(ctx.user.organizationId, ctx.appId);
+
+    const response = await request(
+      ctx.user,
+      'GET',
+      `/api/v1/organizations/${ctx.user.organizationId}/apps/${ctx.appId}/performance?from=2026-08-20&to=2026-08-21`,
+    );
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as {
+      window: { startDate: string; endDate: string; timezone: string };
+      dimensions: Record<string, string | null>;
+      marketing: Record<string, { value: number | null; population: { numerator: string } }>;
+      attribution: Record<string, { value: number | null }>;
+      revenue: Record<string, { value: number | null }>;
+      efficiency: Record<string, { value: number | null }>;
+      coverage: Record<string, { value: number | null }>;
+      quality: { blockers: string[]; qualified: Array<{ metricKey: string; reason: string }> };
+      freshness: Record<string, unknown>;
+      confidence: { level: string; score: number; components: Array<{ input: string }> };
+      lineage: Array<{ metricKey: string; factFamilies: string[]; window: { timezone: string } }>;
+    };
+
+    // The window carries the calendar that produced it.
+    expect(body.window).toEqual({
+      startDate: '2026-08-20',
+      endDate: '2026-08-21',
+      timezone: 'UTC',
+    });
+
+    // Every group the business layer is promised.
+    expect(body.marketing['spend']?.value).toBe(250);
+    expect(body.marketing['impressions']?.value).toBe(50_000);
+    expect(body.marketing['ctr']?.value).toBeCloseTo(900 / 50_000, 6);
+    expect(body.attribution['attributed_installs']?.value).toBe(100);
+    expect(body.attribution['organic_installs']?.value).toBe(0);
+    expect(body.attribution['delivery_aligned_paid_installs']?.value).toBe(100);
+    expect(body.revenue['iap_revenue']?.value).toBe(75);
+    expect(body.efficiency['mapped_cpi']).toBeDefined();
+    expect(body.coverage['spend_coverage']).toBeDefined();
+
+    // Each figure states the population it was drawn from.
+    expect(body.marketing['spend']?.population.numerator).toBe('current_period_marketing');
+
+    // Confidence is decomposable and never empty.
+    expect(['high', 'medium', 'low']).toContain(body.confidence.level);
+    expect(body.confidence.components.length).toBeGreaterThan(0);
+    expect(body.confidence.score).toBeGreaterThanOrEqual(0);
+    expect(body.confidence.score).toBeLessThanOrEqual(1);
+
+    // Lineage traces each number back to the facts and the window.
+    const spendLineage = body.lineage.find((l) => l.metricKey === 'spend');
+    expect(spendLineage?.factFamilies).toContain('marketing_daily_metrics');
+    expect(spendLineage?.window.timezone).toBe('UTC');
+
+    // Anything not fully available explains itself.
+    for (const item of body.quality.qualified) {
+      expect(item.reason.length, item.metricKey).toBeGreaterThan(0);
+    }
+
+    // No provider SEMANTICS leak into the shape the caller reads. Provider keys
+    // themselves are legitimate provenance - the caller may want to know who
+    // reported a number - but an ad-set id or a provider's field name would
+    // mean the business layer had to understand that provider's model.
+    const groups = JSON.stringify({
+      marketing: body.marketing,
+      attribution: body.attribution,
+      revenue: body.revenue,
+      efficiency: body.efficiency,
+    });
+    expect(groups).not.toMatch(/adset|remote_campaign_id|tracked_installs|pub_rev/i);
+    // Provenance is present and declared, not hidden.
+    const spend = body.marketing['spend'] as unknown as { providers: string[] };
+    expect(spend.providers.length).toBeGreaterThan(0);
+  });
+
   it('filters by canonical channel without naming a provider', async () => {
     // The business question is "how much came from paid social", which must not
     // require knowing which networks are connected this quarter.

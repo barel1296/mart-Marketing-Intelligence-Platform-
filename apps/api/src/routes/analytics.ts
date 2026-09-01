@@ -13,6 +13,7 @@ import { auditRepo, dataQualityRepo, integrationsRepo, mappingsRepo, syncRepo } 
 import { campaignCoverage, providerEndpointInfo, reconcileCampaigns } from '@mart/integrations';
 import {
   computeMetricValues,
+  loadUnifiedPerformance,
   listMetricDefinitions,
   loadAttributionAggregate,
   loadCampaignTable,
@@ -130,6 +131,53 @@ export async function registerAnalyticsRoutes(server: FastifyInstance): Promise<
         currencies: marketing.currencies,
       },
     };
+  });
+
+  /**
+   * One provider-neutral answer to "how did this app perform".
+   *
+   * What a caller does NOT need to know is the point: not which network is
+   * bound, not that the MMP calls an install something else, not how a remote
+   * id resolves. Every figure is a governed metric carrying its own population,
+   * grain and availability, grouped and served with the coverage it rests on,
+   * the conditions qualifying it, and a decomposable confidence score.
+   */
+  server.get('/organizations/:organizationId/apps/:appId/performance', async (request, reply) => {
+    const params = appParams.parse(request.params);
+    const query = filterQuery.parse(request.query);
+    const { context, app } = await withApp(
+      request,
+      params.organizationId,
+      params.appId,
+      'metrics:read',
+    );
+    setNoStore(reply);
+
+    const range = resolveWindow(query, app.timezone);
+    const { context: metricContext, state } = await buildMetricContext(
+      context.organizationId,
+      app,
+      { ...range, country: query.country ?? null, platform: query.platform ?? null },
+    );
+
+    const performance = await loadUnifiedPerformance({
+      filters: {
+        organizationId: context.organizationId,
+        appId: app.id,
+        from: range.from,
+        to: range.to,
+        country: query.country ?? null,
+        platform: query.platform ?? null,
+        channel: query.channel ?? null,
+        marketingProviderKey: state.marketingProviderKey,
+        attributionProviderKey: state.attributionProviderKey,
+        marketingAccountExternalId: query.marketingAccountExternalId ?? null,
+      },
+      context: metricContext,
+      window: { startDate: range.startDate, endDate: range.endDate, timezone: range.timezone },
+    });
+
+    return performance;
   });
 
   server.get('/organizations/:organizationId/apps/:appId/timeseries', async (request, reply) => {

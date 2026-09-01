@@ -44,6 +44,24 @@ export async function loadIntegrationState(
  * that needs a dimension neither provider exposes is reported unavailable
  * rather than silently returning zero.
  */
+/**
+ * Minutes since the stream last synced successfully.
+ *
+ * The registry declares a per-metric staleness tolerance; without this it had
+ * nothing to compare against and was read by nothing. The oldest successful
+ * sync across the streams wins - a metric is only as current as its stalest
+ * input.
+ */
+function minutesSinceSuccess(
+  rows: Array<{ last_success_at: Date | string | null }>,
+): number | null {
+  const times = rows
+    .map((r) => (r.last_success_at ? new Date(r.last_success_at).getTime() : null))
+    .filter((t): t is number => t !== null && Number.isFinite(t));
+  if (times.length === 0) return null;
+  return Math.floor((Date.now() - Math.min(...times)) / 60_000);
+}
+
 export async function buildMetricContext(
   organizationId: string,
   app: AppRow,
@@ -110,6 +128,7 @@ export async function buildMetricContext(
     marketingFreshness: marketingRows.length
       ? {
           status: worstFreshness(marketingRows.map((r) => r.status)),
+          minutesSinceSuccess: minutesSinceSuccess(marketingRows),
           latestDataDate:
             marketingRows
               .map((r) => r.latest_provider_data_date)
@@ -121,6 +140,7 @@ export async function buildMetricContext(
     attributionFreshness: attributionRows.length
       ? {
           status: worstFreshness(attributionRows.map((r) => r.status)),
+          minutesSinceSuccess: minutesSinceSuccess(attributionRows),
           latestDataDate:
             attributionRows
               .map((r) => r.latest_provider_data_date)

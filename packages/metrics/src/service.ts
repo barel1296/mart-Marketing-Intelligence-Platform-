@@ -1,4 +1,4 @@
-import type { IsoDate, MetricAvailability } from '@mart/shared';
+import type { IsoDate, MetricAvailability, MetricBlocker } from '@mart/shared';
 import { channelForProvider, mediaSourcesForChannel, type CanonicalChannel } from '@mart/shared';
 import {
   deliveryAlignedCampaign,
@@ -8,6 +8,7 @@ import {
   organic,
 } from './populations.js';
 import { queryRows, toNumber } from '@mart/db';
+import { MAXIMUM_AMBIGUOUS_SPEND_PCT, MINIMUM_SPEND_COVERAGE_PCT } from './thresholds.js';
 
 /**
  * The population predicates every figure below is built from.
@@ -69,8 +70,12 @@ export type MetricContext = {
   marketingProviders: string[];
   attributionProviders: string[];
   supportedCapabilities: Set<string>;
-  marketingFreshness?: { status: string; latestDataDate: string | null } | undefined;
-  attributionFreshness?: { status: string; latestDataDate: string | null } | undefined;
+  marketingFreshness?:
+    | { status: string; latestDataDate: string | null; minutesSinceSuccess?: number | null }
+    | undefined;
+  attributionFreshness?:
+    | { status: string; latestDataDate: string | null; minutesSinceSuccess?: number | null }
+    | undefined;
   mappingCoverage?:
     | {
         total: number;
@@ -396,23 +401,37 @@ export async function loadAttributionAggregate(
  * Returning zero when a source is missing is the failure mode this exists to
  * prevent: an unconnected provider and a genuinely zero day must not look alike.
  */
+/**
+ * Decide whether a metric can be shown, and name the condition if not.
+ *
+ * Every non-available state carries both a reason a person can read and a
+ * blocker a machine can act on. The two are produced together on purpose: a
+ * blocker without prose is unactionable to the reader, and prose without a
+ * blocker is unactionable to anything downstream.
+ */
 export function determineAvailability(
   definition: MetricDefinition,
   context: MetricContext,
-): { availability: MetricAvailability; reason?: string } {
+): { availability: MetricAvailability; reason?: string; blocker?: MetricBlocker } {
   if (definition.unavailableReason) {
-    return { availability: 'unavailable', reason: definition.unavailableReason };
+    return {
+      availability: 'unavailable',
+      reason: definition.unavailableReason,
+      blocker: 'unsupported_metric',
+    };
   }
   if (definition.sources.includes('marketing') && !context.hasMarketingConnection) {
     return {
       availability: 'unavailable',
       reason: 'No marketing network is connected for this app.',
+      blocker: 'missing_provider',
     };
   }
   if (definition.sources.includes('attribution') && !context.hasAttributionConnection) {
     return {
       availability: 'unavailable',
       reason: 'No attribution provider is configured for this app.',
+      blocker: 'missing_provider',
     };
   }
   const missing = definition.requiredCapabilities.filter(
@@ -422,18 +441,78 @@ export function determineAvailability(
     return {
       availability: 'unavailable',
       reason: `The connected provider does not expose: ${missing.join(', ')}.`,
+      blocker: 'unsupported_metric',
     };
   }
 
-  const relevant: Array<{ status: string } | undefined> = [];
+  const relevant: Array<{ status: string; minutesSinceSuccess?: number | null } | undefined> = [];
   if (definition.sources.includes('marketing')) relevant.push(context.marketingFreshness);
   if (definition.sources.includes('attribution')) relevant.push(context.attributionFreshness);
   if (relevant.some((f) => f?.status === 'stale' || f?.status === 'error')) {
-    return { availability: 'stale', reason: 'Underlying data is stale; re-run the sync.' };
+    return {
+      availability: 'stale',
+      reason: 'Underlying data is stale; re-run the sync.',
+      blocker: 'provider_stale',
+    };
   }
+
+  // The registry's per-metric staleness tolerance, finally consulted. A daily
+  // spend figure and a revenue figure that restates for two days do not go
+  // stale at the same rate, which is why the tolerance is declared per metric
+  // rather than assumed.
+  const overdue = relevant.find(
+    (f) =>
+      typeof f?.minutesSinceSuccess === 'number' &&
+      f.minutesSinceSuccess > definition.maxAcceptableStalenessMinutes,
+  );
+  if (overdue && typeof overdue.minutesSinceSuccess === 'number') {
+    const hours = Math.floor(overdue.minutesSinceSuccess / 60);
+    return {
+      availability: 'stale',
+      reason: `Last successful sync was ${hours}h ago; this metric is defined to tolerate ${Math.floor(definition.maxAcceptableStalenessMinutes / 60)}h.`,
+      blocker: 'provider_stale',
+    };
+  }
+
   if (relevant.some((f) => f?.status === 'delayed')) {
-    return { availability: 'partial', reason: 'Underlying data is behind its expected freshness.' };
+    return {
+      availability: 'partial',
+      reason: 'Underlying data is behind its expected freshness.',
+      blocker: 'provider_stale',
+    };
   }
+
+  // Coverage below the documented floor does not stop the arithmetic - it
+  // stops the answer meaning what the reader will take it to mean. A CPI drawn
+  // from half the spend describes MART's reconciliation, not the campaigns.
+  const eligible = context.mappingCoverage?.eligible;
+  if (
+    eligible &&
+    definition.semanticClass === 'operational' &&
+    definition.sources.includes('marketing') &&
+    definition.sources.includes('attribution') &&
+    eligible.totalSpend > 0
+  ) {
+    const coveragePct = (eligible.mappedSpend / eligible.totalSpend) * 100;
+    if (coveragePct < MINIMUM_SPEND_COVERAGE_PCT) {
+      return {
+        availability: 'blocked',
+        reason: `Only ${coveragePct.toFixed(1)}% of spend in this period is on mapped campaigns, below the ${MINIMUM_SPEND_COVERAGE_PCT}% this figure needs to describe the account.`,
+        blocker: 'insufficient_coverage',
+      };
+    }
+    if (eligible.ambiguousSpend > 0) {
+      const ambiguousPct = (eligible.ambiguousSpend / eligible.totalSpend) * 100;
+      if (ambiguousPct > MAXIMUM_AMBIGUOUS_SPEND_PCT) {
+        return {
+          availability: 'partial',
+          reason: `${ambiguousPct.toFixed(1)}% of spend is on campaigns with several equally good mapping candidates, which MART will not choose between.`,
+          blocker: 'ambiguous_mapping',
+        };
+      }
+    }
+  }
+
   return { availability: 'available' };
 }
 
@@ -486,6 +565,18 @@ function buildMetricValue(
       ...base,
       availability: 'unavailable',
       ...(gate.reason ? { reason: gate.reason } : {}),
+      ...(gate.blocker ? { blocker: gate.blocker } : {}),
+    };
+  }
+
+  // A blocked gate stops here too: the arithmetic is possible, the answer is
+  // not one MART is willing to state.
+  if (gate.availability === 'blocked') {
+    return {
+      ...base,
+      availability: 'blocked',
+      ...(gate.reason ? { reason: gate.reason } : {}),
+      ...(gate.blocker ? { blocker: gate.blocker } : {}),
     };
   }
 
@@ -521,6 +612,7 @@ function buildMetricValue(
     ...value,
     availability: gate.availability,
     ...(gate.reason ? { reason: gate.reason } : {}),
+    ...(gate.blocker ? { blocker: gate.blocker } : {}),
     ...(freshness
       ? { freshnessStatus: freshness.status, latestDataDate: freshness.latestDataDate }
       : {}),
