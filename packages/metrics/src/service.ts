@@ -15,8 +15,16 @@ import { queryRows, toNumber } from '@mart/db';
  */
 const NOT_ORGANIC = notOrganic('t');
 const MAPPED_ATTRIBUTION_CAMPAIGN = mappedAttributionCampaign('t');
-/** $3 and $4 are the window bounds; both call sites bind them in that order. */
-const DELIVERY_ALIGNED_CAMPAIGN = deliveryAlignedCampaign({ from: '$3', to: '$4' }, 't');
+/**
+ * Build the delivery-aligned predicate for one query.
+ *
+ * Not a constant, because the delivery side has to carry the same dimension
+ * filters as the rows being counted: $3 and $4 are always the window, but the
+ * country and platform binds land at whatever position the caller pushed them.
+ */
+function deliveryAligned(dimensions: string): string {
+  return deliveryAlignedCampaign({ from: '$3', to: '$4', delivery: dimensions }, 't');
+}
 
 import {
   getMetricDefinition,
@@ -218,14 +226,18 @@ export async function loadAttributionAggregate(
     installParams.push(filters.attributionProviderKey);
     installWhere += ` AND provider_key = $${installParams.length}`;
   }
+  let installDelivery = '';
   if (filters.country) {
     installParams.push(filters.country);
     installWhere += ` AND country = $${installParams.length}`;
+    installDelivery += ` AND md.country = $${installParams.length}`;
   }
   if (filters.platform) {
     installParams.push(filters.platform);
     installWhere += ` AND platform = $${installParams.length}`;
+    installDelivery += ` AND md.platform = $${installParams.length}`;
   }
+  const installAligned = deliveryAligned(installDelivery);
 
   const installRows = await queryRows<{
     installs: string;
@@ -239,7 +251,7 @@ export async function loadAttributionAggregate(
             COALESCE(SUM(attributed_installs) FILTER (
               WHERE ${NOT_ORGANIC} AND ${MAPPED_ATTRIBUTION_CAMPAIGN}), 0)::text AS mapped_installs,
             COALESCE(SUM(attributed_installs) FILTER (
-              WHERE ${NOT_ORGANIC} AND ${DELIVERY_ALIGNED_CAMPAIGN}), 0)::text
+              WHERE ${NOT_ORGANIC} AND ${installAligned}), 0)::text
               AS delivery_aligned_installs,
             COALESCE(SUM(attributed_installs) FILTER (WHERE NOT (${NOT_ORGANIC})), 0)::text
               AS organic_installs,
@@ -262,14 +274,18 @@ export async function loadAttributionAggregate(
     revenueParams.push(filters.attributionProviderKey);
     revenueWhere += ` AND provider_key = $${revenueParams.length}`;
   }
+  let revenueDelivery = '';
   if (filters.country) {
     revenueParams.push(filters.country);
     revenueWhere += ` AND country = $${revenueParams.length}`;
+    revenueDelivery += ` AND md.country = $${revenueParams.length}`;
   }
   if (filters.platform) {
     revenueParams.push(filters.platform);
     revenueWhere += ` AND platform = $${revenueParams.length}`;
+    revenueDelivery += ` AND md.platform = $${revenueParams.length}`;
   }
+  const revenueAligned = deliveryAligned(revenueDelivery);
 
   const revenueRows = await queryRows<{
     revenue: string;
@@ -284,7 +300,7 @@ export async function loadAttributionAggregate(
             COALESCE(SUM(revenue) FILTER (
               WHERE ${NOT_ORGANIC} AND ${MAPPED_ATTRIBUTION_CAMPAIGN}), 0)::text AS mapped_revenue,
             COALESCE(SUM(revenue) FILTER (
-              WHERE ${NOT_ORGANIC} AND ${DELIVERY_ALIGNED_CAMPAIGN}), 0)::text
+              WHERE ${NOT_ORGANIC} AND ${revenueAligned}), 0)::text
               AS delivery_aligned_revenue,
             COALESCE(SUM(revenue) FILTER (WHERE NOT (${NOT_ORGANIC})), 0)::text AS organic_revenue,
             COALESCE(SUM(revenue) FILTER (WHERE revenue_type = 'iap'), 0)::text AS iap_revenue,

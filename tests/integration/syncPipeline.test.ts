@@ -970,6 +970,71 @@ describe('reconciliation', () => {
     expect(coverage.eligible?.mappedPaidInstalls).toBe(50);
   });
 
+  it('narrows both sides of a filtered CPI, not just the spend', async () => {
+    // A filter has to reach the delivery test behind the denominator too. With
+    // country=US, spend narrows to US while "delivered" still meant delivered
+    // anywhere - so a campaign that ran only in GB kept contributing its US
+    // installs to a denominator its US spend never paid for, and the CPI came
+    // out too low.
+    controls.marketingRows = [
+      {
+        reportDate: '2026-08-20',
+        campaignId: '900',
+        campaignName: 'US campaign',
+        spend: 100,
+        impressions: 5000,
+        clicks: 100,
+        country: 'US',
+      },
+      {
+        reportDate: '2026-08-20',
+        campaignId: '901',
+        campaignName: 'GB campaign',
+        spend: 60,
+        impressions: 3000,
+        clicks: 60,
+        country: 'GB',
+      },
+    ];
+    controls.attributionRows = [
+      {
+        installDate: '2026-08-20',
+        campaignId: '900',
+        campaignName: 'US campaign',
+        installs: 50,
+        country: 'US',
+      },
+      // Installs recorded against the GB-only campaign but attributed in US.
+      {
+        installDate: '2026-08-20',
+        campaignId: '901',
+        campaignName: 'GB campaign',
+        installs: 50,
+        country: 'US',
+      },
+    ];
+    const ctx = await setup();
+    await triggerSync(ctx, '2026-08-20', '2026-08-20');
+    await reconcile(ctx.user.organizationId, ctx.appId);
+
+    const response = await request(
+      ctx.user,
+      'GET',
+      `/api/v1/organizations/${ctx.user.organizationId}/apps/${ctx.appId}/metrics?from=2026-08-20&to=2026-08-20&country=US`,
+    );
+    const metrics = (
+      response.json() as { metrics: Array<{ metricKey: string; value: number | null }> }
+    ).metrics;
+    const value = (key: string): number | null =>
+      metrics.find((m) => m.metricKey === key)?.value ?? null;
+
+    // Only the US campaign delivered in US, so only its 50 installs align.
+    expect(value('delivery_aligned_paid_installs')).toBe(50);
+    // 100 US spend / 50 aligned installs. Counting the GB campaign's US
+    // installs would have given 2.00 - a third lower, and entirely plausible.
+    expect(value('mapped_cpi')).toBeCloseTo(2.0, 6);
+  });
+
   it('never reports a campaign as covered and as a discrepancy at once', async () => {
     // Coverage counted a deterministic name match as mapped while the
     // discrepancy list counted the same campaign as unmapped, so the Command

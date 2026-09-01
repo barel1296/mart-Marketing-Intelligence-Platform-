@@ -96,7 +96,23 @@ export function mappedAttributionCampaign(alias = 't'): string {
  * `from` and `to` are the bind placeholders for the window, so the caller keeps
  * control of parameter order.
  */
-export function deliveryAlignedCampaign(window: { from: string; to: string }, alias = 't'): string {
+export function deliveryAlignedCampaign(
+  window: {
+    from: string;
+    to: string;
+    /**
+     * Extra SQL narrowing the DELIVERY side, bound to alias `md`.
+     *
+     * Whatever filter narrows the rows being counted has to narrow this too.
+     * Filtering installs to one country while "delivered" still means delivered
+     * anywhere puts installs in the denominator that the filtered spend never
+     * bought - the same mismatch this predicate exists to prevent, arriving
+     * through the filter instead of through the window.
+     */
+    delivery?: string;
+  },
+  alias = 't',
+): string {
   return `${alias}.external_campaign_id IN (
     SELECT m.target_external_id FROM provider_entity_mappings m
     JOIN (
@@ -104,7 +120,7 @@ export function deliveryAlignedCampaign(window: { from: string; to: string }, al
       FROM marketing_daily_metrics md
       WHERE md.organization_id = ${alias}.organization_id AND md.app_id = ${alias}.app_id
         AND md.report_date BETWEEN ${window.from} AND ${window.to}
-        AND (md.spend > 0 OR md.impressions > 0 OR md.clicks > 0)
+        AND (md.spend > 0 OR md.impressions > 0 OR md.clicks > 0)${window.delivery ?? ''}
     ) delivered
       ON delivered.external_campaign_id = m.source_external_id
      AND delivered.provider_key = m.source_provider
