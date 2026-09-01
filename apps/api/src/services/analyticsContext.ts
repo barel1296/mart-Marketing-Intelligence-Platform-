@@ -52,7 +52,7 @@ export async function buildMetricContext(
    * coverage metrics computable; without it only the all-structure numbers
    * exist, and the period ones correctly report that they have no period.
    */
-  window?: { from: IsoDate; to: IsoDate },
+  window?: { from: IsoDate; to: IsoDate; country?: string | null; platform?: string | null },
 ): Promise<{
   context: MetricContext;
   state: AppIntegrationState;
@@ -91,6 +91,11 @@ export async function buildMetricContext(
               from: window.from,
               to: window.to,
               attributionProviderKey: state.attributionProviderKey,
+              // The coverage cards sit beside the KPIs and must describe the
+              // same slice: account-wide coverage over a country-filtered
+              // dashboard answers a question nobody asked.
+              country: window.country ?? null,
+              platform: window.platform ?? null,
             }
           : undefined,
       )

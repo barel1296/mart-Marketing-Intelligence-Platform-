@@ -970,6 +970,123 @@ describe('reconciliation', () => {
     expect(coverage.eligible?.mappedPaidInstalls).toBe(50);
   });
 
+  it('narrows coverage to the filtered slice, not the whole account', async () => {
+    // Coverage sits beside the KPIs and has to describe the same population.
+    // Account-wide coverage over a country-filtered dashboard reads as though
+    // the filtered view were well covered when it may not be at all.
+    controls.marketingRows = [
+      {
+        reportDate: '2026-08-20',
+        campaignId: '900',
+        campaignName: 'Mapped US',
+        spend: 100,
+        impressions: 5000,
+        clicks: 100,
+        country: 'US',
+      },
+      {
+        reportDate: '2026-08-20',
+        campaignId: '901',
+        campaignName: 'Unmapped GB',
+        spend: 80,
+        impressions: 4000,
+        clicks: 80,
+        country: 'GB',
+      },
+    ];
+    controls.attributionRows = [
+      {
+        installDate: '2026-08-20',
+        campaignId: '900',
+        campaignName: 'Mapped US',
+        installs: 40,
+        country: 'US',
+      },
+    ];
+    const ctx = await setup();
+    await triggerSync(ctx, '2026-08-20', '2026-08-20');
+    await reconcile(ctx.user.organizationId, ctx.appId);
+
+    type Body = {
+      coverage: {
+        eligible: {
+          eligibleCampaigns: number;
+          mappedCampaigns: number;
+          totalSpend: number;
+          mappedSpend: number;
+        } | null;
+      };
+      discrepancies: Array<{ kind: string; externalCampaignId: string | null }>;
+    };
+    const url = (suffix: string): string =>
+      `/api/v1/organizations/${ctx.user.organizationId}/apps/${ctx.appId}/reconciliation?from=2026-08-20&to=2026-08-20${suffix}`;
+
+    const all = (await request(ctx.user, 'GET', url(''))).json() as Body;
+    // Account-wide: two campaigns delivered, one of them mapped.
+    expect(all.coverage.eligible?.eligibleCampaigns).toBe(2);
+    expect(all.coverage.eligible?.mappedCampaigns).toBe(1);
+    expect(all.coverage.eligible?.totalSpend).toBe(180);
+
+    const us = (await request(ctx.user, 'GET', url('&country=US'))).json() as Body;
+    // In US only the mapped campaign ran: both numerator and denominator move.
+    expect(us.coverage.eligible?.eligibleCampaigns).toBe(1);
+    expect(us.coverage.eligible?.mappedCampaigns).toBe(1);
+    expect(us.coverage.eligible?.totalSpend).toBe(100);
+    expect(us.coverage.eligible?.mappedSpend).toBe(100);
+
+    // And the list beside it agrees: the GB campaign is not a US gap.
+    expect(us.discrepancies.map((d) => d.externalCampaignId)).not.toContain('901');
+    expect(all.discrepancies.map((d) => d.externalCampaignId)).toContain('901');
+  });
+
+  it('narrows coverage by platform on both sides too', async () => {
+    controls.marketingRows = [
+      {
+        reportDate: '2026-08-20',
+        campaignId: '900',
+        campaignName: 'iOS campaign',
+        spend: 100,
+        impressions: 5000,
+        clicks: 100,
+        platform: 'ios',
+      },
+      {
+        reportDate: '2026-08-20',
+        campaignId: '901',
+        campaignName: 'Android campaign',
+        spend: 70,
+        impressions: 3000,
+        clicks: 70,
+        platform: 'android',
+      },
+    ];
+    controls.attributionRows = [
+      {
+        installDate: '2026-08-20',
+        campaignId: '900',
+        campaignName: 'iOS campaign',
+        installs: 30,
+        platform: 'ios',
+      },
+    ];
+    const ctx = await setup();
+    await triggerSync(ctx, '2026-08-20', '2026-08-20');
+    await reconcile(ctx.user.organizationId, ctx.appId);
+
+    type Body = {
+      coverage: { eligible: { eligibleCampaigns: number; totalSpend: number } | null };
+    };
+    const body = (
+      await request(
+        ctx.user,
+        'GET',
+        `/api/v1/organizations/${ctx.user.organizationId}/apps/${ctx.appId}/reconciliation?from=2026-08-20&to=2026-08-20&platform=ios`,
+      )
+    ).json() as Body;
+    expect(body.coverage.eligible?.eligibleCampaigns).toBe(1);
+    expect(body.coverage.eligible?.totalSpend).toBe(100);
+  });
+
   it('keeps organic out of a campaign row, as the top line already does', async () => {
     // Section 23: the table's rows must reconcile with the population above
     // them. Every top-line mapped figure excludes organic; a row that included

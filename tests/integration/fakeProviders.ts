@@ -31,6 +31,7 @@ export type FakeControls = {
     impressions: number;
     clicks: number;
     country?: string | null;
+    platform?: string | null;
   }>;
   attributionRows: Array<{
     installDate: IsoDate;
@@ -38,6 +39,7 @@ export type FakeControls = {
     campaignName: string;
     installs: number;
     country?: string | null;
+    platform?: string | null;
     revenue?: number;
     /** Defaults to the paid network. Set 'Organic' to exercise unpaid traffic. */
     mediaSource?: string;
@@ -217,7 +219,7 @@ class FakeMetaProvider implements MarketingNetworkProvider {
         externalAdId: null,
         externalCreativeId: null,
         country: row.country ?? null,
-        platform: null,
+        platform: row.platform ?? null,
         currency: 'USD',
         spend: row.spend,
         impressions: row.impressions,
@@ -306,7 +308,7 @@ class FakeAttributionProvider implements AttributionProvider {
         externalCreativeId: null,
         creativeName: null,
         country: row.country ?? null,
-        platform: 'ios',
+        platform: row.platform ?? 'ios',
         attributionCertainty: 'deterministic' as const,
         attributedInstalls: row.installs,
         attributedClicks: null,
@@ -355,7 +357,7 @@ class FakeAttributionProvider implements AttributionProvider {
       externalCampaignId: row.campaignId,
       campaignName: row.campaignName,
       country: row.country ?? null,
-      platform: 'ios',
+      platform: row.platform ?? 'ios',
       currency: 'USD',
       revenue: row.revenue ?? 0,
     }));

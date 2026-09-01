@@ -66,7 +66,7 @@ export async function registerAnalyticsRoutes(server: FastifyInstance): Promise<
     const { context: metricContext, state } = await buildMetricContext(
       context.organizationId,
       app,
-      range,
+      { ...range, country: query.country ?? null, platform: query.platform ?? null },
     );
     const filters: MetricFilters = {
       organizationId: context.organizationId,
@@ -216,6 +216,8 @@ export async function registerAnalyticsRoutes(server: FastifyInstance): Promise<
           from: range.from,
           to: range.to,
           attributionProviderKey: state.attributionProviderKey,
+          country: query.country ?? null,
+          platform: query.platform ?? null,
         }),
         loadReconciliationDiscrepancies({
           organizationId: context.organizationId,
@@ -224,6 +226,10 @@ export async function registerAnalyticsRoutes(server: FastifyInstance): Promise<
           to: range.to,
           marketingProviderKey: state.marketingProviderKey,
           attributionProviderKey: state.attributionProviderKey,
+          // The lists name the campaigns behind the coverage figure beside
+          // them, so they have to be drawn from the same filtered rows.
+          country: query.country ?? null,
+          platform: query.platform ?? null,
         }),
         mappingsRepo.listMappings(context.organizationId, app.id, {
           entityType: 'campaign',

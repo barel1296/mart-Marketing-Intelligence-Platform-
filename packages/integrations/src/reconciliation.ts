@@ -771,11 +771,28 @@ export type EligibleCoverage = {
 /** One definition, shared with the metric layer, so coverage cannot disagree. */
 const OPERATIONAL_MAPPING = operationalMapping('m');
 
+/**
+ * The selected-period slice a coverage figure describes.
+ *
+ * The dimension filters belong here for the same reason they belong on a
+ * metric: a coverage percentage is only meaningful about a stated population.
+ * Reporting account-wide coverage beside country-filtered KPIs answers a
+ * question nobody asked, and reads as though the filtered view were well
+ * covered when it may not be.
+ */
+export type CoverageWindow = {
+  from: IsoDate;
+  to: IsoDate;
+  attributionProviderKey?: string | null;
+  country?: string | null;
+  platform?: string | null;
+};
+
 export async function campaignCoverage(
   organizationId: string,
   appId: string,
   marketingProviderKey: string,
-  window?: { from: IsoDate; to: IsoDate; attributionProviderKey?: string | null },
+  window?: CoverageWindow,
 ): Promise<CoverageSummary> {
   // One row per campaign, not per mapping. A marketing campaign with three
   // attribution children is one campaign that is mapped, not three - counting
@@ -866,18 +883,43 @@ async function eligibleCoverage(
   organizationId: string,
   appId: string,
   marketingProviderKey: string,
-  window: { from: IsoDate; to: IsoDate; attributionProviderKey?: string | null },
+  window: CoverageWindow,
 ): Promise<EligibleCoverage> {
   // Each query binds exactly the parameters it references: Postgres rejects a
   // bind carrying more than the statement uses.
-  const campaignParams = [organizationId, appId, marketingProviderKey, window.from, window.to];
-  const installParams = [
+  const campaignParams: unknown[] = [
+    organizationId,
+    appId,
+    marketingProviderKey,
+    window.from,
+    window.to,
+  ];
+  const installParams: unknown[] = [
     organizationId,
     appId,
     window.from,
     window.to,
     window.attributionProviderKey ?? null,
   ];
+
+  // The same dimension narrowing the KPIs has to narrow their coverage, or the
+  // panel answers a different question from the cards above it. Each side binds
+  // its own placeholders because the two queries have different parameter
+  // counts.
+  let campaignDimensions = '';
+  let installDimensions = '';
+  if (window.country) {
+    campaignParams.push(window.country);
+    campaignDimensions += ` AND country = $${campaignParams.length}`;
+    installParams.push(window.country);
+    installDimensions += ` AND a.country = $${installParams.length}`;
+  }
+  if (window.platform) {
+    campaignParams.push(window.platform);
+    campaignDimensions += ` AND platform = $${campaignParams.length}`;
+    installParams.push(window.platform);
+    installDimensions += ` AND a.platform = $${installParams.length}`;
+  }
 
   const campaigns = await queryRows<{
     state: 'mapped' | 'ambiguous' | 'unmapped';
@@ -892,7 +934,7 @@ async function eligibleCoverage(
        FROM marketing_daily_metrics
        WHERE organization_id = $1 AND app_id = $2 AND provider_key = $3
          AND report_date BETWEEN $4 AND $5
-         AND external_campaign_id IS NOT NULL
+         AND external_campaign_id IS NOT NULL${campaignDimensions}
        GROUP BY external_campaign_id
        HAVING SUM(spend) > 0 OR SUM(impressions) > 0 OR SUM(clicks) > 0
      ),
@@ -965,7 +1007,7 @@ async function eligibleCoverage(
        FROM attribution_daily_metrics a
       WHERE a.organization_id = $1 AND a.app_id = $2
         AND a.install_date BETWEEN $3 AND $4
-        AND ($5::text IS NULL OR a.provider_key = $5)
+        AND ($5::text IS NULL OR a.provider_key = $5)${installDimensions}
       GROUP BY state`,
     installParams,
   );

@@ -490,6 +490,42 @@ export async function loadReconciliationDiscrepancies(
   const attributionProvider = filters.attributionProviderKey ?? null;
   const out: ReconciliationDiscrepancy[] = [];
 
+  // These lists name the campaigns behind the coverage figure they are shown
+  // with. Drawing them from unfiltered rows while coverage is filtered lets the
+  // panel list a campaign as a gap in a slice that campaign never ran in.
+  const deliveryParams: unknown[] = [
+    filters.organizationId,
+    filters.appId,
+    filters.from,
+    filters.to,
+    marketingProvider,
+  ];
+  const installParams: unknown[] = [
+    filters.organizationId,
+    filters.appId,
+    filters.from,
+    filters.to,
+    attributionProvider,
+  ];
+  let deliveryDimensions = '';
+  let installDimensions = '';
+  if (filters.country) {
+    deliveryParams.push(filters.country);
+    deliveryDimensions += ` AND m.country = $${deliveryParams.length}`;
+    installParams.push(filters.country);
+    installDimensions += ` AND a.country = $${installParams.length}`;
+  }
+  if (filters.platform) {
+    deliveryParams.push(filters.platform);
+    deliveryDimensions += ` AND m.platform = $${deliveryParams.length}`;
+    installParams.push(filters.platform);
+    installDimensions += ` AND a.platform = $${installParams.length}`;
+  }
+  deliveryParams.push(limit);
+  const deliveryLimit = `$${deliveryParams.length}`;
+  installParams.push(limit);
+  const installLimit = `$${installParams.length}`;
+
   const spendWithoutAttribution = await queryRows<{
     external_campaign_id: string;
     campaign_name: string | null;
@@ -510,12 +546,12 @@ export async function loadReconciliationDiscrepancies(
      WHERE m.organization_id = $1 AND m.app_id = $2
        AND m.report_date BETWEEN $3 AND $4
        AND m.provider_key = $5
-       AND map.id IS NULL
+       AND map.id IS NULL${deliveryDimensions}
      GROUP BY m.external_campaign_id
      HAVING SUM(m.spend) > 0
      ORDER BY SUM(m.spend) DESC
-     LIMIT $6`,
-    [filters.organizationId, filters.appId, filters.from, filters.to, marketingProvider, limit],
+     LIMIT ${deliveryLimit}`,
+    deliveryParams,
   );
 
   for (const row of spendWithoutAttribution) {
@@ -547,12 +583,12 @@ export async function loadReconciliationDiscrepancies(
      WHERE a.organization_id = $1 AND a.app_id = $2
        AND a.install_date BETWEEN $3 AND $4
        AND ($5::text IS NULL OR a.provider_key = $5)
-       AND map.id IS NULL
+       AND map.id IS NULL${installDimensions}
      GROUP BY a.external_campaign_id
      HAVING SUM(a.attributed_installs) > 0
      ORDER BY SUM(a.attributed_installs) DESC
-     LIMIT $6`,
-    [filters.organizationId, filters.appId, filters.from, filters.to, attributionProvider, limit],
+     LIMIT ${installLimit}`,
+    installParams,
   );
 
   for (const row of attributionWithoutMapping) {
@@ -566,7 +602,7 @@ export async function loadReconciliationDiscrepancies(
       detail:
         row.external_campaign_id === null
           ? 'The attribution provider did not supply a campaign id for these installs, so they cannot be reconciled by id.'
-          : 'These attributed installs have no authoritative link to a marketing-network campaign.',
+          : 'These attributed installs have no usable link to a marketing-network campaign.',
     });
   }
 
