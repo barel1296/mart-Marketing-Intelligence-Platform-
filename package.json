@@ -23,6 +23,7 @@
     "reconcile-audit": "node packages/integrations/dist/cli/reconcile-audit.js",
     "kpi-audit": "node packages/integrations/dist/cli/kpi-audit.js",
     "phase0-audit": "node packages/integrations/dist/cli/phase0-audit.js",
+    "phase1-audit": "node packages/integrations/dist/cli/phase1-audit.js",
     "dev:fixtures": "MART_ENABLE_FIXTURES=true node scripts/fixture-provider-server.mjs",
     "dev:api": "pnpm --filter @mart/api dev",
     "dev:worker": "pnpm --filter @mart/worker dev",
