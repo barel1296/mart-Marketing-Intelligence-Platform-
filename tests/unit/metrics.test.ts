@@ -372,6 +372,19 @@ describe('currency isolation', () => {
     }
   });
 
+  it('does not block a CPI on currencies that are not in its arithmetic', () => {
+    // Cost per install is spend over installs. The revenue table's currency is
+    // not part of that calculation, so refusing a well-defined USD CPI because
+    // some revenue row arrived in JPY would be a false refusal - and a refusal
+    // nobody can act on is no better than a wrong number.
+    const mixedRevenue = { ...attribution, currencies: ['USD', 'JPY'] };
+    for (const key of ['mapped_cpi', 'blended_cpi']) {
+      const value = metric(key, context(), marketing, mixedRevenue);
+      expect(value?.availability, key).not.toBe('blocked');
+      expect(value?.value, key).not.toBeNull();
+    }
+  });
+
   it('blocks a revenue metric on mixed attribution currencies', () => {
     const mixed = { ...attribution, currencies: ['USD', 'JPY'] };
     const value = metric('attributed_revenue', context(), marketing, mixed);

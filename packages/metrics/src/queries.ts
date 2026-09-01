@@ -3,7 +3,7 @@ import { OPERATIONAL_MAPPING_CONFIDENCE } from '@mart/shared';
 import { queryRows, toNumber, toNullableNumber } from '@mart/db';
 import type { MetricFilters } from './service.js';
 import { safeRatio } from './registry.js';
-import { operationalMapping } from './populations.js';
+import { notOrganic, operationalMapping } from './populations.js';
 
 /**
  * When the campaign table may show attribution beside delivery.
@@ -378,6 +378,11 @@ export async function loadCampaignTable(
          AND a.install_date BETWEEN $3 AND $4
          AND ($6::text IS NULL OR a.provider_key = $6)
          AND a.external_campaign_id = ANY(map.target_external_ids)
+         -- Organic belongs to no campaign. Every top-line mapped figure
+         -- excludes it, so a row that included it would not reconcile with the
+         -- total above the table - and would credit a campaign with installs it
+         -- never bought.
+         AND ${notOrganic('a')}
          ${attributionFilterFor('a')}
      ) attribution ON map.target_external_ids IS NOT NULL
      LEFT JOIN LATERAL (
@@ -388,6 +393,7 @@ export async function loadCampaignTable(
          AND r.grain = 'event_date'
          AND ($6::text IS NULL OR r.provider_key = $6)
          AND r.external_campaign_id = ANY(map.target_external_ids)
+         AND ${notOrganic('r')}
          ${attributionFilterFor('r')}
      ) attribution_revenue ON map.target_external_ids IS NOT NULL
      WHERE true ${mappingFilter}

@@ -970,6 +970,61 @@ describe('reconciliation', () => {
     expect(coverage.eligible?.mappedPaidInstalls).toBe(50);
   });
 
+  it('keeps organic out of a campaign row, as the top line already does', async () => {
+    // Section 23: the table's rows must reconcile with the population above
+    // them. Every top-line mapped figure excludes organic; a row that included
+    // it would credit the campaign with installs it never bought, and the table
+    // would stop summing to the total printed over it.
+    controls.marketingRows = [
+      {
+        reportDate: '2026-08-20',
+        campaignId: '900',
+        campaignName: 'Summer',
+        spend: 100,
+        impressions: 5000,
+        clicks: 100,
+      },
+    ];
+    controls.attributionRows = [
+      { installDate: '2026-08-20', campaignId: '900', campaignName: 'Summer', installs: 40 },
+      // Organic traffic that the MMP happens to stamp with the same campaign id.
+      {
+        installDate: '2026-08-20',
+        campaignId: '900',
+        campaignName: 'Summer',
+        installs: 25,
+        mediaSource: 'Organic',
+      },
+    ];
+    const ctx = await setup();
+    await triggerSync(ctx, '2026-08-20', '2026-08-20');
+    await reconcile(ctx.user.organizationId, ctx.appId);
+
+    const table = await request(
+      ctx.user,
+      'GET',
+      `/api/v1/organizations/${ctx.user.organizationId}/apps/${ctx.appId}/campaigns?from=2026-08-20&to=2026-08-20`,
+    );
+    const row = (
+      table.json() as {
+        rows: Array<{ externalCampaignId: string; attributedInstalls: number | null }>;
+      }
+    ).rows.find((r) => r.externalCampaignId === '900');
+
+    const metrics = await request(
+      ctx.user,
+      'GET',
+      `/api/v1/organizations/${ctx.user.organizationId}/apps/${ctx.appId}/metrics?from=2026-08-20&to=2026-08-20`,
+    );
+    const topLine = (
+      metrics.json() as { metrics: Array<{ metricKey: string; value: number | null }> }
+    ).metrics.find((m) => m.metricKey === 'mapped_paid_installs');
+
+    // 40, not 65: the row and the total describe the same population.
+    expect(row?.attributedInstalls).toBe(40);
+    expect(row?.attributedInstalls).toBe(topLine?.value);
+  });
+
   it('narrows both sides of a filtered CPI, not just the spend', async () => {
     // A filter has to reach the delivery test behind the denominator too. With
     // country=US, spend narrows to US while "delivered" still meant delivered

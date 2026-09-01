@@ -447,10 +447,14 @@ function buildMetricValue(
   // have and must not invent, and the sum would look entirely ordinary. Blocked
   // rather than unavailable: the arithmetic is possible, the meaning is not.
   if (definition.unit === 'currency') {
-    const currencies = new Set<string>([
-      ...(definition.sources.includes('marketing') ? marketing.currencies : []),
-      ...(definition.sources.includes('attribution') ? attribution.currencies : []),
-    ]);
+    // Only the currencies that actually feed THIS metric's arithmetic. A CPI
+    // reads spend and installs - the revenue table's currency is not in the
+    // calculation, so blocking a well-defined USD cost per install because some
+    // revenue row arrived in JPY would be a false refusal, and a refusal that
+    // cannot be acted on is as unhelpful as a wrong number.
+    const currencies = new Set<string>(
+      definition.family === 'revenue' ? attribution.currencies : marketing.currencies,
+    );
     if (currencies.size > 1) {
       const listed = [...currencies].sort().join(', ');
       return {
