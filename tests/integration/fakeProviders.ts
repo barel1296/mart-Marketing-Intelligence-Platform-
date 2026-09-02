@@ -46,7 +46,7 @@ export type FakeControls = {
   }>;
   /** Windows (from..to) that should fail, to exercise partial completion. */
   failWindows: Set<string>;
-  failureClass: 'invalid_request' | 'rate_limited';
+  failureClass: 'invalid_request' | 'rate_limited' | 'authentication_error';
   /** Count of provider calls, to assert idempotent re-runs actually re-fetch. */
   calls: { structure: number; performance: number; installs: number; revenue: number };
   attributionCapabilities: Partial<Record<string, boolean>>;
@@ -94,6 +94,9 @@ function maybeFail(params: SyncParams): void {
     message: `injected ${controls.failureClass} for ${windowKey(params)}`,
     userMessage: 'Injected failure',
     retryable: controls.failureClass === 'rate_limited',
+    httpStatus: 400,
+    // What a real adapter attaches: the provider's sanitized words.
+    context: { bodyPreview: '{"error":{"message":"(#100) injected","code":100}}' },
   });
 }
 

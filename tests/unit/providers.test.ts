@@ -3,6 +3,8 @@ import {
   AppsFlyerAttributionProvider,
   MetaAdsProvider,
   ProviderHttpClient,
+  classifyGraphError,
+  parseGraphError,
   TenjinAttributionProvider,
   parseCsvTable,
   toCanonicalAd,
@@ -271,6 +273,187 @@ describe('Meta Ads adapter', () => {
     expect(rows.map((r) => r.platform)).toEqual(['ios', 'android']);
     // The provider's own spelling survives beside the canonical value.
     expect(rows.map((r) => r.nativePlatform)).toEqual(['iphone', 'android_smartphone']);
+  });
+});
+
+describe('Meta Graph error classification', () => {
+  const body = (error: Record<string, unknown>): string => JSON.stringify({ error });
+
+  it('reads the numeric code, not the "OAuthException" label', () => {
+    // Every one of these carries type: OAuthException. Only one is about the
+    // token.
+    const cases: Array<[Record<string, unknown>, string]> = [
+      [
+        { message: '(#100) breakdowns invalid', type: 'OAuthException', code: 100 },
+        'invalid_request',
+      ],
+      [{ message: '(#10) no permission', type: 'OAuthException', code: 10 }, 'authorization_error'],
+      [
+        { message: '(#200) requires ads_read', type: 'OAuthException', code: 200 },
+        'authorization_error',
+      ],
+      [
+        { message: '(#17) User request limit reached', type: 'OAuthException', code: 17 },
+        'rate_limited',
+      ],
+      [
+        { message: '(#4) Application request limit', type: 'OAuthException', code: 4 },
+        'rate_limited',
+      ],
+      [{ message: 'Ad account limit', type: 'OAuthException', code: 80004 }, 'rate_limited'],
+      [
+        { message: 'An unknown error occurred', type: 'OAuthException', code: 1 },
+        'provider_unavailable',
+      ],
+      [
+        { message: 'Invalid OAuth access token', type: 'OAuthException', code: 190 },
+        'authentication_error',
+      ],
+      [
+        {
+          message: 'Error validating access token: Session has expired',
+          type: 'OAuthException',
+          code: 190,
+          error_subcode: 463,
+        },
+        'expired_credential',
+      ],
+      [
+        { message: 'Session key invalid', type: 'OAuthException', code: 102 },
+        'authentication_error',
+      ],
+    ];
+    for (const [error, expected] of cases) {
+      expect(classifyGraphError(400, body(error)), String(error['code'])).toBe(expected);
+    }
+  });
+
+  it('defers to the generic classifier when the body is not a Graph envelope', () => {
+    expect(classifyGraphError(400, 'not json')).toBeNull();
+    expect(classifyGraphError(400, '{"unrelated":true}')).toBeNull();
+  });
+
+  it('parses the envelope MART shows a person diagnosing a refusal', () => {
+    const parsed = parseGraphError(
+      body({ message: '(#100) x', type: 'OAuthException', code: 100, error_subcode: 1815857 }),
+    );
+    expect(parsed).toEqual({
+      code: 100,
+      subcode: 1815857,
+      type: 'OAuthException',
+      message: '(#100) x',
+    });
+  });
+});
+
+describe('Meta breakdown fallback under the real error shape', () => {
+  const refusal = (message: string, code: number): Response =>
+    new Response(JSON.stringify({ error: { message, type: 'OAuthException', code } }), {
+      status: 400,
+    });
+  const ok = (row: Record<string, unknown>): Response =>
+    new Response(
+      JSON.stringify({
+        data: [
+          {
+            date_start: '2026-08-20',
+            campaign_id: '900',
+            spend: '1',
+            impressions: '10',
+            clicks: '1',
+            ...row,
+          },
+        ],
+      }),
+    );
+
+  it('steps down to country when Meta refuses the combination with a code-100 error', async () => {
+    // The production incident: the combination is refused with code 100, which
+    // is a statement about the QUERY. It must degrade, keep country, and never
+    // become a credential failure.
+    const requested: string[] = [];
+    const impl = async (url: string): Promise<Response> => {
+      requested.push(url);
+      if (url.includes('impression_device')) {
+        return refusal('(#100) impression_device is not compatible with country', 100);
+      }
+      return ok({ country: 'US' });
+    };
+    const provider = new MetaAdsProvider({
+      credentials: { kind: 'meta_ads', accessToken: 't'.repeat(30) },
+      baseUrl: 'https://graph.example.com',
+      apiVersion: 'v21.0',
+      http: new ProviderHttpClient({
+        provider: 'meta_ads',
+        fetchImpl: impl,
+        classifyError: classifyGraphError,
+        maxAttempts: 1,
+        sleep: async () => undefined,
+      }),
+    });
+    const result = await provider.syncPerformance(params);
+    const row = result.batch.dailyMetrics[0];
+    expect(row?.country).toBe('US');
+    expect(row?.platform).toBe('unknown');
+    expect(result.warnings.join(' ')).toMatch(/device/i);
+    expect(requested.filter((u) => u.includes('breakdowns=country')).length).toBeGreaterThan(0);
+  });
+
+  it('does not degrade on a real token error - that must surface as what it is', async () => {
+    const impl = async (): Promise<Response> =>
+      new Response(
+        JSON.stringify({
+          error: { message: 'Invalid OAuth access token', type: 'OAuthException', code: 190 },
+        }),
+        { status: 400 },
+      );
+    const provider = new MetaAdsProvider({
+      credentials: { kind: 'meta_ads', accessToken: 't'.repeat(30) },
+      baseUrl: 'https://graph.example.com',
+      apiVersion: 'v21.0',
+      http: new ProviderHttpClient({
+        provider: 'meta_ads',
+        fetchImpl: impl,
+        classifyError: classifyGraphError,
+        maxAttempts: 1,
+        sleep: async () => undefined,
+      }),
+    });
+    await expect(provider.syncPerformance(params)).rejects.toMatchObject({
+      errorClass: 'authentication_error',
+    });
+  });
+
+  it("records the platform capability from the probe, with Meta's reason beside it", async () => {
+    const impl = async (url: string): Promise<Response> => {
+      if (url.includes('impression_device') && url.includes('country')) {
+        return refusal('(#100) impression_device is not compatible with country', 100);
+      }
+      return ok({});
+    };
+    const provider = new MetaAdsProvider({
+      credentials: { kind: 'meta_ads', accessToken: 't'.repeat(30) },
+      baseUrl: 'https://graph.example.com',
+      apiVersion: 'v21.0',
+      http: new ProviderHttpClient({
+        provider: 'meta_ads',
+        fetchImpl: impl,
+        classifyError: classifyGraphError,
+        maxAttempts: 1,
+        sleep: async () => undefined,
+      }),
+    });
+    const capabilities = await provider.getCapabilities('act_1');
+    const platform = capabilities.find((c) => c.key === 'platform');
+    expect(platform?.supported).toBe(false);
+    expect(platform?.discoveryMethod).toBe('probed');
+    expect(platform?.detail).toMatchObject({
+      compatibleWithCountry: false,
+      aloneSupported: true,
+      graphCode: 100,
+    });
+    // Country itself is unaffected.
+    expect(capabilities.find((c) => c.key === 'country')?.supported).toBe(true);
   });
 });
 

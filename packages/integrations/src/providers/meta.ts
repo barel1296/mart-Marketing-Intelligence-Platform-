@@ -1,4 +1,5 @@
 import type {
+  ProviderErrorClass,
   CanonicalAd,
   CanonicalAdGroup,
   CanonicalCampaign,
@@ -136,6 +137,69 @@ const INSIGHT_FIELDS = [
 const PAGE_LIMIT = 200;
 const MAX_PAGES = 200;
 
+/**
+ * Meta's error envelope. `type` is "OAuthException" for almost everything -
+ * including a malformed parameter - so it carries no signal. `code` does.
+ */
+export type GraphError = {
+  code: number | null;
+  subcode: number | null;
+  type: string | null;
+  message: string | null;
+};
+
+export function parseGraphError(bodyText: string): GraphError | null {
+  try {
+    const parsed = JSON.parse(bodyText) as { error?: Record<string, unknown> };
+    const error = parsed?.error;
+    if (!error || typeof error !== 'object') return null;
+    const num = (v: unknown): number | null => (typeof v === 'number' ? v : null);
+    const str = (v: unknown): string | null => (typeof v === 'string' ? v : null);
+    return {
+      code: num(error['code']),
+      subcode: num(error['error_subcode']),
+      type: str(error['type']),
+      message: str(error['message']),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Classify a Graph API failure by the code Meta publishes, not by its label.
+ *
+ * Documented codes (Marketing API error reference):
+ *   190            invalid/expired access token (subcodes 458-467 name why)
+ *   102            session key invalid
+ *   10, 200-299    permission denied for this action or object
+ *   4, 17, 32, 613, 80000-80014   application / user / ad-account rate limits
+ *   1, 2           transient "unknown error, try again"
+ *   100            invalid parameter - the request itself is wrong
+ *
+ * Returning null hands the decision to the generic classifier, which reads
+ * status and prose only.
+ */
+export function classifyGraphError(status: number, bodyText: string): ProviderErrorClass | null {
+  const graph = parseGraphError(bodyText);
+  if (!graph || graph.code === null) return null;
+  const { code, subcode, message } = graph;
+
+  if (code === 190 || code === 102) {
+    const expiredSubcodes = new Set([458, 459, 460, 463, 464, 467]);
+    const expired =
+      (subcode !== null && expiredSubcodes.has(subcode)) || /expire/i.test(message ?? '');
+    return expired ? 'expired_credential' : 'authentication_error';
+  }
+  if (code === 10 || (code >= 200 && code <= 299)) return 'authorization_error';
+  if (code === 4 || code === 17 || code === 32 || code === 613) return 'rate_limited';
+  if (code >= 80000 && code <= 80014) return 'rate_limited';
+  if (code === 1 || code === 2) return 'provider_unavailable';
+  // 100 and anything else Meta answers with a 4xx: the request was wrong.
+  if (status >= 400 && status < 500) return 'invalid_request';
+  return null;
+}
+
 export class MetaAdsProvider implements MarketingNetworkProvider {
   readonly providerKey = 'meta_ads' as const;
   readonly category = 'marketing_network' as const;
@@ -151,7 +215,14 @@ export class MetaAdsProvider implements MarketingNetworkProvider {
     this.apiVersion = options.apiVersion;
     this.http =
       options.http ??
-      new ProviderHttpClient({ provider: 'meta_ads', minIntervalMs: 120, maxAttempts: 3 });
+      new ProviderHttpClient({
+        provider: 'meta_ads',
+        minIntervalMs: 120,
+        maxAttempts: 3,
+        // Meta publishes numeric error codes; read them rather than guessing
+        // from a label that says "OAuthException" about a malformed query.
+        classifyError: classifyGraphError,
+      });
   }
 
   private url(path: string): string {
@@ -309,9 +380,9 @@ export class MetaAdsProvider implements MarketingNetworkProvider {
         ad_id: true,
         creative: true,
         creative_id: true,
-        // Reported through the impression_device breakdown, where the account
-        // allows it; the run says so when it does not.
-        platform: true,
+        // Probed below: whether the device breakdown is served alongside
+        // country is a property of the account, not of MART.
+        platform: false,
         impressions: true,
         clicks: true,
         link_clicks: true,
@@ -332,16 +403,116 @@ export class MetaAdsProvider implements MarketingNetworkProvider {
 
     if (!externalAccountId) return base;
 
-    const probe = await this.probeCountryBreakdown(externalAccountId);
+    const [country, platform] = await Promise.all([
+      this.probeCountryBreakdown(externalAccountId),
+      this.probePlatformBreakdown(externalAccountId),
+    ]);
+    // The probed rows replace the declared `platform: false` above: a probe is
+    // evidence, a declaration is an assumption.
     return [
-      ...base,
+      ...base.filter((c) => c.key !== 'platform'),
       {
         key: 'country',
-        supported: probe.supported,
+        supported: country.supported,
         discoveryMethod: 'probed',
-        detail: probe.detail,
+        detail: country.detail,
+      },
+      {
+        key: 'platform',
+        supported: platform.supported,
+        discoveryMethod: 'probed',
+        detail: platform.detail,
       },
     ];
+  }
+
+  /**
+   * Ask the account whether it will serve one breakdown set, for one day.
+   *
+   * Returns the outcome rather than throwing, and keeps Meta's own code and
+   * message beside MART's classification, so a person diagnosing a rejected
+   * query can see what Meta actually said. Never includes the token.
+   */
+  async probeInsightsBreakdowns(
+    externalAccountId: string,
+    breakdowns: readonly string[],
+  ): Promise<
+    | { ok: true; breakdowns: string[]; rows: number }
+    | {
+        ok: false;
+        breakdowns: string[];
+        errorClass: ProviderErrorClass;
+        httpStatus: number | null;
+        graph: GraphError | null;
+      }
+  > {
+    const today = new Date().toISOString().slice(0, 10);
+    try {
+      const page = await this.getPage<MetaInsightRow>(this.url(`${externalAccountId}/insights`), {
+        level: 'campaign',
+        fields: 'campaign_id,impressions',
+        ...(breakdowns.length > 0 ? { breakdowns: breakdowns.join(',') } : {}),
+        time_range: JSON.stringify({ since: today, until: today }),
+        limit: 1,
+      });
+      return { ok: true, breakdowns: [...breakdowns], rows: page.data?.length ?? 0 };
+    } catch (error) {
+      if (!isProviderError(error)) throw error;
+      const preview = error.context?.['bodyPreview'];
+      return {
+        ok: false,
+        breakdowns: [...breakdowns],
+        errorClass: error.errorClass,
+        httpStatus: error.httpStatus ?? null,
+        graph: typeof preview === 'string' ? parseGraphError(preview) : null,
+      };
+    }
+  }
+
+  /**
+   * Whether this account reports the device alongside country.
+   *
+   * Probed rather than declared, because breakdown compatibility is a property
+   * of the account and the API version, not of MART. Only a rejected REQUEST
+   * proves absence: a throttle or an expired token says nothing about the
+   * breakdown and must not become a permanent capability downgrade.
+   */
+  private async probePlatformBreakdown(
+    externalAccountId: string,
+  ): Promise<{ supported: boolean; detail: Record<string, unknown> }> {
+    const probedAt = new Date().toISOString();
+    const withCountry = await this.probeInsightsBreakdowns(externalAccountId, [
+      'country',
+      'impression_device',
+    ]);
+    if (withCountry.ok) {
+      return { supported: true, detail: { probedAt, breakdowns: withCountry.breakdowns } };
+    }
+    if (withCountry.errorClass !== 'invalid_request') {
+      // Not a verdict about the breakdown. Surface what happened, prove nothing.
+      throw new ProviderError({
+        provider: 'meta_ads',
+        errorClass: withCountry.errorClass,
+        message: `platform probe could not run: ${withCountry.errorClass}`,
+        userMessage: 'Meta could not be asked about the device breakdown right now.',
+        retryable: true,
+      });
+    }
+    // The combination was refused. Does the device breakdown work at all?
+    const alone = await this.probeInsightsBreakdowns(externalAccountId, ['impression_device']);
+    return {
+      supported: false,
+      detail: {
+        probedAt,
+        reason: alone.ok
+          ? 'impression_device is served alone but refused alongside country; country is preserved and platform reads unknown'
+          : 'impression_device is refused by this account',
+        compatibleWithCountry: false,
+        aloneSupported: alone.ok,
+        graphCode: withCountry.graph?.code ?? null,
+        graphMessage: withCountry.graph?.message ?? null,
+      },
+    };
   }
 
   private async probeCountryBreakdown(
@@ -495,6 +666,17 @@ export class MetaAdsProvider implements MarketingNetworkProvider {
         // breakdown and must not quietly coarsen the data.
         if (!isProviderError(error) || error.errorClass !== 'invalid_request') throw error;
         lastError = error;
+        const preview = error.context?.['bodyPreview'];
+        const graph = typeof preview === 'string' ? parseGraphError(preview) : null;
+        getLogger().info(
+          {
+            provider: 'meta_ads',
+            account: params.externalAccountId,
+            breakdowns: step.breakdowns,
+            graphCode: graph?.code ?? null,
+          },
+          'insights breakdown set refused; stepping down',
+        );
       }
     }
     throw lastError;

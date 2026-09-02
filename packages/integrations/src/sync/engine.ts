@@ -279,7 +279,7 @@ export async function runSync(run: SyncRunRow, request: SyncRequest): Promise<Sy
         retryable: classified.retryable,
         windowStart: chunk.from,
         windowEnd: chunk.to,
-        context: { window: windowKey },
+        context: { window: windowKey, ...classified.context },
       });
       log.warn(
         { window: windowKey, errorClass: classified.errorClass, retryable: classified.retryable },
@@ -287,7 +287,16 @@ export async function runSync(run: SyncRunRow, request: SyncRequest): Promise<Sy
       );
       // A retryable failure means the provider is unhappy right now: stop and
       // let the scheduler retry rather than hammering the remaining windows.
-      if (classified.retryable) {
+      //
+      // A rejected credential stops the run for the opposite reason: nothing
+      // is going to change between windows, every further request would fail
+      // the same way and leave another error row, and the failure belongs on
+      // the integration card - which reads the run's terminal failure, so a
+      // credential rejection that only ever failed one window never got there.
+      const credentialRejected =
+        classified.errorClass === 'authentication_error' ||
+        classified.errorClass === 'expired_credential';
+      if (classified.retryable || credentialRejected) {
         fatal = error;
         break;
       }
@@ -445,6 +454,13 @@ type ClassifiedError = {
   message: string;
   userMessage: string;
   retryable: boolean;
+  /**
+   * What the provider actually said, already sanitized and truncated by the
+   * HTTP client. Without this a rejected query reached the database as
+   * "meta_ads responded 400" and nothing more, and the diagnosis had to be
+   * redone by hand against the live API.
+   */
+  context: Record<string, unknown>;
 };
 
 export function classify(error: unknown, providerKey: string): ClassifiedError {
@@ -454,6 +470,10 @@ export function classify(error: unknown, providerKey: string): ClassifiedError {
       message: error.message,
       userMessage: error.userMessage,
       retryable: error.retryable || RETRYABLE_ERROR_CLASSES.includes(error.errorClass),
+      context: {
+        ...(error.httpStatus !== undefined ? { httpStatus: error.httpStatus } : {}),
+        ...(error.context ?? {}),
+      },
     };
   }
   const message = error instanceof Error ? error.message : 'Unknown failure';
@@ -466,6 +486,7 @@ export function classify(error: unknown, providerKey: string): ClassifiedError {
       ? 'MART could not store the data it fetched. The run was stopped so nothing partial is trusted.'
       : `The ${providerKey} sync failed unexpectedly.`,
     retryable: isDatabase,
+    context: {},
   };
 }
 
@@ -485,6 +506,7 @@ async function finishWithFailure(
     retryable: classified.retryable,
     windowStart: request.from,
     windowEnd: request.to,
+    context: classified.context,
   });
   await syncRepo.completeSyncRun(summary.syncRunId, {
     status: 'failed',

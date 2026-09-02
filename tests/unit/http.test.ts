@@ -69,6 +69,26 @@ describe('error classification', () => {
     ).toBe('rate_limited');
   });
 
+  it('does not mistake Meta\'s "OAuthException" label for a credential problem', () => {
+    // Meta stamps type: "OAuthException" on nearly every Graph API error,
+    // including a malformed breakdown (code 100) and a missing permission (code
+    // 10). Reading the label as a credential signal reported a rejected QUERY
+    // as a rejected TOKEN, flipped a working connection to invalid_credentials,
+    // and stopped the adapter's own fallback from ever running.
+    expect(
+      classifyHttpStatus(
+        400,
+        '{"error":{"message":"(#100) impression_device is not compatible with country","type":"OAuthException","code":100}}',
+      ),
+    ).toBe('invalid_request');
+    expect(
+      classifyHttpStatus(
+        400,
+        '{"error":{"message":"(#10) Application does not have permission for this action","type":"OAuthException","code":10}}',
+      ),
+    ).not.toBe('authentication_error');
+  });
+
   it('still calls a genuinely malformed request invalid, whatever the status carries', () => {
     expect(classifyHttpStatus(400, '{"error":{"message":"Unknown field: nonsense"}}')).toBe(
       'invalid_request',

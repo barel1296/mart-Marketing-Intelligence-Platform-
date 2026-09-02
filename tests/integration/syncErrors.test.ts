@@ -314,4 +314,58 @@ describe('superseded sync errors', () => {
     const exact = (await errorRows(ctx.appId)).filter((e) => e.window_start === '2026-08-20');
     expect(exact.every((e) => e.resolved_at !== null)).toBe(true);
   });
+
+  it('does not flip a working connection to invalid_credentials on a rejected query', async () => {
+    // The production incident. Meta answered a malformed breakdown with a
+    // code-100 error stamped "OAuthException", MART read the label as a
+    // credential signal, and a connection whose token was perfectly valid was
+    // marked invalid_credentials - prompting a reconnect that would have fixed
+    // nothing. A rejected query is a statement about the query.
+    const ctx = await setup();
+    controls.failureClass = 'invalid_request';
+    controls.failWindows = new Set(['2026-08-20..2026-08-20']);
+    await triggerSync(ctx, '2026-08-20', '2026-08-20');
+
+    const status = await queryRows<{ status: string }>(
+      `SELECT status FROM integration_connections WHERE id = $1`,
+      [ctx.metaConnectionId],
+    );
+    expect(status[0]?.status).not.toBe('invalid_credentials');
+  });
+
+  it('does flip it when the provider actually rejects the token', async () => {
+    // The distinction the incident lost: this one IS about the credential.
+    const ctx = await setup();
+    controls.failureClass = 'authentication_error';
+    controls.failWindows = new Set(['2026-08-20..2026-08-20']);
+    await triggerSync(ctx, '2026-08-20', '2026-08-20');
+
+    const status = await queryRows<{ status: string }>(
+      `SELECT status FROM integration_connections WHERE id = $1`,
+      [ctx.metaConnectionId],
+    );
+    expect(status[0]?.status).toBe('invalid_credentials');
+  });
+
+  it("records the provider's own words beside every failure", async () => {
+    // Before this, a rejected query reached the database as "responded 400" and
+    // nothing more, and the diagnosis had to be redone by hand against the live
+    // API. The sanitized body the HTTP client already captured now travels to
+    // the row.
+    const ctx = await setup();
+    controls.failureClass = 'invalid_request';
+    controls.failWindows = new Set(['2026-08-20..2026-08-20']);
+    await triggerSync(ctx, '2026-08-20', '2026-08-20');
+
+    const rows = await queryRows<{ context: Record<string, unknown> }>(
+      `SELECT e.context FROM sync_errors e JOIN sync_runs r ON r.id = e.sync_run_id
+        WHERE r.app_id = $1`,
+      [ctx.appId],
+    );
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) {
+      expect(row.context['httpStatus']).toBe(400);
+      expect(String(row.context['bodyPreview'])).toMatch(/"code":100/);
+    }
+  });
 });

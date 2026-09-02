@@ -11,7 +11,12 @@ export * from './sync/engine.js';
 export * from './sync/freshness.js';
 export * from './sync/planner.js';
 
-export { MetaAdsProvider } from './providers/meta.js';
+export {
+  MetaAdsProvider,
+  classifyGraphError,
+  parseGraphError,
+  type GraphError,
+} from './providers/meta.js';
 export { AppsFlyerAttributionProvider } from './providers/appsflyer.js';
 export { TenjinAttributionProvider } from './providers/tenjin.js';
 export {

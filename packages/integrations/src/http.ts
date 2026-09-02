@@ -5,6 +5,14 @@ export type FetchImpl = (input: string, init?: RequestInit) => Promise<Response>
 
 export type HttpClientOptions = {
   provider: string;
+  /**
+   * Provider-specific classification, consulted before the generic one.
+   *
+   * A provider that publishes structured error codes knows exactly what a
+   * failure means; the generic classifier can only read status and prose.
+   * Return null to fall through.
+   */
+  classifyError?: (status: number, bodyText: string) => ProviderErrorClass | null;
   fetchImpl?: FetchImpl;
   timeoutMs?: number;
   maxAttempts?: number;
@@ -60,7 +68,15 @@ const EXPIRED_CREDENTIAL_SIGNAL =
 const INVALID_CREDENTIAL_SIGNAL =
   // The gap absorbs whatever a provider names between the two words -
   // "invalid OAuth access token", "invalid_token", "invalid bearer token".
-  /invalid[\w _-]{0,20}token|malformed access token|access token[^.]{0,40}(?:invalid|revoked)|invalid[_ ]?credential|oauth ?exception/i;
+  //
+  // "OAuthException" is deliberately NOT here. Meta stamps that type on nearly
+  // every Graph API error - a malformed breakdown, a missing permission, a
+  // throttle - so treating the label as a credential signal turned a rejected
+  // query into "reconnect the integration", flipped a working connection to
+  // invalid_credentials, and stopped the adapter's own fallback from ever
+  // running. The provider's numeric error code is what carries meaning, and
+  // the Meta adapter reads it; this generic classifier must not guess.
+  /invalid[\w _-]{0,20}token|malformed access token|access token[^.]{0,40}(?:invalid|revoked)|invalid[_ ]?credential/i;
 const THROTTLE_SIGNAL =
   /rate[_ ]?limit|too many (?:requests|calls)|throttl|request limit reached|calls? to this api ha(?:s|ve) exceeded|user request limit/i;
 
@@ -150,10 +166,12 @@ export class ProviderHttpClient {
   private readonly minIntervalMs: number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
+  private readonly classifyError: HttpClientOptions['classifyError'];
   private nextAllowedAt = 0;
 
   constructor(options: HttpClientOptions) {
     this.provider = options.provider;
+    this.classifyError = options.classifyError;
     this.fetchImpl = options.fetchImpl ?? ((url, init) => fetch(url, init));
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
@@ -219,7 +237,9 @@ export class ProviderHttpClient {
           'provider request',
         );
         if (!response.ok) {
-          const errorClass = classifyHttpStatus(response.status, text);
+          const errorClass =
+            this.classifyError?.(response.status, text) ??
+            classifyHttpStatus(response.status, text);
           const retryAfterMs = parseRetryAfter(response.headers);
           lastError = new ProviderError({
             provider: this.provider,
