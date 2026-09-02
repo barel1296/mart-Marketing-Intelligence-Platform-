@@ -1,3 +1,4 @@
+export * from './currencyProof.js';
 export * from './confidence.js';
 export * from './thresholds.js';
 export * from './populations.js';

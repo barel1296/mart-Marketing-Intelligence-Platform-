@@ -7,7 +7,7 @@ import {
   operationalMapping,
   organic,
 } from './populations.js';
-import { queryRows, toNumber } from '@mart/db';
+import { queryRows, toNumber, type Queryable } from '@mart/db';
 import { MAXIMUM_AMBIGUOUS_SPEND_PCT, MINIMUM_SPEND_COVERAGE_PCT } from './thresholds.js';
 
 /**
@@ -195,7 +195,17 @@ export function channelMatchesProvider(
   return channelForProvider(providerKey ?? null) === channel;
 }
 
-export async function loadMarketingAggregate(filters: MetricFilters): Promise<MarketingAggregate> {
+/**
+ * `client` lets a caller run this exact production path inside its own
+ * transaction. The currency-gate proof depends on that: it injects a second
+ * currency, asks THIS function what it sees, and rolls back - so the audit
+ * exercises the real code rather than a copy of it. Omitted, the pool is used
+ * as before.
+ */
+export async function loadMarketingAggregate(
+  filters: MetricFilters,
+  client?: Queryable,
+): Promise<MarketingAggregate> {
   const params: unknown[] = [];
   // Channel is derived from the provider that reported the row, so a filter
   // naming a channel the bound network does not belong to matches nothing.
@@ -235,6 +245,7 @@ export async function loadMarketingAggregate(filters: MetricFilters): Promise<Ma
      FROM marketing_daily_metrics
      WHERE ${where}`,
     params,
+    client,
   );
   const row = rows[0];
   return {
@@ -254,6 +265,7 @@ export async function loadMarketingAggregate(filters: MetricFilters): Promise<Ma
 
 export async function loadAttributionAggregate(
   filters: MetricFilters,
+  client?: Queryable,
 ): Promise<AttributionAggregate> {
   const installParams: unknown[] = [
     filters.organizationId,
@@ -309,6 +321,7 @@ export async function loadAttributionAggregate(
             MAX(install_date)::text AS latest_date
      FROM attribution_daily_metrics t WHERE ${installWhere}`,
     installParams,
+    client,
   );
 
   const revenueParams: unknown[] = [
@@ -368,6 +381,7 @@ export async function loadAttributionAggregate(
             MAX(activity_date)::text AS latest_date
      FROM attribution_revenue_metrics t WHERE ${revenueWhere}`,
     revenueParams,
+    client,
   );
 
   const attributedInstalls = toNumber(installRows[0]?.installs);

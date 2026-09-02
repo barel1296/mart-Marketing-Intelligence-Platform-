@@ -23,6 +23,7 @@ import {
   loadAttributionAggregate,
   loadMarketingAggregate,
   loadUnifiedPerformance,
+  proveMixedCurrencyGate,
   scoreConfidence,
   type MetricContext,
   type MetricFilters,
@@ -498,11 +499,62 @@ async function auditApp(
         : `${unblocked.map((m) => m.metricKey).join(', ')} produced a value across currencies`,
     );
   } else {
-    record(
+    // NATURAL DATA CHECK: a single currency cannot exercise the gate, and a
+    // healthy account never will. So the condition is created on purpose,
+    // inside a transaction that is always rolled back, and the PRODUCTION
+    // loaders and metric computation are asked what they see. The criterion
+    // passes only if the real path refused - never on the strength of a unit
+    // test, and never if a single row survived the rollback.
+    line(
+      'NATURAL DATA CHECK',
+      `single currency only (${[...new Set([...marketing.currencies, ...attribution.currencies])].join(', ')})`,
+    );
+    const proof = await proveMixedCurrencyGate({ filters, context: metricContext });
+    line('CONTROLLED GATE PROOF', `injected ${proof.injected.currency} transactionally`);
+    line(
+      '  natural spend',
+      `${proof.natural.spendAvailability} value=${proof.natural.spendValue ?? '(none)'}`,
+    );
+    line('  currencies seen by production path', proof.gate.marketingCurrencies.join(', '));
+    line(
+      '  spend under mixed currency',
+      `${proof.gate.spend.availability} blocker=${proof.gate.spend.blocker ?? '-'} value=${proof.gate.spend.value ?? '(none)'}`,
+    );
+    if (proof.gate.revenue) {
+      line(
+        '  revenue under mixed currency',
+        `${proof.gate.revenue.availability} blocker=${proof.gate.revenue.blocker ?? '-'} value=${proof.gate.revenue.value ?? '(none)'}`,
+      );
+    }
+    line('  reason', proof.gate.spend.reason ?? '(none)');
+    line(
+      '  detected / not summed / blocked / reason names currency',
+      `${proof.verdict.detected} / ${proof.verdict.notSummed} / ${proof.verdict.blocked} / ${proof.verdict.reasonNamesCurrency}`,
+    );
+    const drift = Object.keys(proof.rollback.before).filter(
+      (k) => proof.rollback.before[k] !== proof.rollback.after[k],
+    );
+    line(
+      'ROLLBACK',
+      proof.rollback.verified
+        ? `verified - ${Object.keys(proof.rollback.before).length} table snapshots identical`
+        : `FAILED - drift in ${drift.join(', ')}`,
+    );
+    assert(
       ctx,
       'mixed currency is blocked, never summed',
-      'UNPROVEN',
-      'only one currency present, so the gate could not be exercised here',
+      proof.verdict.passed && proof.rollback.verified,
+      proof.verdict.passed && proof.rollback.verified
+        ? `production gate refused ${proof.injected.currency} beside ${proof.natural.marketingCurrencies.join('/')}; rollback verified`
+        : !proof.rollback.verified
+          ? 'ROLLBACK NOT VERIFIED - synthetic rows may have survived'
+          : 'production path did not refuse the mixed aggregate',
+    );
+    assert(
+      ctx,
+      'same-currency aggregation still computes',
+      proof.natural.spendAvailability !== 'blocked',
+      `natural spend is ${proof.natural.spendAvailability}`,
     );
   }
 
