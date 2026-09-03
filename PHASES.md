@@ -120,3 +120,40 @@ predictions.
 
 **Deliberately out of scope, still:** predicted LTV/ROAS, retention curves, ages
 beyond D7, forecasting, agents, and any write-back to a provider.
+
+## Phase 3 — decision intelligence (built)
+
+Phase 3 reads the trusted figures of Phases 0–2 against operator-stated
+targets and says, deterministically, what they support. It executes nothing.
+
+**Built:**
+
+- Five signals - `scale`, `hold`, `reduce`, `investigate`, `insufficient_data` -
+  each with a category (`performance`, `data_quality`, `pacing`, `coverage`,
+  `undetermined`), a headline and a reason that quotes the figures.
+- A recommendation object per marketing campaign and for the app's mapped
+  population, carrying the window and the mature days actually evaluated, the
+  populations, every figure as evidence with its own availability and blocker,
+  the quality state (freshness, sync errors, findings, maturity, mapping,
+  currencies, anomalies), a decomposed confidence, the blockers, the policy
+  and the lineage. Deterministic: the same rows give the same recommendation.
+- Operator targets per app (`decision_policies`: D7 / D1 cohort ROAS, CPI
+  ceiling with currency), stored as typed, never derived, audited on change.
+  Without a target nothing is ever `scale` or `reduce`.
+- Ordered gates before any reading: provider bound, operationally mapped,
+  streams current, one currency, no error findings, no data-side anomaly, a
+  target the report can supply, enough mature volume. Each failing gate names
+  itself; a tracking problem can never surface as performance.
+- Anomaly detection per day against a 14-day median/MAD baseline, classified
+  from the data around the day (`delivery`, `data_gap`, `attribution`,
+  `monetization`, `undetermined`).
+- Budget pacing against the last observed daily budget, and a newest-seven
+  versus prior-seven mature-day trend that can withhold a signal the window
+  average would have issued.
+- `GET .../decisions`, `GET`/`PUT .../decision-policy`, a Decision Center page,
+  and a Phase 3 audit (`pnpm phase3-audit <org> <from> <to> [app]`) that
+  recomputes every figure and signal with independent SQL and proves the hard
+  rules with rolled-back transactional changes. See `DECISIONS.md`.
+
+**Deliberately out of scope:** any campaign action, budget or bid arithmetic,
+forecasting, predicted LTV/ROAS, and Phase 4.

@@ -122,6 +122,16 @@ Reconciliation reports how many campaigns are unmatched; this explains each one:
 docker compose exec api node packages/integrations/dist/cli/reconcile-audit.js <organization_id> [app_id]
 ```
 
+Phase exit audits (each recomputes its phase's figures with independent SQL
+and proves its hard rules inside rolled-back transactions):
+
+```bash
+pnpm phase0-audit <organization_id> <from> <to> [app_id]
+pnpm phase1-audit <organization_id> <from> <to> [app_id]
+pnpm phase2-audit <organization_id> <from> <to> [app_id]
+pnpm phase3-audit <organization_id> <from> <to> [app_id]
+```
+
 For every unmatched attribution campaign it prints the id, name, installs and
 revenue, the network campaign name embedded in its own name, whether an exact
 marketing campaign carries that name, and - when it does not - whether a near

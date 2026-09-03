@@ -25,6 +25,7 @@
     "phase0-audit": "node packages/integrations/dist/cli/phase0-audit.js",
     "phase1-audit": "node packages/integrations/dist/cli/phase1-audit.js",
     "phase2-audit": "node packages/integrations/dist/cli/phase2-audit.js",
+    "phase3-audit": "node packages/integrations/dist/cli/phase3-audit.js",
     "meta-insights-probe": "node packages/integrations/dist/cli/meta-insights-probe.js",
     "dev:fixtures": "MART_ENABLE_FIXTURES=true node scripts/fixture-provider-server.mjs",
     "dev:api": "pnpm --filter @mart/api dev",

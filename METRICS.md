@@ -260,3 +260,12 @@ last attempt, the last success and the latest date the provider actually had dat
 for. A metric computed from a stream past its window is marked `stale` and the
 tile shows the data date, so a dashboard left open overnight cannot quietly show
 yesterday's numbers as today's.
+
+## Decision signals
+
+Phase 3 reads these metrics against operator targets and returns `scale`,
+`hold`, `reduce`, `investigate` or `insufficient_data` with the evidence,
+window, population, quality state, confidence and blockers behind each. A
+signal is a reading, never an action, and it is only ever drawn from figures
+this document allows to be shown: a blocked or unavailable metric blocks the
+signal with the same blocker. See `DECISIONS.md`.

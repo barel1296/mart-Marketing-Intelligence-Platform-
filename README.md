@@ -53,6 +53,7 @@ call is a read. See [PHASES.md](PHASES.md) for what comes next and why.
 | [DATA_MODEL.md](DATA_MODEL.md)     | Every table, the canonical model, grain rules                 |
 | [INTEGRATIONS.md](INTEGRATIONS.md) | Provider contracts, capability model, **verification status** |
 | [METRICS.md](METRICS.md)           | The governed metric registry and its arithmetic               |
+| [DECISIONS.md](DECISIONS.md)       | Phase 3 decision signals: gates, evidence, anomalies, pacing  |
 | [SECURITY.md](SECURITY.md)         | Auth, tenancy, credential handling, logging                   |
 | [DEVELOPMENT.md](DEVELOPMENT.md)   | Running it locally, tests, fixtures                           |
 | [PHASES.md](PHASES.md)             | What Phase 0A is, and what Phase 0B should be                 |
