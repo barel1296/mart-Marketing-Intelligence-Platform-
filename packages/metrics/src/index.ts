@@ -6,3 +6,4 @@ export * from './registry.js';
 export * from './service.js';
 export * from './queries.js';
 export * from './unified.js';
+export * from './decisions/index.js';
