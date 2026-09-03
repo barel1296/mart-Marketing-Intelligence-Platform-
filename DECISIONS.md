@@ -99,7 +99,10 @@ the blocker.
    `insufficient_data` / `coverage` / `insufficient_coverage`. Ambiguous ->
    `investigate` / `coverage` / `ambiguous_mapping`. At app scope, mapped spend
    below 80% of window spend withholds the reading and ambiguous spend above
-   10% asks for an investigation.
+   10% of window spend asks for an investigation. The app figure is the sum of
+   its campaigns' cohort-aligned figures: a campaign-day with no spend
+   contributes neither its installs nor its revenue, at either scope, because
+   nothing bought them.
 3. **The streams are current.** A stream in error, or any unresolved sync
    error, -> `investigate` / `data_quality`. A stale or unknown stream, or no
    attribution horizon, -> `insufficient_data` / `provider_stale`. `delayed`
@@ -110,7 +113,9 @@ the blocker.
    `investigate` / `data_quality_finding`. Findings about the account's
    reconciliation (unmapped spend or installs) bear on the app scope, whose
    coverage gates already read them; a mapped campaign's own rows are not
-   misaligned by its neighbours' gaps.
+   misaligned by its neighbours' gaps. Findings about how rows are labelled
+   gate nothing. Only unresolved sync errors on the performance, install and
+   revenue streams of the bound providers count as a failing feed.
 6. **No data-side anomaly** in the window (`data_gap` or `attribution`), else
    `investigate` / `data_quality` / `anomalous_data`. An `undetermined` or
    `monetization` anomaly -> `investigate` / `undetermined`. A `delivery`
@@ -142,8 +147,9 @@ the spend currency.
 ## Anomalies
 
 Each day in the window is judged against the 14 days before it, for spend,
-installs and event-date revenue, per campaign and for the app as a whole. A day
-is anomalous only when it is 3.5 MAD-scaled deviations from the median of those
+installs and event-date revenue, per campaign and for the app's mapped
+population as a whole (organic traffic and unmapped campaigns are outside it: a
+featuring spike is not a fact about paid delivery). A day is anomalous only when it is 3.5 MAD-scaled deviations from the median of those
 days (or simply differs, when every baseline day is identical), differs by at
 least 30% of the median, and differs by at least 20 in absolute terms. Fewer
 than seven baseline days and no call is made.
@@ -153,7 +159,7 @@ move:
 
 | Class          | When                                                                                                                 |
 | -------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `delivery`     | spend moved; or installs moved the same way as spend on the same day                                                 |
+| `delivery`     | spend moved; or installs or revenue moved the same way as spend on the same day                                      |
 | `data_gap`     | an unresolved sync error covers the day, or no completed install sync read it                                        |
 | `attribution`  | installs moved while spend held, with a data-quality finding on the day or an attribution stream that is not current |
 | `monetization` | revenue moved while installs and spend held                                                                          |
@@ -167,6 +173,11 @@ Findings that describe how rows are labelled (organic traffic has no campaign
 id every day) or the account's reconciliation are not evidence that a day was
 read wrongly.
 
+A finding is current until a later completed sync of the same connection and
+stream has read the day it describes; a finding the next run did not raise
+again is history, not a live signal. Only current findings gate a reading or
+classify a day.
+
 ## Pacing
 
 Average spend over the days a campaign delivered, against the daily budget MART
@@ -178,8 +189,9 @@ is reported beside the signal and is never a signal itself.
 ## Trends
 
 The newest seven mature delivered days against the seven before them, both
-halves required to clear the same floors as the signal. Stable under a 20%
-relative change. Reported as evidence on the return figure and used only to
+halves required to be full and to clear the same floors as the signal; seven
+days against three is not a comparison, and the trend is unknown until there
+are fourteen. Stable under a 20% relative change. Reported as evidence on the return figure and used only to
 withhold a `scale` or `reduce` the newest days contradict.
 
 ## API and UI

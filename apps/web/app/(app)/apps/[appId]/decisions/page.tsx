@@ -95,6 +95,7 @@ type Recommendation = {
 type Pacing = {
   marketingCampaignId: string;
   campaignName: string | null;
+  spendCurrencies: string[];
   dailyBudget: number | null;
   budgetSource: string | null;
   budgetCurrency: string | null;
@@ -269,6 +270,9 @@ function RecommendationCard({
   title: string;
 }) {
   const r = recommendation;
+  // Figures are shown in the currency their rows carry, never in the app's
+  // default currency by assumption; a two-currency scope shows its blocker.
+  const scopeCurrency = r.quality.currencies.spend[0] ?? currency;
   return (
     <Card
       title={title}
@@ -300,7 +304,7 @@ function RecommendationCard({
             ))}
           </p>
         ) : null}
-        <EvidenceTable evidence={r.evidence} currency={currency} />
+        <EvidenceTable evidence={r.evidence} currency={scopeCurrency} />
         <details>
           <summary className="subsection-title">Quality, confidence and lineage</summary>
           <div className="stack">
@@ -444,6 +448,7 @@ export default async function DecisionCenterPage({
                   const spend = r.evidence.find((e) => e.key === 'spend');
                   const roas = r.evidence.find((e) => e.key.startsWith('cohort_'));
                   const cpi = r.evidence.find((e) => e.key === 'mapped_cpi');
+                  const rowCurrency = r.quality.currencies.spend[0] ?? currency;
                   return (
                     <tr key={r.id}>
                       <td>
@@ -461,14 +466,14 @@ export default async function DecisionCenterPage({
                         ) : null}
                       </td>
                       <td className="mono">
-                        {formatMetric(spend?.value ?? null, 'currency', currency)}
+                        {formatMetric(spend?.value ?? null, 'currency', rowCurrency)}
                       </td>
                       <td className="mono">
                         {roas ? formatMetric(roas.value, 'ratio') : '—'}
                         {roas ? <div className="cell-note mono">{roas.key}</div> : null}
                       </td>
                       <td className="mono">
-                        {formatMetric(cpi?.value ?? null, 'currency', currency)}
+                        {formatMetric(cpi?.value ?? null, 'currency', rowCurrency)}
                       </td>
                       <td className="mono">{r.window.evaluated.days}</td>
                       <td>
@@ -531,7 +536,11 @@ export default async function DecisionCenterPage({
                       ) : null}
                     </td>
                     <td className="mono">
-                      {formatMetric(p.averageDailySpend, 'currency', currency)}
+                      {formatMetric(
+                        p.averageDailySpend,
+                        'currency',
+                        p.spendCurrencies[0] ?? currency,
+                      )}
                     </td>
                     <td className="mono">
                       {p.ratio === null ? '—' : `${Math.round(p.ratio * 100)}%`}

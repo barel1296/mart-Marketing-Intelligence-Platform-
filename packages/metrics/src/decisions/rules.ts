@@ -248,11 +248,15 @@ export function classifyAnomalies(input: {
       }
     } else {
       const installs = sameDay(candidate, 'installs');
+      const spendMove = sameDay(candidate, 'spend');
       if (installs) {
         const parent = classify(installs);
         classification = parent.classification;
         dataSignals.push(...parent.dataSignals);
         explanation = `${move}. Installs on the same day moved the same way, and that movement is classified as ${parent.classification}.`;
+      } else if (spendMove) {
+        classification = 'delivery';
+        explanation = `${move}. Spend on the same day moved the same way, so revenue followed delivery.`;
       } else if (signals.finding) {
         classification = 'attribution';
         dataSignals.push('data_quality_finding_on_day');
@@ -413,7 +417,10 @@ export function computeTrend(input: {
     const numerator = round(days.reduce((acc, d) => acc + d.numerator, 0));
     const denominator = round(days.reduce((acc, d) => acc + d.denominator, 0));
     const installs = days.reduce((acc, d) => acc + d.installs, 0);
+    // A half is a full half: seven days against seven, never seven against
+    // three that happen to clear the floors.
     const clears =
+      days.length === size &&
       days.length >= input.floors.days &&
       denominator >= input.floors.denominator &&
       installs >= input.floors.installs;
@@ -450,7 +457,9 @@ export function computeTrend(input: {
       changePct: null,
       direction: 'unknown',
       reason: priorSummary
-        ? `The ${priorSummary.days} eligible day(s) before the newest ${currentSummary.days} do not clear the floors, so there is nothing to compare against.`
+        ? priorSummary.days < size
+          ? `Only ${priorSummary.days} eligible day(s) sit before the newest ${currentSummary.days}; a trend needs two full halves of ${size}.`
+          : `The ${priorSummary.days} eligible day(s) before the newest ${currentSummary.days} do not clear the floors, so there is nothing to compare against.`
         : `Only ${currentSummary.days} eligible day(s) exist; a trend needs ${2 * size}.`,
     };
   }
@@ -622,7 +631,7 @@ export function evaluateScope(
   const spendCurrencies = [...new Set(delivered.flatMap((d) => d.spendCurrencies))].sort();
   const settled = delivered.filter((d) => input.asOf !== null && d.date < input.asOf);
   const settledSpend = round(settled.reduce((acc, d) => acc + d.spend, 0));
-  const settledInstalls = settled.reduce((acc, d) => acc + d.installs, 0);
+  const settledInstalls = settled.reduce((acc, d) => acc + d.alignedInstalls, 0);
   const installsInWindow = days
     .filter((d) => input.asOf !== null && d.date <= input.asOf)
     .reduce((acc, d) => acc + d.installs, 0);
@@ -659,7 +668,8 @@ export function evaluateScope(
   });
 
   const cpiEligible = settledInstalls >= T.minimumInstalls && settledSpend >= T.minimumSpend;
-  const cpi = cpiEligible && settledInstalls > 0 ? round(settledSpend / settledInstalls) : null;
+  const cpiExact = cpiEligible && settledInstalls > 0 ? settledSpend / settledInstalls : null;
+  const cpi = cpiExact === null ? null : round(cpiExact);
   evidence.push({
     key: 'mapped_cpi',
     label: 'Mapped CPI',
@@ -687,10 +697,19 @@ export function evaluateScope(
   const maturity = maturityFor(days, readingAge);
   const mature = days.filter((d) => isMature(d, readingAge));
   const matureSpend = round(mature.reduce((acc, d) => acc + d.spend, 0));
-  const matureInstalls = mature.reduce((acc, d) => acc + d.installs, 0);
+  const matureInstalls = mature.reduce((acc, d) => acc + d.alignedInstalls, 0);
+  const readingType: CohortRevenueType = measure?.revenueType ?? 'total';
   const revenueCurrencies = [
-    ...new Set(mature.flatMap((d) => d.cohort[readingAge].currencies)),
+    ...new Set(mature.flatMap((d) => d.cohort[readingAge].currencies[readingType])),
   ].sort();
+  // Two spend currencies, two revenue currencies, or one of each that differ:
+  // nothing here can be divided by anything, and the evidence says so too.
+  const currencyProblem =
+    spendCurrencies.length > 1 ||
+    revenueCurrencies.length > 1 ||
+    (spendCurrencies.length === 1 &&
+      revenueCurrencies.length === 1 &&
+      spendCurrencies[0] !== revenueCurrencies[0]);
   const evaluatedWindow = {
     from: mature[0]?.date ?? null,
     to: mature[mature.length - 1]?.date ?? null,
@@ -698,6 +717,7 @@ export function evaluateScope(
   };
 
   let roas: number | null = null;
+  let ratioExact: number | null = null;
   let matureRevenue = 0;
   let trend: Trend | null = null;
   if (measure) {
@@ -708,7 +728,9 @@ export function evaluateScope(
       mature.length >= T.minimumMatureDays &&
       matureSpend >= T.minimumSpend &&
       matureInstalls >= T.minimumInstalls;
-    roas = floorsClear && matureSpend > 0 ? round(matureRevenue / matureSpend) : null;
+    // The band is judged on the unrounded ratio; rounding is for display.
+    ratioExact = floorsClear && matureSpend > 0 ? matureRevenue / matureSpend : null;
+    roas = ratioExact === null ? null : round(ratioExact);
     trend = computeTrend({
       measure: cohortMetricKey({
         ageDays: measure.ageDays,
@@ -720,7 +742,7 @@ export function evaluateScope(
         date: d.date,
         numerator: d.cohort[readingAge].revenue[measure.revenueType],
         denominator: d.spend,
-        installs: d.installs,
+        installs: d.alignedInstalls,
         eligible: isMature(d, readingAge),
       })),
       floors: {
@@ -740,7 +762,7 @@ export function evaluateScope(
         ? 'blocked'
         : roas === null
           ? 'blocked'
-          : revenueCurrencies.length > 1
+          : currencyProblem
             ? 'blocked'
             : measure.partial
               ? 'partial'
@@ -751,8 +773,10 @@ export function evaluateScope(
           ? 'provider_stale'
           : 'immature_cohort'
         : roas === null
-          ? 'missing_denominator'
-          : revenueCurrencies.length > 1
+          ? mature.length < T.minimumMatureDays
+            ? 'immature_cohort'
+            : 'missing_denominator'
+          : currencyProblem
             ? 'mixed_currency'
             : measure.partial
               ? 'partial_return'
@@ -777,10 +801,12 @@ export function evaluateScope(
           ? `No delivered day in the window is mature at D${measure.ageDays}: ${maturity.immatureDays} too young, ${maturity.uncoveredDays} not read by the revenue sync since maturing.`
           : roas === null
             ? `${mature.length} mature day(s), ${matureSpend} spend, ${matureInstalls} installs; the floors are ${T.minimumMatureDays} days, ${T.minimumSpend} spend and ${T.minimumInstalls} installs.`
-            : `Cohort revenue at D${measure.ageDays} over the spend that bought those cohorts, on ${mature.length} mature delivered day(s).` +
-              (measure.partial
-                ? ` Only ${measure.revenueType} revenue is reported at this age, so this is a floor on the full return.`
-                : ''),
+            : currencyProblem
+              ? `Spend is in ${spendCurrencies.join(', ') || 'no currency'} and cohort revenue in ${revenueCurrencies.join(', ') || 'no currency'}; MART never converts.`
+              : `Cohort revenue at D${measure.ageDays} over the spend that bought those cohorts, on ${mature.length} mature delivered day(s).` +
+                (measure.partial
+                  ? ` Only ${measure.revenueType} revenue is reported at this age, so this is a floor on the full return.`
+                  : ''),
       ...(trend
         ? {
             comparison: {
@@ -881,13 +907,17 @@ export function evaluateScope(
           signal: 'investigate',
           category: 'coverage',
           headline: 'Ambiguous mappings carry material spend',
-          reason: `${input.ambiguousSpendPct.toFixed(1)}% of mapped spend is on campaigns with several equally good candidates; resolve them before reading the app-level return.`,
+          reason: `${input.ambiguousSpendPct.toFixed(1)}% of window spend is on campaigns with several equally good candidates; resolve them before reading the app-level return.`,
           blockers: ['ambiguous_mapping'],
         };
       }
     }
 
-    const worst = worstStreamStatus([input.freshness.marketing, input.freshness.attribution]);
+    // A bound stream that has never reported a status is unknown, not
+    // absent: it cannot be read around.
+    const marketingStatus = input.freshness.marketing ?? 'unknown';
+    const attributionStatus = input.freshness.attribution ?? 'unknown';
+    const worst = worstStreamStatus([marketingStatus, attributionStatus]);
     if (worst === 'error' || input.activeSyncErrors > 0) {
       return {
         signal: 'investigate',
@@ -901,14 +931,15 @@ export function evaluateScope(
       };
     }
     if (worst === null || worst === 'stale' || worst === 'unknown') {
+      const which = marketingStatus === worst ? 'marketing' : 'attribution';
       return {
         signal: 'insufficient_data',
         category: 'data_quality',
-        headline: worst === null ? 'No stream has synced' : `Data is ${worst}`,
-        reason:
-          worst === null
-            ? 'Neither the marketing nor the attribution stream has reported a status yet.'
-            : `The ${input.freshness.marketing === worst ? 'marketing' : 'attribution'} stream is ${worst} (marketing ${input.freshness.marketing ?? 'none'}, attribution ${input.freshness.attribution ?? 'none'}). A signal from data this old would describe the past as the present.`,
+        headline:
+          worst === 'unknown' && input.freshness[which] === null
+            ? `The ${which} stream has not synced`
+            : `Data is ${worst ?? 'unknown'}`,
+        reason: `The ${which} stream is ${worst ?? 'unknown'} (marketing ${input.freshness.marketing ?? 'never synced'}, attribution ${input.freshness.attribution ?? 'never synced'}). A signal from data this old, or never received, would describe the past as the present.`,
         blockers: ['provider_stale'],
       };
     }
@@ -923,12 +954,6 @@ export function evaluateScope(
       };
     }
 
-    const currencyProblem =
-      spendCurrencies.length > 1 ||
-      revenueCurrencies.length > 1 ||
-      (spendCurrencies.length === 1 &&
-        revenueCurrencies.length === 1 &&
-        spendCurrencies[0] !== revenueCurrencies[0]);
     if (currencyProblem) {
       return {
         signal: 'investigate',
@@ -1024,12 +1049,15 @@ export function evaluateScope(
       };
     }
 
-    const upper = round(measure.target * (1 + T.tolerancePct / 100));
-    const lower = round(measure.target * (1 - T.tolerancePct / 100));
+    const upperExact = measure.target * (1 + T.tolerancePct / 100);
+    const lowerExact = measure.target * (1 - T.tolerancePct / 100);
+    const upper = round(upperExact);
+    const lower = round(lowerExact);
+    const ratio = ratioExact as number;
     const label = `D${measure.ageDays} ${measure.revenueType === 'total' ? '' : `${measure.revenueType} `}cohort ROAS`;
     const basis = `${label} is ${roas} over ${mature.length} mature day(s) (${evaluatedWindow.from}..${evaluatedWindow.to}; ${matureRevenue} revenue on ${matureSpend} spend, ${matureInstalls} installs) against a target of ${measure.target} (band ${lower}–${upper}).`;
 
-    if (roas >= upper) {
+    if (ratio >= upperExact) {
       if (trend?.direction === 'deteriorating') {
         return {
           signal: 'hold',
@@ -1047,7 +1075,7 @@ export function evaluateScope(
         blockers: [],
       };
     }
-    if (roas <= lower) {
+    if (ratio <= lowerExact) {
       if (measure.partial) {
         return {
           signal: 'hold',
@@ -1103,10 +1131,13 @@ export function evaluateScope(
         blockers: ['missing_denominator'],
       };
     }
-    const upper = round(maxCpi * (1 + T.tolerancePct / 100));
-    const lower = round(maxCpi * (1 - T.tolerancePct / 100));
+    const upperExact = maxCpi * (1 + T.tolerancePct / 100);
+    const lowerExact = maxCpi * (1 - T.tolerancePct / 100);
+    const upper = round(upperExact);
+    const lower = round(lowerExact);
+    const value = cpiExact as number;
     const basis = `Mapped CPI is ${cpi} (${settledSpend} spend over ${settledInstalls} installs on ${settled.length} settled delivered day(s)) against a ceiling of ${maxCpi} (band ${lower}–${upper}).`;
-    if (cpi <= lower) {
+    if (value <= lowerExact) {
       return {
         signal: 'scale',
         category: 'performance',
@@ -1115,7 +1146,7 @@ export function evaluateScope(
         blockers: [],
       };
     }
-    if (cpi >= upper) {
+    if (value >= upperExact) {
       return {
         signal: 'reduce',
         category: 'performance',

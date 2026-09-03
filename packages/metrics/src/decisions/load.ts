@@ -69,7 +69,7 @@ export type DecisionFacts = {
   app: {
     /** The mapped population, summed across campaigns: what an app-level return is drawn from. */
     days: CampaignDayFact[];
-    /** Everything the providers reported, mapped or not: what an app-level anomaly is drawn from. */
+    /** The mapped population's daily series: what an app-level anomaly is drawn from. */
     series: ScopeSeries;
     spendCoveragePct: number | null;
     ambiguousSpendPct: number | null;
@@ -102,7 +102,7 @@ function emptyCohortDay(): CohortDayFact {
     oldEnough: false,
     covered: false,
     earlyReadRows: 0,
-    currencies: [],
+    currencies: { iap: [], ad: [], total: [] },
   };
 }
 
@@ -114,6 +114,7 @@ function emptyDay(date: IsoDate): CampaignDayFact {
     clicks: 0,
     spendCurrencies: [],
     installs: 0,
+    alignedInstalls: 0,
     cohort: { 1: emptyCohortDay(), 7: emptyCohortDay() },
   };
 }
@@ -215,11 +216,19 @@ export async function loadDecisionFacts(input: {
   };
 
   // ----------------------------------------------------------- day signals ---
+  // Unresolved errors on the streams a reading is drawn from, for the bound
+  // providers. An old structure-sync rate limit is a real error, but not one
+  // that makes a spend or cohort figure untrustworthy.
+  const boundProviders = [marketingProvider, attributionProvider].filter(
+    (p): p is string => p !== null,
+  );
   const errorRows = await queryRows<{ window_start: string | null; window_end: string | null }>(
     `SELECT e.window_start::text AS window_start, e.window_end::text AS window_end
        FROM sync_errors e JOIN sync_runs r ON r.id = e.sync_run_id
-      WHERE e.organization_id = $1 AND r.app_id = $2 AND e.resolved_at IS NULL`,
-    [filters.organizationId, filters.appId],
+      WHERE e.organization_id = $1 AND r.app_id = $2 AND e.resolved_at IS NULL
+        AND r.data_type IN ('marketing_performance', 'attribution_installs', 'attribution_revenue')
+        AND r.provider_key = ANY($3::text[])`,
+    [filters.organizationId, filters.appId, boundProviders],
     client,
   );
   const installRuns = await queryRows<{
@@ -260,16 +269,42 @@ export async function loadDecisionFacts(input: {
     [filters.organizationId, filters.appId, attributionProvider],
     client,
   );
-  const findingRows = await queryRows<{
+  // Sync-time findings are an append-only record of what each run saw. A
+  // finding is current until a later completed run of the same stream reads
+  // the day again: the latest read of a day decides what is true of it, and
+  // a corrective re-sync that no longer flags the day resolves the finding.
+  // Reconciliation findings are rewritten on every recompute and carry no
+  // run, so they are always current.
+  const allFindingRows = await queryRows<{
     check_key: string;
     severity: string;
     observed_date: string | null;
+    current: boolean;
   }>(
-    `SELECT check_key, severity, observed_date::text AS observed_date
-       FROM data_quality_findings WHERE organization_id = $1 AND app_id = $2`,
+    `SELECT f.check_key, f.severity, f.observed_date::text AS observed_date,
+            NOT EXISTS (
+              SELECT 1 FROM sync_runs later
+               WHERE later.app_id = f.app_id AND later.connection_id = r.connection_id
+                 AND later.data_type = r.data_type
+                 AND later.status IN ('completed', 'partially_completed')
+                 AND later.finished_at > f.created_at
+                 AND (f.observed_date IS NULL
+                      OR (later.status = 'completed'
+                          AND later.window_start <= f.observed_date
+                          AND later.window_end >= f.observed_date)
+                      OR EXISTS (
+                        SELECT 1 FROM jsonb_array_elements_text(
+                          COALESCE(later.checkpoint->'completedWindows', '[]'::jsonb)) k
+                         WHERE split_part(k, '..', 1)::date <= f.observed_date
+                           AND split_part(k, '..', 2)::date >= f.observed_date))
+            ) AS current
+       FROM data_quality_findings f
+       LEFT JOIN sync_runs r ON r.id = f.sync_run_id
+      WHERE f.organization_id = $1 AND f.app_id = $2`,
     [filters.organizationId, filters.appId],
     client,
   );
+  const findingRows = allFindingRows.filter((f) => f.current);
   // A finding on a day is a data-side signal for that day's anomalies -
   // except the two that describe how rows are labelled rather than whether
   // the day is intact. Organic traffic has no campaign id every day; treating
@@ -296,8 +331,11 @@ export async function loadDecisionFacts(input: {
     revenueWindows.some(
       (w) => covers(w, date) && w.finished !== null && w.finished > addDays(date, age),
     );
+  // Labelling checks are excluded from the readings' findings for the reason
+  // given above: they describe rows, not whether a day is intact.
   const findingCounts = new Map<string, { checkKey: string; severity: string; count: number }>();
   for (const finding of findingRows) {
+    if (DAY_SIGNAL_EXCLUDED_CHECKS.has(finding.check_key)) continue;
     const inWindow =
       finding.observed_date === null ||
       (finding.observed_date >= input.window.from && finding.observed_date <= input.window.to);
@@ -346,6 +384,7 @@ export async function loadDecisionFacts(input: {
     return facts;
   };
   const dayIndex = new Map(allDates.map((d, i) => [d, i] as const));
+  const eventRevenueByCampaign = new Map<string, Map<string, number>>();
   const dayOf = (facts: CampaignFacts, date: string): CampaignDayFact | undefined => {
     const index = dayIndex.get(date);
     return index === undefined ? undefined : facts.days[index];
@@ -531,6 +570,18 @@ export async function loadDecisionFacts(input: {
            JOIN links l ON l.attribution_id = t.external_campaign_id
           WHERE t.organization_id = $1 AND t.app_id = $2 AND t.provider_key = $4
             AND t.grain = 'event_date' AND t.activity_date BETWEEN $5 AND $6 AND ${notOrganic('t')}
+            -- A provider total counts only where no component row exists for
+            -- the same day and identity: a report that gained the split
+            -- later leaves its old totals behind.
+            AND (t.revenue_type <> 'total' OR NOT EXISTS (
+                  SELECT 1 FROM attribution_revenue_metrics c
+                   WHERE c.connection_id = t.connection_id AND c.app_id = t.app_id
+                     AND c.grain = 'event_date' AND c.activity_date = t.activity_date
+                     AND c.revenue_type IN ('iap', 'ad')
+                     AND c.media_source IS NOT DISTINCT FROM t.media_source
+                     AND c.external_campaign_id IS NOT DISTINCT FROM t.external_campaign_id
+                     AND c.country IS NOT DISTINCT FROM t.country
+                     AND c.platform = t.platform AND c.currency = t.currency))
           GROUP BY l.marketing_id, t.activity_date`,
         [
           filters.organizationId,
@@ -542,7 +593,6 @@ export async function loadDecisionFacts(input: {
         ],
         client,
       );
-      const eventRevenueByCampaign = new Map<string, Map<string, number>>();
       for (const row of eventRevenue) {
         const byDate = eventRevenueByCampaign.get(row.cid) ?? new Map<string, number>();
         byDate.set(row.date, toNumber(row.revenue));
@@ -617,12 +667,17 @@ export async function loadDecisionFacts(input: {
           if (!day || !COHORT_AGES.includes(age)) continue;
           const cohort = day.cohort[age];
           const revenue = toNumber(row.revenue);
+          const currencies = row.currencies ?? [];
           if (row.revenue_type === 'iap' || row.revenue_type === 'ad') {
             cohort.revenue[row.revenue_type] += revenue;
+            cohort.currencies[row.revenue_type] = sortedUnique([
+              ...cohort.currencies[row.revenue_type],
+              ...currencies,
+            ]);
           }
           cohort.revenue.total += revenue;
           cohort.earlyReadRows += toNumber(row.early_read_rows);
-          cohort.currencies = sortedUnique([...cohort.currencies, ...(row.currencies ?? [])]);
+          cohort.currencies.total = sortedUnique([...cohort.currencies.total, ...currencies]);
         }
       }
 
@@ -630,6 +685,7 @@ export async function loadDecisionFacts(input: {
       // it: a delivered day with no cohort row at all is still mature or not.
       for (const facts of campaigns.values()) {
         for (const day of facts.days) {
+          day.alignedInstalls = day.spend > 0 ? day.installs : 0;
           for (const age of COHORT_AGES) {
             const cohort = day.cohort[age];
             cohort.oldEnough = asOf !== null && addDays(day.date, age) < asOf;
@@ -681,12 +737,23 @@ export async function loadDecisionFacts(input: {
       target.clicks += day.clicks;
       target.spendCurrencies = sortedUnique([...target.spendCurrencies, ...day.spendCurrencies]);
       target.installs += day.installs;
+      // Cohort-aligned, exactly as Phase 2 aligns a cohort ROAS: a cohort's
+      // return and installs join the app figure only on a day its own
+      // campaign spent. Another campaign's spend on the day buys nothing for
+      // a campaign that was paused.
+      if (!(day.spend > 0)) continue;
+      target.alignedInstalls += day.installs;
       for (const age of COHORT_AGES) {
         const from = day.cohort[age];
         const into = target.cohort[age];
-        for (const type of COHORT_REVENUE_TYPES) into.revenue[type] += from.revenue[type];
+        for (const type of COHORT_REVENUE_TYPES) {
+          into.revenue[type] += from.revenue[type];
+          into.currencies[type] = sortedUnique([
+            ...into.currencies[type],
+            ...from.currencies[type],
+          ]);
+        }
         into.earlyReadRows += from.earlyReadRows;
-        into.currencies = sortedUnique([...into.currencies, ...from.currencies]);
       }
     }
   }
@@ -696,17 +763,42 @@ export async function loadDecisionFacts(input: {
       day.cohort[age].covered = revenueCoveredAt(day.date, age);
     }
   }
-  const appSeries = await loadAppSeries({
-    filters,
-    marketingProvider,
-    attributionProvider,
-    loaded: { from: loadedFrom, to: loadedTo },
-    horizon,
-    client,
-  });
+  // App-level anomalies are drawn from the same population the app reading
+  // is: the mapped campaigns. A featuring spike in organic installs is real,
+  // but it is not a reason to withhold a reading on paid campaigns it never
+  // touched; a tracking fault that stops paid installs still shows here.
+  const operational = [...campaigns.values()].filter((c) => c.mapping.operational);
+  const firstMappedActivity =
+    operational
+      .map(
+        (c) =>
+          c.days.find((d) => d.spend > 0 || d.impressions > 0 || d.clicks > 0 || d.installs > 0)
+            ?.date,
+      )
+      .filter((d): d is string => Boolean(d))
+      .sort()[0] ?? null;
+  const appEventRevenue = new Map<string, number>();
+  for (const c of operational) {
+    for (const [date, value] of eventRevenueByCampaign.get(c.externalCampaignId) ?? []) {
+      appEventRevenue.set(date, (appEventRevenue.get(date) ?? 0) + value);
+    }
+  }
+  const appSeries: ScopeSeries = firstMappedActivity
+    ? {
+        spend: seriesFrom(appDays, firstMappedActivity, horizon.marketing, (d) => d.spend),
+        installs: seriesFrom(appDays, firstMappedActivity, horizon.installs, (d) => d.installs),
+        revenue: seriesFrom(
+          appDays,
+          firstMappedActivity,
+          horizon.revenue,
+          (d) => appEventRevenue.get(d.date) ?? 0,
+        ),
+      }
+    : { spend: [], installs: [], revenue: [] };
 
+  // Unrounded: the gate compares against a floor, and 79.996 is below 80.
   const pct = (value: number, denominator: number): number | null =>
-    denominator > 0 ? Number(((value / denominator) * 100).toFixed(2)) : null;
+    denominator > 0 ? (value / denominator) * 100 : null;
 
   return {
     asOf,
@@ -739,89 +831,6 @@ function seriesFrom(
   return days
     .filter((d) => d.date >= first && d.date <= horizon)
     .map((d) => ({ date: d.date, value: pick(d) }));
-}
-
-/**
- * Everything the providers reported for the app, per day: all spend, all
- * attributed installs (paid and organic - an SDK that stops reporting stops
- * for both), all event-date revenue.
- */
-async function loadAppSeries(input: {
-  filters: MetricFilters;
-  marketingProvider: string | null;
-  attributionProvider: string | null;
-  loaded: Window;
-  horizon: { marketing: IsoDate | null; installs: IsoDate | null; revenue: IsoDate | null };
-  client?: Queryable;
-}): Promise<ScopeSeries> {
-  const { filters, client } = input;
-  const spend = new Map<string, number>();
-  const installs = new Map<string, number>();
-  const revenue = new Map<string, number>();
-  if (input.marketingProvider) {
-    const rows = await queryRows<{ date: string; spend: string }>(
-      `SELECT report_date::text AS date, SUM(spend)::text AS spend
-         FROM marketing_daily_metrics
-        WHERE organization_id = $1 AND app_id = $2 AND provider_key = $3
-          AND report_date BETWEEN $4 AND $5
-        GROUP BY report_date`,
-      [
-        filters.organizationId,
-        filters.appId,
-        input.marketingProvider,
-        input.loaded.from,
-        input.loaded.to,
-      ],
-      client,
-    );
-    for (const row of rows) spend.set(row.date, toNumber(row.spend));
-  }
-  if (input.attributionProvider) {
-    const installRows = await queryRows<{ date: string; installs: string }>(
-      `SELECT install_date::text AS date, SUM(attributed_installs)::text AS installs
-         FROM attribution_daily_metrics
-        WHERE organization_id = $1 AND app_id = $2 AND provider_key = $3
-          AND install_date BETWEEN $4 AND $5
-        GROUP BY install_date`,
-      [
-        filters.organizationId,
-        filters.appId,
-        input.attributionProvider,
-        input.loaded.from,
-        input.loaded.to,
-      ],
-      client,
-    );
-    for (const row of installRows) installs.set(row.date, toNumber(row.installs));
-    const revenueRows = await queryRows<{ date: string; revenue: string }>(
-      `SELECT activity_date::text AS date, SUM(revenue)::text AS revenue
-         FROM attribution_revenue_metrics
-        WHERE organization_id = $1 AND app_id = $2 AND provider_key = $3
-          AND grain = 'event_date' AND activity_date BETWEEN $4 AND $5
-        GROUP BY activity_date`,
-      [
-        filters.organizationId,
-        filters.appId,
-        input.attributionProvider,
-        input.loaded.from,
-        input.loaded.to,
-      ],
-      client,
-    );
-    for (const row of revenueRows) revenue.set(row.date, toNumber(row.revenue));
-  }
-  const dense = (values: Map<string, number>, horizon: IsoDate | null): SeriesPoint[] => {
-    if (horizon === null || values.size === 0) return [];
-    const first = [...values.keys()].sort()[0] as string;
-    return eachDate(input.loaded.from, input.loaded.to)
-      .filter((d) => d >= first && d <= horizon)
-      .map((date) => ({ date, value: values.get(date) ?? 0 }));
-  };
-  return {
-    spend: dense(spend, input.horizon.marketing),
-    installs: dense(installs, input.horizon.installs),
-    revenue: dense(revenue, input.horizon.revenue),
-  };
 }
 
 export type { CohortRevenueType };

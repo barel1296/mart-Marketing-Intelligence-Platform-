@@ -20,7 +20,8 @@
  * Like the earlier audits it derives every figure with its own SQL and its
  * own arithmetic, never by importing the predicates it checks. A criterion
  * this database cannot evaluate is UNPROVEN with the reason, never PASS on
- * the strength of a fixture.
+ * the strength of a fixture - and a proof whose precondition this database
+ * does not meet says which precondition, rather than failing.
  */
 import { closePool, decisionsRepo, getPool, queryRows, toNumber, type Queryable } from '@mart/db';
 import {
@@ -81,6 +82,17 @@ const LINKS = `links AS (
      AND m.source_provider = $3 AND m.target_provider = $4
      AND m.target_external_id IS NOT NULL AND ${OPERATIONAL}
    ORDER BY m.target_external_id, m.mapping_confidence DESC, m.source_external_id)`;
+/**
+ * The spend side: every marketing campaign with an operational link, as
+ * Phase 2's mappedMarketingCampaign counts it. Two marketing campaigns
+ * linked to one attribution campaign both spend; the attribution campaign's
+ * installs and cohorts are credited to one of them (LINKS).
+ */
+const MAPPED_SPEND = `md.external_campaign_id IN (
+  SELECT m.source_external_id FROM provider_entity_mappings m
+   WHERE m.organization_id = $1 AND m.app_id = $2 AND m.entity_type = 'campaign'
+     AND m.source_provider = $3 AND m.target_provider = $4
+     AND m.target_external_id IS NOT NULL AND ${OPERATIONAL})`;
 /** The revenue sync read `day` in a run that finished after the cohort reached `age`. */
 const COVERED = (alias: string, day: string, age: string): string => `EXISTS (
   SELECT 1 FROM sync_runs r, jsonb_array_elements(COALESCE(r.checkpoint->'dataWindows', '[]'::jsonb)) w
@@ -88,9 +100,39 @@ const COVERED = (alias: string, day: string, age: string): string => `EXISTS (
      AND r.status IN ('completed', 'partially_completed')
      AND (w->>'from')::date <= ${day} AND ${day} <= (w->>'to')::date
      AND (r.finished_at AT TIME ZONE a.timezone)::date > (${day} + ${age}::int))`;
+/** A provider total counts only where no component row exists for the same identity. */
+const TOTAL_WITHOUT_COMPONENTS = (
+  grain: string,
+): string => `(t.revenue_type <> 'total' OR NOT EXISTS (
+  SELECT 1 FROM attribution_revenue_metrics c
+   WHERE c.connection_id = t.connection_id AND c.app_id = t.app_id
+     AND c.grain = '${grain}' AND c.activity_date = t.activity_date AND c.revenue_type IN ('iap','ad')
+     ${grain === 'cohort_date' ? 'AND c.cohort_age_days = t.cohort_age_days' : ''}
+     AND c.media_source IS NOT DISTINCT FROM t.media_source
+     AND c.external_campaign_id IS NOT DISTINCT FROM t.external_campaign_id
+     AND c.country IS NOT DISTINCT FROM t.country
+     AND c.platform = t.platform AND c.currency = t.currency))`;
 /** Findings that describe row labelling or the account, never a day's integrity. */
-const NOT_A_DAY_SIGNAL = `(check_key IN ('attribution.missing_campaign_id', 'marketing.missing_campaign_id')
-  OR check_key LIKE 'reconciliation.%')`;
+const LABELLING_CHECKS = `('attribution.missing_campaign_id', 'marketing.missing_campaign_id')`;
+/**
+ * A sync-time finding is current until a later completed run of the same
+ * stream read its day again. Reconciliation findings carry no run and are
+ * rewritten on every recompute, so they are always current.
+ */
+const FINDING_CURRENT = `NOT EXISTS (
+  SELECT 1 FROM sync_runs later
+   WHERE later.app_id = f.app_id AND later.connection_id = r.connection_id
+     AND later.data_type = r.data_type
+     AND later.status IN ('completed', 'partially_completed')
+     AND later.finished_at > f.created_at
+     AND (f.observed_date IS NULL
+          OR (later.status = 'completed'
+              AND later.window_start <= f.observed_date AND later.window_end >= f.observed_date)
+          OR EXISTS (
+            SELECT 1 FROM jsonb_array_elements_text(COALESCE(later.checkpoint->'completedWindows', '[]'::jsonb)) k
+             WHERE split_part(k, '..', 1)::date <= f.observed_date
+               AND split_part(k, '..', 2)::date >= f.observed_date)))`;
+const READING_STREAMS = `('marketing_performance', 'attribution_installs', 'attribution_revenue')`;
 const PROOF_CAMPAIGN = 'mart-phase3-proof';
 const T = DECISION_THRESHOLDS;
 const FRESHNESS_ORDER = ['error', 'stale', 'unknown', 'delayed', 'fresh'];
@@ -122,10 +164,11 @@ async function main(): Promise<void> {
   }
 
   auditVocabulary(ctx);
-  await auditStorage(ctx);
-
-  for (const app of apps) {
-    await auditApp(ctx, organizationId, app, from as IsoDate, to as IsoDate);
+  const stored = await auditStorage(ctx);
+  if (stored) {
+    for (const app of apps) {
+      await auditApp(ctx, organizationId, app, from as IsoDate, to as IsoDate);
+    }
   }
 
   heading(ctx, 'PHASE 3 EXIT VERDICT');
@@ -208,8 +251,19 @@ function auditVocabulary(ctx: AuditContext): void {
   );
 }
 
-async function auditStorage(ctx: AuditContext): Promise<void> {
+/** False when the schema has no decision storage yet: nothing below can run. */
+async function auditStorage(ctx: AuditContext): Promise<boolean> {
   heading(ctx, 'POLICY STORAGE AND NO AUTOMATION');
+  const present = await queryRows<Row>(`SELECT to_regclass('decision_policies')::text AS name`);
+  if (!present[0]?.['name']) {
+    record(
+      ctx,
+      'decision_policies stores targets only',
+      'NOT_IMPLEMENTED',
+      'table decision_policies is absent: run migrations (0016) before auditing Phase 3',
+    );
+    return false;
+  }
   const columns = await queryRows<Row>(
     `SELECT column_name FROM information_schema.columns
       WHERE table_name = 'decision_policies' ORDER BY ordinal_position`,
@@ -221,7 +275,7 @@ async function auditStorage(ctx: AuditContext): Promise<void> {
     ['target_roas_d7', 'target_roas_d1', 'max_cpi', 'currency', 'updated_by_user_id'].every((c) =>
       names.includes(c),
     ) && !names.some((c) => /budget|bid|status|action/.test(c)),
-    names.join(', ') || 'table missing - run migrations',
+    names.join(', '),
   );
   const unique = await queryRows<Row>(
     `SELECT count(*)::text AS n FROM pg_constraint
@@ -240,6 +294,7 @@ async function auditStorage(ctx: AuditContext): Promise<void> {
     actionTables.length === 0,
     actionTables.map((t) => String(t['table_name'])).join(', ') || 'nothing to execute from',
   );
+  return true;
 }
 
 // ------------------------------------------------------------------ app ---
@@ -388,34 +443,52 @@ function scopeName(r: Recommendation): string {
   return r.scope.kind === 'app' ? 'APP' : String(r.scope.marketingCampaignId);
 }
 
-/** Run `fn` inside a transaction that is always rolled back, and verify the rollback. */
+/**
+ * Run `fn` inside a transaction that is always rolled back, and verify the
+ * rollback against checksums that would show every change a proof makes:
+ * row counts, currencies, spend, checkpoints, statuses, targets, capability
+ * flags.
+ */
 async function withRollback<R>(
   appId: string,
   fn: (client: Queryable) => Promise<R>,
 ): Promise<{ result: R | null; error: string | null; verified: boolean; drift: string[] }> {
   const extra = async (): Promise<Record<string, string>> => {
-    const policies = await queryRows<{ n: string; sum: string }>(
-      `SELECT count(*)::text AS n, COALESCE(md5(string_agg(id::text || COALESCE(target_roas_d7::text, '') || COALESCE(max_cpi::text, ''), ',' ORDER BY id)), '') AS sum
-         FROM decision_policies WHERE app_id = $1`,
-      [appId],
-    );
-    const campaigns = await queryRows<{ n: string; sum: string }>(
-      `SELECT count(*)::text AS n, COALESCE(md5(string_agg(id::text || COALESCE(name, ''), ',' ORDER BY id)), '') AS sum
-         FROM marketing_campaigns WHERE app_id = $1`,
-      [appId],
-    );
-    const capabilities = await queryRows<{ n: string; sum: string }>(
-      `SELECT count(*)::text AS n, COALESCE(md5(string_agg(pc.id::text || pc.supported::text, ',' ORDER BY pc.id)), '') AS sum
-         FROM provider_capabilities pc
-         JOIN integration_app_bindings b ON b.connection_id = pc.connection_id
-        WHERE b.app_id = $1`,
-      [appId],
-    );
-    return {
-      decision_policies: `${policies[0]?.n ?? '0'}:${policies[0]?.sum ?? ''}`,
-      marketing_campaigns: `${campaigns[0]?.n ?? '0'}:${campaigns[0]?.sum ?? ''}`,
-      provider_capabilities: `${capabilities[0]?.n ?? '0'}:${capabilities[0]?.sum ?? ''}`,
-    };
+    const sums: Array<[string, string]> = [
+      [
+        'decision_policies',
+        `SELECT count(*)::text AS n, COALESCE(md5(string_agg(id::text || COALESCE(target_roas_d7::text, '') || COALESCE(target_roas_d1::text, '') || COALESCE(max_cpi::text, ''), ',' ORDER BY id)), '') AS sum
+           FROM decision_policies WHERE app_id = $1`,
+      ],
+      [
+        'marketing_campaigns',
+        `SELECT count(*)::text AS n, COALESCE(md5(string_agg(id::text || COALESCE(name, ''), ',' ORDER BY id)), '') AS sum
+           FROM marketing_campaigns WHERE app_id = $1`,
+      ],
+      [
+        'marketing_daily_metrics.values',
+        `SELECT count(*)::text AS n, COALESCE(md5(string_agg(id::text || currency || spend::text, ',' ORDER BY id)), '') AS sum
+           FROM marketing_daily_metrics WHERE app_id = $1`,
+      ],
+      [
+        'sync_runs.checkpoints',
+        `SELECT count(*)::text AS n, COALESCE(md5(string_agg(id::text || COALESCE(checkpoint::text, ''), ',' ORDER BY id)), '') AS sum
+           FROM sync_runs WHERE app_id = $1`,
+      ],
+      [
+        'provider_capabilities',
+        `SELECT count(*)::text AS n, COALESCE(md5(string_agg(pc.id::text || pc.supported::text, ',' ORDER BY pc.id)), '') AS sum
+           FROM provider_capabilities pc
+           JOIN integration_app_bindings b ON b.connection_id = pc.connection_id
+          WHERE b.app_id = $1`,
+      ],
+    ];
+    const out: Record<string, string> = {};
+    for (const [key, sql] of sums) {
+      const rows = await queryRows<{ n: string; sum: string }>(sql, [appId]);
+      out[key] = `${rows[0]?.n ?? '0'}:${rows[0]?.sum ?? ''}`;
+    }
+    return out;
   };
   const before: Record<string, string> = {
     ...(await snapshotForProof(appId)),
@@ -424,6 +497,7 @@ async function withRollback<R>(
   const client = await getPool().connect();
   let result: R | null = null;
   let error: string | null = null;
+  let rolledBack = false;
   try {
     await client.query('BEGIN');
     result = await fn(client);
@@ -432,10 +506,11 @@ async function withRollback<R>(
   } finally {
     try {
       await client.query('ROLLBACK');
+      rolledBack = true;
     } catch {
-      // Releasing discards the transaction anyway; the snapshot decides.
+      // A connection that cannot roll back is not returned to the pool.
     }
-    client.release();
+    client.release(rolledBack ? undefined : true);
   }
   const after: Record<string, string> = {
     ...(await snapshotForProof(appId)),
@@ -680,8 +755,25 @@ async function auditApp(
         : `${decisive.length} decisive signal(s), every hard rule holds`),
   );
 
+  const PROOF_NAMES = [
+    'no target: no scale, no reduce',
+    'target below the return: scale',
+    'target above the return: reduce',
+    'target met: hold',
+    'newest cohorts contradict the window: hold',
+    'stale feed: no signal',
+    'second currency: investigate, never divide',
+    'ambiguous mapping: investigate, never read',
+    'immature window: no signal',
+    'day nobody re-read: not a day that earned nothing',
+    'partial return: scale above, never reduce below',
+    'partial return below target never reduces',
+    'tracking-shaped movement is never performance',
+    'sync error over the same movement is a data gap',
+  ];
   if (!marketing || !attribution) {
     for (const metric of [
+      'attribution horizon recomputed',
       'spend evidence recomputed',
       'cohort return recomputed',
       'installs and CPI recomputed',
@@ -691,20 +783,7 @@ async function auditApp(
       'anomaly classes follow the data around them',
       'pacing recomputed independently',
       'Phase 2 cohort ROAS agrees with the app evidence',
-      'no target: no scale, no reduce',
-      'target below the return: scale',
-      'target above the return: reduce',
-      'target met: hold',
-      'newest cohorts contradict the window: hold',
-      'stale feed: no signal',
-      'second currency: investigate, never divide',
-      'ambiguous mapping: investigate, never read',
-      'immature window: no signal',
-      'day nobody re-read: not a day that earned nothing',
-      'partial return: scale above, never reduce below',
-      'partial return below target never reduces',
-      'tracking-shaped movement is never performance',
-      'sync error over the same movement is a data gap',
+      ...PROOF_NAMES,
     ]) {
       record(ctx, metric, 'UNPROVEN', 'needs both a marketing and an attribution binding');
     }
@@ -743,6 +822,17 @@ async function auditApp(
   };
   const parseArray = (value: string | null | undefined): string[] =>
     (value ?? '{}').replace(/[{}"]/g, '').split(',').filter(Boolean).sort();
+  /**
+   * Installs and cohort revenue are credited to a marketing campaign only on
+   * a day that campaign spent - the alignment Phase 2 applies to a cohort
+   * ROAS - at campaign scope and at app scope alike.
+   */
+  const SPENT = (scope: string): string => `spent AS (
+    SELECT md.external_campaign_id AS cid, md.report_date AS day
+      FROM marketing_daily_metrics md
+     WHERE md.organization_id = $1 AND md.app_id = $2 AND md.provider_key = $3
+       AND md.report_date BETWEEN $5 AND $6 ${scope}
+     GROUP BY md.external_campaign_id, md.report_date HAVING SUM(md.spend) > 0)`;
   const ownFigures = async (
     campaignId: string | null,
     age: number,
@@ -761,19 +851,15 @@ async function auditApp(
           [organizationId, appId, mp, from, to, campaignId],
         )
       : await queryRows<Row>(
-          `WITH ${LINKS}
-           SELECT COALESCE(SUM(md.spend), 0)::text AS spend,
+          `SELECT COALESCE(SUM(md.spend), 0)::text AS spend,
                   COALESCE(array_agg(DISTINCT md.currency) FILTER (WHERE md.spend > 0), '{}')::text AS currencies
              FROM marketing_daily_metrics md
             WHERE md.organization_id = $1 AND md.app_id = $2 AND md.provider_key = $3
-              AND md.report_date BETWEEN $5 AND $6
-              AND md.external_campaign_id IN (SELECT marketing_id FROM links)`,
+              AND md.report_date BETWEEN $5 AND $6 AND ${MAPPED_SPEND}`,
           [organizationId, appId, mp, ap, from, to],
         );
     const scopeLink = campaignId ? 'AND l.marketing_id = $8' : '';
-    const scopeSpend = campaignId
-      ? 'AND md.external_campaign_id = $8'
-      : 'AND md.external_campaign_id IN (SELECT marketing_id FROM links)';
+    const scopeSpend = campaignId ? 'AND md.external_campaign_id = $8' : `AND ${MAPPED_SPEND}`;
     const scoped: unknown[] = [organizationId, appId, mp, ap, from, to, asOf];
     if (campaignId) scoped.push(campaignId);
     const installs = await queryRows<Row>(
@@ -785,33 +871,33 @@ async function auditApp(
           ${scopeLink}`,
       scoped,
     );
-    // Delivered days the attribution horizon has passed, with their mapped installs.
+    // Delivered days the attribution horizon has passed, with the installs
+    // their spend bought.
     const settled = await queryRows<Row>(
-      `WITH ${LINKS},
+      `WITH ${LINKS}, ${SPENT(scopeSpend)},
        days AS (
-         SELECT md.report_date AS day, SUM(md.spend) AS spend
-           FROM marketing_daily_metrics md
+         SELECT s.day, SUM(md.spend) AS spend
+           FROM spent s JOIN marketing_daily_metrics md
+             ON md.external_campaign_id = s.cid AND md.report_date = s.day
           WHERE md.organization_id = $1 AND md.app_id = $2 AND md.provider_key = $3
-            AND md.report_date BETWEEN $5 AND $6 ${scopeSpend}
-            AND $7::date IS NOT NULL AND md.report_date < $7::date
-          GROUP BY md.report_date HAVING SUM(md.spend) > 0
+            AND $7::date IS NOT NULL AND s.day < $7::date
+          GROUP BY s.day
        )
        SELECT COALESCE(SUM(d.spend), 0)::text AS spend,
               COALESCE((SELECT SUM(t.attributed_installs) FROM attribution_daily_metrics t
                           JOIN links l ON l.attribution_id = t.external_campaign_id
+                          JOIN spent s ON s.cid = l.marketing_id AND s.day = t.install_date
                          WHERE t.organization_id = $1 AND t.app_id = $2 AND t.provider_key = $4
-                           AND ${PAID} AND t.install_date IN (SELECT day FROM days)
-                           ${scopeLink}), 0)::text AS installs
+                           AND ${PAID} AND t.install_date IN (SELECT day FROM days)), 0)::text AS installs
          FROM days d`,
       scoped,
     );
     // Mature delivered days: old enough at the horizon and re-read by the
-    // revenue sync since; per day, their spend, mapped installs and cohort
-    // revenue at the age.
-    const matureScopeLink = campaignId ? 'AND l.marketing_id = $10' : '';
+    // revenue sync since; per day, their spend, the installs and cohort
+    // revenue their own campaigns' spend bought.
     const matureScopeSpend = campaignId
       ? 'AND md.external_campaign_id = $10'
-      : 'AND md.external_campaign_id IN (SELECT marketing_id FROM links)';
+      : `AND ${MAPPED_SPEND}`;
     const matureParams: unknown[] = [
       organizationId,
       appId,
@@ -825,22 +911,25 @@ async function auditApp(
     ];
     if (campaignId) matureParams.push(campaignId);
     const mature = await queryRows<Row>(
-      `WITH ${LINKS},
+      `WITH ${LINKS}, ${SPENT(matureScopeSpend)},
        days AS (
-         SELECT md.report_date AS day, SUM(md.spend) AS spend
-           FROM marketing_daily_metrics md JOIN apps a ON a.id = md.app_id
+         SELECT s.day, SUM(md.spend) AS spend
+           FROM spent s
+           JOIN marketing_daily_metrics md
+             ON md.external_campaign_id = s.cid AND md.report_date = s.day
+           JOIN apps a ON a.id = md.app_id
           WHERE md.organization_id = $1 AND md.app_id = $2 AND md.provider_key = $3
-            AND md.report_date BETWEEN $5 AND $6 ${matureScopeSpend}
-            AND $8::date IS NOT NULL AND (md.report_date + $7::int) < $8::date
-            AND ${COVERED('md', 'md.report_date', '$7')}
-          GROUP BY md.report_date HAVING SUM(md.spend) > 0
+            AND $8::date IS NOT NULL AND (s.day + $7::int) < $8::date
+            AND ${COVERED('md', 's.day', '$7')}
+          GROUP BY s.day
        ),
        installs AS (
          SELECT t.install_date AS day, SUM(t.attributed_installs) AS installs
            FROM attribution_daily_metrics t
            JOIN links l ON l.attribution_id = t.external_campaign_id
+           JOIN spent s ON s.cid = l.marketing_id AND s.day = t.install_date
           WHERE t.organization_id = $1 AND t.app_id = $2 AND t.provider_key = $4
-            AND ${PAID} AND t.install_date IN (SELECT day FROM days) ${matureScopeLink}
+            AND ${PAID} AND t.install_date IN (SELECT day FROM days)
           GROUP BY t.install_date
        ),
        revenue AS (
@@ -849,19 +938,12 @@ async function auditApp(
            FROM attribution_revenue_metrics t
            JOIN apps a ON a.id = t.app_id
            JOIN links l ON l.attribution_id = t.external_campaign_id
+           JOIN spent s ON s.cid = l.marketing_id AND s.day = t.activity_date
           WHERE t.organization_id = $1 AND t.app_id = $2 AND t.provider_key = $4
             AND t.grain = 'cohort_date' AND t.cohort_age_days = $7
-            AND ${PAID} AND t.activity_date IN (SELECT day FROM days) ${matureScopeLink}
+            AND ${PAID} AND t.activity_date IN (SELECT day FROM days)
             AND ($9::text = 'total' OR t.revenue_type = $9)
-            AND (t.revenue_type <> 'total' OR NOT EXISTS (
-                  SELECT 1 FROM attribution_revenue_metrics c
-                   WHERE c.connection_id = t.connection_id AND c.app_id = t.app_id
-                     AND c.grain = 'cohort_date' AND c.cohort_age_days = t.cohort_age_days
-                     AND c.activity_date = t.activity_date AND c.revenue_type IN ('iap','ad')
-                     AND c.media_source IS NOT DISTINCT FROM t.media_source
-                     AND c.external_campaign_id IS NOT DISTINCT FROM t.external_campaign_id
-                     AND c.country IS NOT DISTINCT FROM t.country
-                     AND c.platform = t.platform AND c.currency = t.currency))
+            AND ${TOTAL_WITHOUT_COMPONENTS('cohort_date')}
             AND (t.activity_date + t.cohort_age_days) < $8::date
             AND (t.observed_at AT TIME ZONE a.timezone)::date > (t.activity_date + t.cohort_age_days)
             AND ${COVERED('t', 't.activity_date', 't.cohort_age_days')}
@@ -932,19 +1014,24 @@ async function auditApp(
         ? ownInstallsLatest
         : ownRevenueLatest
       : null;
+  // Unresolved errors on the streams a reading is drawn from, for the bound providers.
   const ownErrors = toNumber(
     (
       await queryRows<Row>(
         `SELECT count(*)::text AS n FROM sync_errors e JOIN sync_runs r ON r.id = e.sync_run_id
-          WHERE r.app_id = $1 AND e.resolved_at IS NULL`,
-        [appId],
+          WHERE r.app_id = $1 AND e.resolved_at IS NULL
+            AND r.data_type IN ${READING_STREAMS} AND r.provider_key IN ($2, $3)`,
+        [appId, mp, ap],
       )
     )[0]?.['n'],
   );
   const ownErrorFindings = await queryRows<Row>(
-    `SELECT check_key FROM data_quality_findings
-      WHERE app_id = $1 AND severity = 'error'
-        AND (observed_date IS NULL OR observed_date BETWEEN $2 AND $3)`,
+    `SELECT f.check_key FROM data_quality_findings f
+       LEFT JOIN sync_runs r ON r.id = f.sync_run_id
+      WHERE f.app_id = $1 AND f.severity = 'error'
+        AND f.check_key NOT IN ${LABELLING_CHECKS}
+        AND (f.observed_date IS NULL OR f.observed_date BETWEEN $2 AND $3)
+        AND ${FINDING_CURRENT}`,
     [appId, from, to],
   );
   assert(
@@ -967,45 +1054,51 @@ async function auditApp(
   const ownSeries = async (
     campaignId: string | null,
   ): Promise<Record<OwnMetric, Array<{ date: IsoDate; value: number }>>> => {
-    const spendRows = await queryRows<Row>(
-      `SELECT report_date::text AS date, SUM(spend)::text AS value FROM marketing_daily_metrics
-        WHERE app_id = $1 AND provider_key = $2 AND report_date BETWEEN $3 AND $4
-          ${campaignId ? 'AND external_campaign_id = $5' : ''}
-        GROUP BY report_date`,
-      campaignId ? [appId, mp, loadedFrom, to, campaignId] : [appId, mp, loadedFrom, to],
-    );
+    // Delivery rows of the scope (the mapped population at app scope), with
+    // impressions and clicks so a first day that only served counts as
+    // activity, as it does in the layer.
+    const spendRows = campaignId
+      ? await queryRows<Row>(
+          `SELECT report_date::text AS date, SUM(spend)::text AS value,
+                  (SUM(impressions) + SUM(clicks))::text AS served
+             FROM marketing_daily_metrics
+            WHERE app_id = $1 AND provider_key = $2 AND report_date BETWEEN $3 AND $4
+              AND external_campaign_id = $5
+            GROUP BY report_date`,
+          [appId, mp, loadedFrom, to, campaignId],
+        )
+      : await queryRows<Row>(
+          `SELECT md.report_date::text AS date, SUM(md.spend)::text AS value,
+                  (SUM(md.impressions) + SUM(md.clicks))::text AS served
+             FROM marketing_daily_metrics md
+            WHERE md.organization_id = $1 AND md.app_id = $2 AND md.provider_key = $3
+              AND md.report_date BETWEEN $5 AND $6 AND ${MAPPED_SPEND}
+            GROUP BY md.report_date`,
+          [organizationId, appId, mp, ap, loadedFrom, to],
+        );
     const installRows = await queryRows<Row>(
-      campaignId
-        ? `WITH ${LINKS}
-           SELECT t.install_date::text AS date, SUM(t.attributed_installs)::text AS value
-             FROM attribution_daily_metrics t JOIN links l ON l.attribution_id = t.external_campaign_id
-            WHERE t.organization_id = $1 AND t.app_id = $2 AND t.provider_key = $4 AND ${PAID}
-              AND t.install_date BETWEEN $5 AND $6 AND l.marketing_id = $7
-            GROUP BY t.install_date`
-        : `SELECT install_date::text AS date, SUM(attributed_installs)::text AS value
-             FROM attribution_daily_metrics
-            WHERE app_id = $1 AND provider_key = $2 AND install_date BETWEEN $3 AND $4
-            GROUP BY install_date`,
+      `WITH ${LINKS}
+       SELECT t.install_date::text AS date, SUM(t.attributed_installs)::text AS value
+         FROM attribution_daily_metrics t JOIN links l ON l.attribution_id = t.external_campaign_id
+        WHERE t.organization_id = $1 AND t.app_id = $2 AND t.provider_key = $4 AND ${PAID}
+          AND t.install_date BETWEEN $5 AND $6 ${campaignId ? 'AND l.marketing_id = $7' : ''}
+        GROUP BY t.install_date`,
       campaignId
         ? [organizationId, appId, mp, ap, loadedFrom, to, campaignId]
-        : [appId, ap, loadedFrom, to],
+        : [organizationId, appId, mp, ap, loadedFrom, to],
     );
     const revenueRows = await queryRows<Row>(
-      campaignId
-        ? `WITH ${LINKS}
-           SELECT t.activity_date::text AS date, SUM(t.revenue)::text AS value
-             FROM attribution_revenue_metrics t JOIN links l ON l.attribution_id = t.external_campaign_id
-            WHERE t.organization_id = $1 AND t.app_id = $2 AND t.provider_key = $4 AND ${PAID}
-              AND t.grain = 'event_date' AND t.activity_date BETWEEN $5 AND $6 AND l.marketing_id = $7
-            GROUP BY t.activity_date`
-        : `SELECT activity_date::text AS date, SUM(revenue)::text AS value
-             FROM attribution_revenue_metrics
-            WHERE app_id = $1 AND provider_key = $2 AND grain = 'event_date'
-              AND activity_date BETWEEN $3 AND $4
-            GROUP BY activity_date`,
+      `WITH ${LINKS}
+       SELECT t.activity_date::text AS date, SUM(t.revenue)::text AS value
+         FROM attribution_revenue_metrics t JOIN links l ON l.attribution_id = t.external_campaign_id
+        WHERE t.organization_id = $1 AND t.app_id = $2 AND t.provider_key = $4 AND ${PAID}
+          AND t.grain = 'event_date' AND t.activity_date BETWEEN $5 AND $6
+          AND ${TOTAL_WITHOUT_COMPONENTS('event_date')}
+          ${campaignId ? 'AND l.marketing_id = $7' : ''}
+        GROUP BY t.activity_date`,
       campaignId
         ? [organizationId, appId, mp, ap, loadedFrom, to, campaignId]
-        : [appId, ap, loadedFrom, to],
+        : [organizationId, appId, mp, ap, loadedFrom, to],
     );
     const dense = (
       rows: Row[],
@@ -1018,21 +1111,17 @@ async function auditApp(
         .filter((d) => d >= first && d <= streamHorizon)
         .map((date) => ({ date, value: byDate.get(date) ?? 0 }));
     };
-    const activity = [...spendRows, ...installRows]
-      .filter((r) => toNumber(r['value']) > 0)
-      .map((r) => String(r['date']))
-      .sort();
-    const first = campaignId ? activity[0] : [...spendRows.map((r) => String(r['date']))].sort()[0];
-    const firstInstalls = campaignId
-      ? first
-      : [...installRows.map((r) => String(r['date']))].sort()[0];
-    const firstRevenue = campaignId
-      ? first
-      : [...revenueRows.map((r) => String(r['date']))].sort()[0];
+    // First activity: a day with spend, impressions, clicks or installs.
+    const first = [
+      ...spendRows
+        .filter((r) => toNumber(r['value']) > 0 || toNumber(r['served']) > 0)
+        .map((r) => String(r['date'])),
+      ...installRows.filter((r) => toNumber(r['value']) > 0).map((r) => String(r['date'])),
+    ].sort()[0];
     return {
       spend: dense(spendRows, horizonOf('marketing_performance'), first),
-      installs: dense(installRows, horizonOf('attribution_installs'), firstInstalls),
-      revenue: dense(revenueRows, horizonOf('attribution_revenue'), firstRevenue),
+      installs: dense(installRows, horizonOf('attribution_installs'), first),
+      revenue: dense(revenueRows, horizonOf('attribution_revenue'), first),
     };
   };
   const ownDaySignals = async (
@@ -1041,9 +1130,10 @@ async function auditApp(
     const errors = await queryRows<Row>(
       `SELECT count(*)::text AS n FROM sync_errors e JOIN sync_runs r ON r.id = e.sync_run_id
         WHERE r.app_id = $1 AND e.resolved_at IS NULL
+          AND r.data_type IN ${READING_STREAMS} AND r.provider_key IN ($3, $4)
           AND (e.window_start IS NULL OR e.window_start <= $2::date)
           AND (e.window_end IS NULL OR e.window_end >= $2::date)`,
-      [appId, date],
+      [appId, date, mp, ap],
     );
     const covered = await queryRows<Row>(
       `SELECT count(*)::text AS n FROM sync_runs r
@@ -1057,9 +1147,11 @@ async function auditApp(
       [appId, date],
     );
     const findings = await queryRows<Row>(
-      `SELECT count(*)::text AS n FROM data_quality_findings
-        WHERE app_id = $1 AND observed_date = $2::date AND severity <> 'info'
-          AND NOT ${NOT_A_DAY_SIGNAL}`,
+      `SELECT count(*)::text AS n FROM data_quality_findings f
+         LEFT JOIN sync_runs r ON r.id = f.sync_run_id
+        WHERE f.app_id = $1 AND f.observed_date = $2::date AND f.severity <> 'info'
+          AND f.check_key NOT IN ${LABELLING_CHECKS} AND f.check_key NOT LIKE 'reconciliation.%'
+          AND ${FINDING_CURRENT}`,
       [appId, date],
     );
     return {
@@ -1091,6 +1183,7 @@ async function auditApp(
         (b) => b.metric === 'installs' && b.date === a.date && b.direction === a.direction,
       );
       if (sameInstalls) return classify(sameInstalls);
+      if (sameSpend) return 'delivery';
       return signals.finding ? 'attribution' : 'monetization';
     };
     const classified: OwnClassified[] = [];
@@ -1154,17 +1247,17 @@ async function auditApp(
       }
     } else {
       const coverage = await queryRows<Row>(
-        `WITH ${LINKS},
-         delivered AS (
-           SELECT md.external_campaign_id AS cid, SUM(md.spend) AS spend
+        `WITH delivered AS (
+           SELECT md.external_campaign_id AS cid, SUM(md.spend) AS spend,
+                  bool_or(${MAPPED_SPEND}) AS mapped
              FROM marketing_daily_metrics md
             WHERE md.organization_id = $1 AND md.app_id = $2 AND md.provider_key = $3
               AND md.report_date BETWEEN $5 AND $6 AND md.external_campaign_id IS NOT NULL
             GROUP BY md.external_campaign_id
          )
          SELECT COALESCE(SUM(d.spend), 0)::text AS total,
-                COALESCE(SUM(d.spend) FILTER (WHERE d.cid IN (SELECT marketing_id FROM links)), 0)::text AS mapped,
-                COALESCE(SUM(d.spend) FILTER (WHERE d.cid NOT IN (SELECT marketing_id FROM links)
+                COALESCE(SUM(d.spend) FILTER (WHERE d.mapped), 0)::text AS mapped,
+                COALESCE(SUM(d.spend) FILTER (WHERE NOT d.mapped
                   AND EXISTS (SELECT 1 FROM provider_entity_mappings m
                                WHERE m.organization_id = $1 AND m.app_id = $2 AND m.entity_type = 'campaign'
                                  AND m.source_provider = $3 AND m.source_external_id = d.cid
@@ -1190,13 +1283,7 @@ async function auditApp(
     if (worst === 'error' || ownErrors > 0) {
       return { signal: 'investigate', category: 'data_quality', blocker: 'provider_stale' };
     }
-    if (
-      ownMarketingStatus === null ||
-      ownAttributionStatus === null ||
-      worst === 'stale' ||
-      worst === 'unknown' ||
-      ownAsOf === null
-    ) {
+    if (worst === 'stale' || worst === 'unknown' || worst === null || ownAsOf === null) {
       return { signal: 'insufficient_data', category: 'data_quality', blocker: 'provider_stale' };
     }
     const spendCurrency = own.spendCurrencies[0];
@@ -1280,11 +1367,9 @@ async function auditApp(
               ],
             )
           : await queryRows<Row>(
-              `WITH ${LINKS}
-               SELECT count(*)::text AS n FROM marketing_daily_metrics md JOIN apps a ON a.id = md.app_id
+              `SELECT count(*)::text AS n FROM marketing_daily_metrics md JOIN apps a ON a.id = md.app_id
                 WHERE md.organization_id = $1 AND md.app_id = $2 AND md.provider_key = $3
-                  AND md.report_date BETWEEN $5 AND $6 AND md.spend > 0
-                  AND md.external_campaign_id IN (SELECT marketing_id FROM links)
+                  AND md.report_date BETWEEN $5 AND $6 AND md.spend > 0 AND ${MAPPED_SPEND}
                   AND (md.report_date + $7::int) < $8::date
                   AND NOT ${COVERED('md', 'md.report_date', '$7')}`,
               [organizationId, appId, mp, ap, from, to, measure.age, ownAsOf],
@@ -1310,12 +1395,12 @@ async function auditApp(
     const ratio = figures.matureRevenue / figures.matureSpend;
     const partial = measure.type !== 'total';
     const { upper, lower } = band(measure.target);
-    // Own trend: the newest seven mature days against the seven before.
+    // Own trend: the newest seven mature days against the seven before, both full.
     const half = (slice: MatureDay[]): number | null => {
       const s = slice.reduce((acc, d) => acc + d.spend, 0);
       const i = slice.reduce((acc, d) => acc + d.installs, 0);
       const v = slice.reduce((acc, d) => acc + d.revenue, 0);
-      return slice.length >= T.minimumMatureDays &&
+      return slice.length === T.trendWindowDays &&
         s >= T.minimumSpend &&
         i >= T.minimumInstalls &&
         s > 0
@@ -1469,7 +1554,7 @@ async function auditApp(
   const pacingProblems: string[] = [];
   for (const p of run1.pacing) {
     const budget = await queryRows<Row>(
-      `SELECT MAX(c.daily_budget)::text AS daily,
+      `SELECT MAX(c.daily_budget)::text AS daily, MAX(c.currency) AS currency,
               (SELECT SUM(g.daily_budget)::text FROM marketing_ad_groups g
                 WHERE g.app_id = c.app_id AND g.provider_key = c.provider_key
                   AND g.external_campaign_id = c.external_campaign_id) AS ad_sets
@@ -1479,8 +1564,9 @@ async function auditApp(
       [appId, mp, p.marketingCampaignId],
     );
     const delivered = await queryRows<Row>(
-      `SELECT count(*)::text AS days, COALESCE(SUM(s), 0)::text AS spend
-         FROM (SELECT report_date, SUM(spend) AS s FROM marketing_daily_metrics
+      `SELECT count(*)::text AS days, COALESCE(SUM(s), 0)::text AS spend,
+              COALESCE(array_agg(DISTINCT cur), '{}')::text AS currencies
+         FROM (SELECT report_date, SUM(spend) AS s, MAX(currency) AS cur FROM marketing_daily_metrics
                 WHERE app_id = $1 AND provider_key = $2 AND external_campaign_id = $3
                   AND report_date BETWEEN $4 AND $5
                 GROUP BY report_date HAVING SUM(spend) > 0) d`,
@@ -1492,10 +1578,14 @@ async function auditApp(
         : budget[0]?.['ad_sets'] && toNumber(budget[0]['ad_sets']) > 0
           ? toNumber(budget[0]['ad_sets'])
           : null;
+    const budgetCurrency = budget[0]?.['currency'] ?? null;
     const days = toNumber(delivered[0]?.['days']);
     const spend = toNumber(delivered[0]?.['spend']);
-    const ratio =
-      daily !== null && days > 0 && p.spendCurrencies.length <= 1 ? spend / days / daily : null;
+    const spendCurrencies = parseArray(delivered[0]?.['currencies']);
+    const currencyOk =
+      spendCurrencies.length <= 1 &&
+      !(budgetCurrency && spendCurrencies[0] && budgetCurrency !== spendCurrencies[0]);
+    const ratio = daily !== null && days > 0 && currencyOk ? spend / days / daily : null;
     const status =
       ratio === null
         ? 'unknown'
@@ -1515,7 +1605,7 @@ async function auditApp(
     ) {
       pacingProblems.push(`${p.marketingCampaignId}: ratio ${ratio} vs ${p.ratio}`);
     }
-    if (status !== p.status && !(p.blocker === 'mixed_currency' && p.status === 'unknown')) {
+    if (status !== p.status) {
       pacingProblems.push(`${p.marketingCampaignId}: status ${status} vs ${p.status}`);
     }
   }
@@ -1584,7 +1674,8 @@ async function auditApp(
   // A clean synthetic campaign carries the proofs, so they do not depend on
   // what this dataset happens to contain: steady spend, steady installs, a
   // D7 cohort return of 0.6 per component (1.2 in total), on days the real
-  // revenue runs have covered since the cohorts matured.
+  // revenue runs have covered since the cohorts matured. Each proof states
+  // the precondition it needs and is UNPROVEN, not failed, without it.
   const revenueWindows = await queryRows<Row>(
     `SELECT w->>'from' AS "from", w->>'to' AS "to",
             (r.finished_at AT TIME ZONE a.timezone)::date::text AS finished
@@ -1603,41 +1694,69 @@ async function auditApp(
     );
   const installsHorizon = horizonOf('attribution_installs');
   const marketingHorizon = horizonOf('marketing_performance');
+  // The synthetic campaign is live up to the drop day - the window's end, or
+  // the install horizon if that is earlier - and its 14 newest mature days
+  // carry revenue. In a window old enough for the drop day itself to be
+  // mature, the drop day is one of them: a mature delivered day the rules
+  // read must carry the revenue the proof expects, or the proof would be
+  // reading its own gap.
   const dropDay = installsHorizon && installsHorizon < to ? installsHorizon : to;
-  const matureCandidates = ownAsOf
-    ? eachDate(from, to).filter((d) => addDays(d, 7) < ownAsOf && coveredAt(d, 7))
-    : [];
+  const matureCandidates =
+    ownAsOf && marketingHorizon
+      ? eachDate(from, dropDay).filter(
+          (d) => d <= marketingHorizon && addDays(d, 7) < ownAsOf && coveredAt(d, 7),
+        )
+      : [];
   const matureSynthetic = matureCandidates.slice(-14);
   const syntheticFrom = matureSynthetic[0] ?? null;
   const syntheticLast = matureSynthetic[13] ?? null;
+  const d7Supported = (['total', 'iap', 'ad'] as const).filter((t) =>
+    capabilities.has(`cohort_${t}_revenue_d7`),
+  );
   const syntheticOk =
     syntheticFrom !== null &&
     syntheticLast !== null &&
     installsHorizon !== null &&
     marketingHorizon !== null &&
-    dropDay > syntheticLast;
+    d7Supported.length > 0;
   line(
     'synthetic campaign',
     syntheticOk
-      ? `${matureSynthetic.length} covered mature days ${syntheticFrom}..${syntheticLast}, live to ${dropDay}`
-      : `not possible: ${matureCandidates.length} covered mature day(s) in the window (needs 14), installs horizon ${installsHorizon ?? 'none'}, marketing horizon ${marketingHorizon ?? 'none'}`,
+      ? `${matureSynthetic.length} covered mature days ${syntheticFrom}..${syntheticLast}, live to ${dropDay}${syntheticLast === dropDay ? ' (the drop day is mature in this window)' : ''}; D7 revenue reported for ${d7Supported.join(', ')}`
+      : `not possible: ${matureCandidates.length} covered mature day(s) up to ${dropDay} (needs 14), installs horizon ${installsHorizon ?? 'none'}, marketing horizon ${marketingHorizon ?? 'none'}, D7 revenue reported for ${d7Supported.join(', ') || 'nothing'}`,
   );
-  const cleanFeeds =
+  const feedsCurrent =
     ['fresh', 'delayed'].includes(ownMarketingStatus ?? '') &&
     ['fresh', 'delayed'].includes(ownAttributionStatus ?? '') &&
     ownErrors === 0 &&
-    !ownErrorFindings.some((f) => !String(f['check_key']).startsWith('reconciliation.'));
-  line(
-    'feeds clean for a performance reading',
-    cleanFeeds
-      ? 'yes'
-      : `no (marketing ${ownMarketingStatus}, attribution ${ownAttributionStatus}, ${ownErrors} sync error(s), ${ownErrorFindings.length} error finding(s))`,
+    ownAsOf !== null;
+  const nonReconciliationFindings = ownErrorFindings.filter(
+    (f) => !String(f['check_key']).startsWith('reconciliation.'),
   );
+  const cleanFeeds = feedsCurrent && nonReconciliationFindings.length === 0;
+  const feedsDetail = `marketing ${ownMarketingStatus ?? 'none'}, attribution ${ownAttributionStatus ?? 'none'}, ${ownErrors} unresolved sync error(s), ${nonReconciliationFindings.length} current error finding(s)`;
+  line('feeds current', feedsCurrent ? 'yes' : `no (${feedsDetail})`);
+  line('feeds clean for a performance reading', cleanFeeds ? 'yes' : `no (${feedsDetail})`);
+  const dropSignals = syntheticOk
+    ? await ownDaySignals(dropDay)
+    : { syncError: false, uncovered: false, finding: false };
+  const dropDayClean = !dropSignals.syncError && !dropSignals.uncovered && !dropSignals.finding;
+  const notes = context.capabilityNotes ?? {};
   const syntheticPrecondition = !syntheticOk
-    ? 'the window has no 14 covered mature days for a synthetic campaign: widen it or run an attribution revenue sync over it'
-    : !cleanFeeds
-      ? `feeds are not clean (marketing ${ownMarketingStatus}, attribution ${ownAttributionStatus}, ${ownErrors} unresolved sync error(s), ${ownErrorFindings.length} error finding(s)): the reading stops at that gate first, as it must`
-      : null;
+    ? d7Supported.length === 0
+      ? `the report supplies no D7 cohort revenue, so no synthetic return can be read. ${[...new Set(['total', 'iap', 'ad'].map((t) => notes[`cohort_${t}_revenue_d7`]).filter(Boolean))].join(' ') || 'Add revenues_7d / ad_mediation_revenue_7d to the provider report.'}`
+      : 'the window has no 14 covered mature days with spend coverage for a synthetic campaign: widen it or run marketing and attribution revenue syncs over it'
+    : null;
+  const needs = (what: 'current' | 'clean'): string | null => {
+    if (syntheticPrecondition) return syntheticPrecondition;
+    if (what === 'current' && !feedsCurrent) {
+      return `feeds are not current (${feedsDetail}): the reading stops at the freshness gate first, as it must`;
+    }
+    if (what === 'clean' && !cleanFeeds) {
+      return `feeds are not clean (${feedsDetail}): the reading stops at that gate first, as it must`;
+    }
+    return null;
+  };
 
   type Pattern = {
     /** Revenue per component per mature day, by index into matureSynthetic. */
@@ -1732,13 +1851,17 @@ async function auditApp(
   type ProofCheck = { ok: boolean; detail: string } | { unproven: string };
   const proof = async (
     name: string,
-    mutate: (client: Queryable) => Promise<void | 'skip'>,
+    precondition: string | null,
+    mutate: (client: Queryable) => Promise<void>,
     check: (decisions: DecisionSet, client: Queryable) => Promise<ProofCheck> | ProofCheck,
     proofWindow: { from: IsoDate; to: IsoDate; timezone: string } = window,
   ): Promise<void> => {
+    if (precondition !== null) {
+      record(ctx, name, 'UNPROVEN', precondition);
+      return;
+    }
     const outcome = await withRollback(appId, async (client) => {
-      const skipped = await mutate(client);
-      if (skipped === 'skip') return { unproven: 'precondition not met' } as ProofCheck;
+      await mutate(client);
       const proofContext = await buildContext(organizationId, appId, client);
       const proofPolicy = await decisionsRepo.getDecisionPolicy(organizationId, appId, client);
       const decisions = await loadDecisions({
@@ -1767,8 +1890,10 @@ async function auditApp(
     if ('unproven' in result) record(ctx, name, 'UNPROVEN', result.unproven);
     else assert(ctx, name, result.ok, result.detail);
   };
-  const noDecisive = (d: DecisionSet): boolean =>
-    [d.app, ...d.campaigns].every((r) => r.signal !== 'scale' && r.signal !== 'reduce');
+  const decisiveIn = (d: DecisionSet): string[] =>
+    [d.app, ...d.campaigns]
+      .filter((r) => r.signal === 'scale' || r.signal === 'reduce')
+      .map((r) => `${scopeName(r)}:${r.signal}`);
   const upsertPolicy = async (client: Queryable, targetRoasD7: number): Promise<void> => {
     await decisionsRepo.upsertDecisionPolicy(
       {
@@ -1783,33 +1908,29 @@ async function auditApp(
       client,
     );
   };
-  /** A proof on the synthetic campaign, UNPROVEN with the reason when it cannot be set up. */
+  /** A proof on the synthetic campaign under a stored target. */
   const syntheticProof = (
     name: string,
+    precondition: string | null,
     target: number,
     pattern: Pattern,
     extra: (client: Queryable) => Promise<void>,
     check: (reading: Recommendation | undefined, d: DecisionSet) => ProofCheck,
-    requireCleanFeeds = true,
   ): Promise<void> =>
     proof(
       name,
+      precondition,
       async (client) => {
-        if (!syntheticOk || (requireCleanFeeds && !cleanFeeds)) return 'skip';
         await upsertPolicy(client, target);
         await insertSynthetic(client, pattern);
         await extra(client);
       },
-      (d) => {
-        if (!syntheticOk || (requireCleanFeeds && !cleanFeeds)) {
-          return { unproven: syntheticPrecondition ?? 'precondition not met' };
-        }
-        return check(syntheticReading(d), d);
-      },
+      (d) => check(syntheticReading(d), d),
     );
 
   await proof(
     'no target: no scale, no reduce',
+    null,
     async (client) => {
       await decisionsRepo.deleteDecisionPolicy(organizationId, appId, client);
       if (syntheticOk) await insertSynthetic(client, flat);
@@ -1818,18 +1939,22 @@ async function auditApp(
       const readings = [d.app, ...d.campaigns];
       const holders = readings.filter((r) => r.blockers.includes('no_target'));
       const synthetic = syntheticReading(d);
+      const decisive = decisiveIn(d);
+      // With clean feeds the clean campaign reaches the target gate and must
+      // hold on no_target; otherwise an earlier gate stops it, and the only
+      // claim left is that nothing anywhere scales or reduces.
+      const syntheticOkHere =
+        !syntheticOk || !cleanFeeds || (synthetic !== undefined && synthetic.signal === 'hold');
       return {
-        ok:
-          noDecisive(d) &&
-          !d.policy.configured &&
-          (!syntheticOk || (synthetic !== undefined && synthetic.signal === 'hold')),
-        detail: `policy removed: ${readings.length} reading(s), none scale/reduce, ${holders.length} hold on no_target${synthetic ? `; a clean campaign returning 1.2 reads ${describe(synthetic)}` : ''}`,
+        ok: decisive.length === 0 && !d.policy.configured && syntheticOkHere,
+        detail: `policy removed: ${readings.length} reading(s), ${decisive.length === 0 ? 'none scale/reduce' : decisive.join(' ')}, ${holders.length} hold on no_target${synthetic ? `; a clean campaign returning 1.2 reads ${describe(synthetic)}` : ''}`,
       };
     },
   );
 
   await syntheticProof(
     'target below the return: scale',
+    needs('clean'),
     0.5,
     flat,
     async () => undefined,
@@ -1840,6 +1965,7 @@ async function auditApp(
   );
   await syntheticProof(
     'target above the return: reduce',
+    needs('clean'),
     2,
     flat,
     async () => undefined,
@@ -1859,6 +1985,7 @@ async function auditApp(
   );
   await syntheticProof(
     'target met: hold',
+    needs('clean'),
     1.2,
     flat,
     async () => undefined,
@@ -1878,6 +2005,7 @@ async function auditApp(
   );
   await syntheticProof(
     'newest cohorts contradict the window: hold',
+    needs('clean'),
     0.5,
     { revenue: (index) => (index < 7 ? 20 : 10) },
     async () => undefined,
@@ -1888,6 +2016,7 @@ async function auditApp(
   );
   await syntheticProof(
     'stale feed: no signal',
+    syntheticPrecondition,
     0.5,
     flat,
     async (client) => {
@@ -1896,18 +2025,26 @@ async function auditApp(
         [appId],
       );
     },
-    (r, d) => ({
-      ok:
-        noDecisive(d) &&
-        r?.signal === 'insufficient_data' &&
-        r.category === 'data_quality' &&
-        r.blockers.includes('provider_stale'),
-      detail: `attribution_installs marked stale under a 0.5 target: ${describe(r)}, no scale/reduce anywhere`,
-    }),
-    false,
+    (r, d) => {
+      // A failing feed (an unresolved error, a stream in error) is caught by
+      // the same gate one step earlier and reads investigate; otherwise stale
+      // reads insufficient_data. Either way provider_stale, and nothing
+      // anywhere scales or reduces.
+      const failing = ownErrors > 0 || ownMarketingStatus === 'error';
+      const decisive = decisiveIn(d);
+      return {
+        ok:
+          decisive.length === 0 &&
+          r?.signal === (failing ? 'investigate' : 'insufficient_data') &&
+          r.category === 'data_quality' &&
+          r.blockers.includes('provider_stale'),
+        detail: `attribution_installs marked stale under a 0.5 target: ${describe(r)}, ${decisive.length === 0 ? 'no scale/reduce anywhere' : decisive.join(' ')}`,
+      };
+    },
   );
   await syntheticProof(
     'second currency: investigate, never divide',
+    needs('current'),
     0.5,
     flat,
     async (client) => {
@@ -1922,13 +2059,14 @@ async function auditApp(
         r?.signal === 'investigate' &&
         r.category === 'data_quality' &&
         r.blockers.includes('mixed_currency') &&
-        evidenceOf(r, 'spend')?.availability === 'blocked',
+        evidenceOf(r, 'spend')?.availability === 'blocked' &&
+        roasOf(r)?.availability === 'blocked',
       detail: `one XTS day injected: ${describe(r)} spend=${r ? evidenceOf(r, 'spend')?.availability : '-'}`,
     }),
-    false,
   );
   await syntheticProof(
     'ambiguous mapping: investigate, never read',
+    syntheticPrecondition,
     0.5,
     flat,
     async (client) => {
@@ -1946,31 +2084,42 @@ async function auditApp(
         !r.quality.mapping.operational,
       detail: `mapping made ambiguous: ${describe(r)}`,
     }),
-    false,
   );
+  // The newest days before the horizon can never be mature at D7, whatever
+  // window the audit was asked about.
+  const immatureWindow = ownAsOf
+    ? { from: addDays(ownAsOf, -3), to: ownAsOf, timezone: app.timezone }
+    : null;
   await proof(
     'immature window: no signal',
+    immatureWindow
+      ? null
+      : 'no attribution horizon: the streams have not both reported a latest data date',
     async (client) => {
       await upsertPolicy(client, 0.000001);
     },
     (d) => {
       const readings = d.campaigns;
+      if (readings.length === 0) {
+        return {
+          unproven: `no campaign delivered in ${immatureWindow?.from}..${immatureWindow?.to}; nothing to withhold`,
+        };
+      }
       const withheld = readings.filter(
         (r) => r.blockers.includes('immature_cohort') || r.blockers.includes('provider_stale'),
       );
-      const roasBlocked = readings.every((r) => {
-        const roas = roasOf(r);
-        return !roas || roas.value === null;
-      });
+      const shown = readings.filter((r) => roasOf(r)?.value !== null && roasOf(r) !== undefined);
+      const decisive = decisiveIn(d);
       return {
-        ok: noDecisive(d) && roasBlocked,
-        detail: `window ${addDays(to, -3)}..${to} under a 0.000001 target: ${readings.length} campaign(s), ${withheld.length} withheld as immature/unread, no return figure shown, none scale/reduce`,
+        ok: decisive.length === 0 && shown.length === 0,
+        detail: `window ${immatureWindow?.from}..${immatureWindow?.to} under a 0.000001 target: ${readings.length} campaign(s), ${withheld.length} withheld as immature/unread, ${shown.length} return figure(s) shown, ${decisive.length === 0 ? 'none scale/reduce' : decisive.join(' ')}`,
       };
     },
-    { from: addDays(to, -3), to, timezone: app.timezone },
+    immatureWindow ?? window,
   );
   await syntheticProof(
     'day nobody re-read: not a day that earned nothing',
+    needs('clean'),
     0.5,
     flat,
     async (client) => {
@@ -1980,18 +2129,25 @@ async function auditApp(
         [appId],
       );
     },
-    (r, d) => ({
-      ok:
-        noDecisive(d) &&
-        r?.signal === 'insufficient_data' &&
-        r.blockers.includes('provider_stale') &&
-        roasOf(r)?.value === null &&
-        (r.quality.maturity?.matureDays ?? -1) === 0 &&
-        (r.quality.maturity?.uncoveredDays ?? 0) > 0,
-      detail: `revenue read-windows removed: ${describe(r)} mature=${r?.quality.maturity?.matureDays} unread=${r?.quality.maturity?.uncoveredDays}`,
-    }),
-    false,
+    (r, d) => {
+      const decisive = decisiveIn(d);
+      return {
+        ok:
+          decisive.length === 0 &&
+          r?.signal === 'insufficient_data' &&
+          r.blockers.includes('provider_stale') &&
+          roasOf(r)?.value === null &&
+          (r.quality.maturity?.matureDays ?? -1) === 0 &&
+          (r.quality.maturity?.uncoveredDays ?? 0) > 0,
+        detail: `revenue read-windows removed: ${describe(r)} mature=${r?.quality.maturity?.matureDays} unread=${r?.quality.maturity?.uncoveredDays}, ${decisive.length === 0 ? 'no scale/reduce anywhere' : decisive.join(' ')}`,
+      };
+    },
   );
+  const adOnlyPrecondition =
+    needs('clean') ??
+    (capabilities.has('cohort_ad_revenue_d7')
+      ? null
+      : `the report supplies no D7 ad revenue, so a component-only reading cannot be set up. ${notes['cohort_ad_revenue_d7'] ?? ''}`.trim());
   const leaveAdOnly = async (client: Queryable): Promise<void> => {
     await client.query(
       `UPDATE provider_capabilities pc SET supported = false
@@ -2003,6 +2159,7 @@ async function auditApp(
   };
   await syntheticProof(
     'partial return: scale above, never reduce below',
+    adOnlyPrecondition,
     0.5,
     flat,
     leaveAdOnly,
@@ -2014,12 +2171,25 @@ async function auditApp(
       detail: `only ad revenue reported at D7, 0.6 against a target of 0.5: ${describe(r)} via ${roasOf(r)?.key ?? '-'}`,
     }),
   );
-  await syntheticProof('partial return below target never reduces', 2, flat, leaveAdOnly, (r) => ({
-    ok: r?.signal === 'hold' && r.blockers.includes('partial_return'),
-    detail: `only ad revenue reported at D7, 0.6 against a target of 2: ${describe(r)}`,
-  }));
+  await syntheticProof(
+    'partial return below target never reduces',
+    adOnlyPrecondition,
+    2,
+    flat,
+    leaveAdOnly,
+    (r) => ({
+      ok: r?.signal === 'hold' && r.blockers.includes('partial_return'),
+      detail: `only ad revenue reported at D7, 0.6 against a target of 2: ${describe(r)}`,
+    }),
+  );
+  const trackingPrecondition =
+    needs('clean') ??
+    (dropDayClean
+      ? null
+      : `${dropDay} is not a clean day (${[dropSignals.syncError ? 'an unresolved sync error covers it' : null, dropSignals.uncovered ? 'no completed install sync read it' : null, dropSignals.finding ? 'a data-quality finding was recorded for it' : null].filter(Boolean).join(', ')}), so an install collapse on it is a data gap or a tracking fault by the rules, not an undetermined movement`);
   await syntheticProof(
     'tracking-shaped movement is never performance',
+    trackingPrecondition,
     0.5,
     { revenue: () => 12, dropInstalls: true },
     async () => undefined,
@@ -2037,6 +2207,7 @@ async function auditApp(
   );
   await syntheticProof(
     'sync error over the same movement is a data gap',
+    needs('clean'),
     0.5,
     { revenue: () => 12, dropInstalls: true },
     async (client) => {
@@ -2054,13 +2225,14 @@ async function auditApp(
     },
     (r, d) => {
       const anomaly = syntheticAnomaly(d);
+      const decisive = decisiveIn(d);
       return {
         ok:
           anomaly?.classification === 'data_gap' &&
           r?.signal === 'investigate' &&
           r.category === 'data_quality' &&
-          noDecisive(d),
-        detail: `same movement under an unresolved sync error on ${dropDay}: anomaly=${anomaly?.classification ?? 'not detected'} reading=${describe(r)}, no scale/reduce anywhere`,
+          decisive.length === 0,
+        detail: `same movement under an unresolved sync error on ${dropDay}: anomaly=${anomaly?.classification ?? 'not detected'} reading=${describe(r)}, ${decisive.length === 0 ? 'no scale/reduce anywhere' : decisive.join(' ')}`,
       };
     },
   );

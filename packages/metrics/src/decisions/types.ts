@@ -152,7 +152,12 @@ export type CohortDayFact = {
   /** The revenue sync read this day after the cohort reached the age. */
   covered: boolean;
   earlyReadRows: number;
-  currencies: string[];
+  /**
+   * Currencies of the mature rows, per component. A reading on one component
+   * is judged on that component's currencies alone, as Phase 2 judges each
+   * cohort metric on its own slice.
+   */
+  currencies: Record<CohortRevenueType, string[]>;
 };
 
 export type CampaignDayFact = {
@@ -163,6 +168,12 @@ export type CampaignDayFact = {
   spendCurrencies: string[];
   /** Paid installs attributed to this campaign's mapped attribution campaigns. */
   installs: number;
+  /**
+   * The installs that this day's spend bought: `installs` when the campaign
+   * spent on the day, else 0. At app scope, the sum over campaigns that spent
+   * on the day - the population a per-install figure divides by.
+   */
+  alignedInstalls: number;
   cohort: Record<CohortAge, CohortDayFact>;
 };
 

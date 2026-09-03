@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { AppError, addDays, resolveReportingWindow, type IsoDate } from '@mart/shared';
+import { AppError, addDays, daysBetween, resolveReportingWindow, type IsoDate } from '@mart/shared';
 import { auditRepo, decisionsRepo } from '@mart/db';
 import {
   DECISION_THRESHOLDS,
@@ -57,6 +57,8 @@ const policyBody = z
  * every campaign, every time.
  */
 export const DECISION_WINDOW_DAYS = 28;
+/** Every campaign is read as a dense day array; a multi-year window is a report, not a decision. */
+export const MAXIMUM_DECISION_WINDOW_DAYS = 366;
 
 function resolveDecisionWindow(
   query: { from?: string; to?: string },
@@ -66,6 +68,12 @@ function resolveDecisionWindow(
   const to = resolved.endDate;
   const from = query.from ?? addDays(to, -(DECISION_WINDOW_DAYS - 1));
   if (from > to) throw new AppError('validation_failed', '`from` must not be after `to`');
+  if (daysBetween(from, to) >= MAXIMUM_DECISION_WINDOW_DAYS) {
+    throw new AppError(
+      'validation_failed',
+      `The decision window may not exceed ${MAXIMUM_DECISION_WINDOW_DAYS} days`,
+    );
+  }
   return { from, to, timezone };
 }
 

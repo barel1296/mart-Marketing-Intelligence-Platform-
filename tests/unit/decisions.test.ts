@@ -80,7 +80,11 @@ function day(date: string, spec: DaySpec = {}): CampaignDayFact {
     oldEnough: spec.oldEnough ?? true,
     covered: spec.covered ?? true,
     earlyReadRows: spec.earlyReadRows ?? 0,
-    currencies: iap + ad > 0 ? [spec.revenueCurrency ?? spec.currency ?? 'USD'] : [],
+    currencies: {
+      iap: iap > 0 ? [spec.revenueCurrency ?? spec.currency ?? 'USD'] : [],
+      ad: ad > 0 ? [spec.revenueCurrency ?? spec.currency ?? 'USD'] : [],
+      total: iap + ad > 0 ? [spec.revenueCurrency ?? spec.currency ?? 'USD'] : [],
+    },
   });
   return {
     date,
@@ -89,6 +93,7 @@ function day(date: string, spec: DaySpec = {}): CampaignDayFact {
     clicks: spend > 0 ? 20 : 0,
     spendCurrencies: spend > 0 ? [spec.currency ?? 'USD'] : [],
     installs: spec.installs ?? 0,
+    alignedInstalls: spend > 0 ? (spec.installs ?? 0) : 0,
     cohort: { 1: cohort(), 7: cohort() },
   };
 }
@@ -893,5 +898,99 @@ describe('evaluateScope: the app scope', () => {
     const ambiguous = app({ ambiguousSpendPct: 25 });
     expect(ambiguous.signal).toBe('investigate');
     expect(ambiguous.blockers).toEqual(['ambiguous_mapping']);
+  });
+});
+
+describe('adversarial review reproductions', () => {
+  it('F2: a return over two spend currencies is not exposed as available evidence', () => {
+    // Revenue stays in USD throughout; only the spend side splits.
+    const r = evaluate({
+      days: [
+        ...days(5, { spend: 20, installs: 5, iap: 8, ad: 4 }),
+        ...days(
+          5,
+          { spend: 20, installs: 5, iap: 8, ad: 4, currency: 'EUR', revenueCurrency: 'USD' },
+          dateAt(5),
+        ),
+      ],
+    });
+    expect(r.signal).toBe('investigate');
+    expect(roasEvidence(r)?.availability).toBe('blocked');
+    expect(roasEvidence(r)?.blocker).toBe('mixed_currency');
+  });
+
+  it('F10: a bound stream with no freshness row is unknown, not fresh', () => {
+    const r = evaluate({ freshness: { ...input().freshness, marketing: null } });
+    expect(r.signal).toBe('insufficient_data');
+    expect(r.blockers).toEqual(['provider_stale']);
+  });
+
+  it('F11: revenue that moved with spend is a delivery change, not monetization', () => {
+    const quiet: DaySignals = { syncError: false, uncovered: false, finding: false };
+    const base = anomaly({});
+    const { classification: _c, explanation: _e, dataSignals: _d, ...rest } = base;
+    const candidates = [
+      { ...rest, metric: 'spend' as const, direction: 'up' as const },
+      { ...rest, metric: 'revenue' as const, direction: 'up' as const },
+    ];
+    const result = classifyAnomalies({
+      candidates,
+      daySignals: () => quiet,
+      attributionFreshness: 'fresh',
+    });
+    expect(result.map((a) => a.classification)).toEqual(['delivery', 'delivery']);
+  });
+
+  it('F13: a trend needs two full halves', () => {
+    const trendDays = (values: number[]) =>
+      values.map((numerator, i) => ({
+        date: dateAt(i),
+        numerator,
+        denominator: 20,
+        installs: 5,
+        eligible: true,
+      }));
+    const trend = computeTrend({
+      measure: 'roas',
+      higherIsBetter: true,
+      // Ten eligible days: a full newest seven and only three before them,
+      // three that would clear every floor on their own.
+      days: trendDays([...Array(3).fill(20), ...Array(7).fill(10)]).map((d) => ({
+        ...d,
+        installs: 10,
+      })),
+      floors: {
+        days: T.minimumMatureDays,
+        denominator: T.minimumSpend,
+        installs: T.minimumInstalls,
+      },
+    });
+    expect(trend.direction).toBe('unknown');
+    expect(trend.prior?.value ?? null).toBeNull();
+  });
+
+  it('F15: the evidence blocker for too few mature days matches the verdict', () => {
+    const thin = evaluate({ days: days(2, { spend: 20, installs: 5, iap: 60 }) });
+    expect(thin.blockers).toEqual(['immature_cohort']);
+    expect(roasEvidence(thin)?.blocker).toBe('immature_cohort');
+  });
+
+  it('F21: only the read component decides the revenue currency', () => {
+    const adOnly = new Set([cohortCapabilityKey('ad', 7)]);
+    // iap in EUR beside ad in USD: the ad-only reading is single-currency.
+    const mixedComponents = days(10, { spend: 20, installs: 5, ad: 12 }).map((d) => ({
+      ...d,
+      cohort: {
+        1: d.cohort[1],
+        7: {
+          ...d.cohort[7],
+          revenue: { iap: 100, ad: 12, total: 112 },
+          currencies: { iap: ['EUR'], ad: ['USD'], total: ['EUR', 'USD'] },
+        },
+      },
+    }));
+    const r = evaluate({ capabilities: adOnly, days: mixedComponents });
+    expect(r.signal).toBe('scale');
+    expect(r.quality.currencies.revenue).toEqual(['USD']);
   });
 });

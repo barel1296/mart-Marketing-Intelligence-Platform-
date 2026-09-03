@@ -26,9 +26,11 @@ import {
  * asserted on what the API returns.
  *
  * Dates are relative to today (H). Campaign 900 delivers 20 spend a day
- * for twenty days up to H-1 with thirty installs a day and a D7 cohort return
- * of 12 per day (0.6). With the horizon at H-1, days up to H-9 are mature
- * at D7: twelve mature days, 240 spend, 360 installs - above every floor.
+ * for twenty days up to H-1 - except H-12, when it was paused - with thirty
+ * installs a day and a D7 cohort return of 12 per day (0.6). With the
+ * horizon at H-1, days up to H-9 are mature at D7: eleven mature delivered
+ * days, 220 spend, 330 installs - above every floor. The paused day's 30
+ * installs and 12 of revenue are in neither side of any return.
  */
 
 function day(offset: number): string {
@@ -40,6 +42,8 @@ function day(offset: number): string {
 const H = day(0);
 const LAST = day(1);
 const SYNC_FROM = day(30);
+/** A mature day with installs and cohort revenue but no spend. */
+const PAUSED_OFFSET = 12;
 
 type Ctx = { user: TestUser; appId: string };
 
@@ -174,15 +178,21 @@ function seed(): void {
   controls.attributionRows = [];
   for (let offset = 20; offset >= 1; offset -= 1) {
     const date = day(offset);
-    controls.marketingRows.push({
-      reportDate: date,
-      campaignId: '900',
-      campaignName: 'Summer US',
-      spend: 20,
-      impressions: 4_000,
-      clicks: 80,
-      country: 'US',
-    });
+    // One mature day the campaign was paused: installs and cohort revenue
+    // still arrive for it (a click the day before), but no spend bought
+    // them, so they belong in neither side of a return - at campaign scope
+    // and at app scope alike.
+    if (offset !== PAUSED_OFFSET) {
+      controls.marketingRows.push({
+        reportDate: date,
+        campaignId: '900',
+        campaignName: 'Summer US',
+        spend: 20,
+        impressions: 4_000,
+        clicks: 80,
+        country: 'US',
+      });
+    }
     controls.attributionRows.push({
       installDate: date,
       campaignId: '900',
@@ -240,26 +250,36 @@ describe('decision center', () => {
     expect(r.category).toBe('performance');
     expect(r.blockers).toEqual([]);
     const roas = r.evidence.find((e) => e.key === 'cohort_roas_d7');
-    // Twelve mature days (FIRST..H-9): 240 spend, 144 total D7 revenue.
+    // Eleven mature delivered days (H-20..H-9 without H-12): 220 spend, 132
+    // total D7 revenue. The paused day's 12 is excluded, not added.
     expect(roas).toMatchObject({
       value: 0.6,
-      numerator: 144,
-      denominator: 240,
+      numerator: 132,
+      denominator: 220,
       availability: 'available',
       population: 'cohort_aligned_paid_attribution',
       grain: 'cohort_date',
     });
-    expect(r.window.evaluated.days).toBe(12);
-    expect(r.quality.maturity?.matureDays).toBe(12);
-    expect(r.evidence.find((e) => e.key === 'spend')?.value).toBe(400);
+    expect(r.window.evaluated.days).toBe(11);
+    expect(r.quality.maturity?.matureDays).toBe(11);
+    expect(r.evidence.find((e) => e.key === 'spend')?.value).toBe(380);
+    // Installs are reported for every day the horizon has passed, but the
+    // CPI divides only by the installs that spend bought.
+    expect(r.evidence.find((e) => e.key === 'mapped_paid_installs')?.value).toBe(600);
+    expect(r.evidence.find((e) => e.key === 'mapped_cpi')?.denominator).toBe(540);
     expect(r.confidence.components.map((c) => c.input)).toEqual(
       expect.arrayContaining(['freshness', 'sample', 'maturity', 'mapping']),
     );
 
     // The app scope reads the same mapped population, with 901's 60 unmapped
-    // leaving coverage at 400/460 = 87%: above the floor, so it reads too.
+    // leaving coverage at 380/440 = 86%: above the floor, so it reads too,
+    // and the paused day's cohort stays out of the app figure as well.
     expect(after.app.signal).toBe('scale');
-    expect(after.app.evidence.find((e) => e.key === 'cohort_roas_d7')?.value).toBe(0.6);
+    expect(after.app.evidence.find((e) => e.key === 'cohort_roas_d7')).toMatchObject({
+      value: 0.6,
+      numerator: 132,
+      denominator: 220,
+    });
 
     // Raising the target flips the same facts to reduce; clearing it to hold.
     await putPolicy(ctx, { targetRoasD7: 1 });
@@ -292,9 +312,15 @@ describe('decision center', () => {
     expect(unmapped.blockers).toEqual(['insufficient_coverage']);
     expect(unmapped.quality.mapping.operational).toBe(false);
 
-    // The fake network declares a 100/day budget; 20/day is under pace.
+    // The fake network declares a 100/day budget; 20/day is under pace, and
+    // the paused day is not a delivered day.
     const pace = d.pacing.find((p) => p.marketingCampaignId === '900');
-    expect(pace).toMatchObject({ status: 'under', ratio: 0.2, dailyBudget: 100 });
+    expect(pace).toMatchObject({
+      status: 'under',
+      ratio: 0.2,
+      dailyBudget: 100,
+      deliveredDays: 19,
+    });
   });
 
   it('refuses to read stale data, and says which stream', async () => {
