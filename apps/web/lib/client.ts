@@ -17,7 +17,7 @@ export type ApiFailure = { code: string; message: string; details?: unknown };
 export async function apiMutate<T>(
   path: string,
   body?: unknown,
-  method: 'POST' | 'PATCH' | 'DELETE' = 'POST',
+  method: 'POST' | 'PUT' | 'PATCH' | 'DELETE' = 'POST',
 ): Promise<{ ok: true; data: T } | { ok: false; error: ApiFailure }> {
   const response = await fetch(path, {
     method,

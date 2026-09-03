@@ -16,6 +16,8 @@ export type AuditAction =
   | 'sync.triggered'
   | 'mapping.manually_verified'
   | 'mapping.rejected'
+  | 'decision_policy.updated'
+  | 'decision_policy.cleared'
   | 'auth.signed_in'
   | 'auth.signed_out'
   | 'security.configuration_changed';

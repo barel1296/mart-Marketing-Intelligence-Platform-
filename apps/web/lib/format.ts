@@ -134,3 +134,36 @@ export function accountSecondary(account: ProviderAccountLike): string {
   const label = accountLabel(account);
   return label.includes(account.external_account_id) ? '' : account.external_account_id;
 }
+
+/**
+ * Chip class for a Phase 3 decision signal, pacing status or anomaly class.
+ *
+ * `investigate` is a warning rather than a failure: the data may be fine and
+ * the campaign may be fine, and MART is saying it cannot tell which yet.
+ */
+export function signalTone(value: string | null | undefined): string {
+  switch (value) {
+    case 'scale':
+    case 'on':
+    case 'delivery':
+    case 'improving':
+      return 'chip-good';
+    case 'reduce':
+    case 'deteriorating':
+      return 'chip-serious';
+    case 'investigate':
+    case 'under':
+    case 'over':
+    case 'attribution':
+    case 'data_gap':
+    case 'undetermined':
+      return 'chip-warning';
+    case 'hold':
+    case 'insufficient_data':
+    case 'unknown':
+    case 'monetization':
+    case 'stable':
+    default:
+      return 'chip-neutral';
+  }
+}

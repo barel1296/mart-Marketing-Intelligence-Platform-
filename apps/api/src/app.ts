@@ -10,6 +10,7 @@ import { registerOrganizationRoutes } from './routes/organizations.js';
 import { registerIntegrationRoutes } from './routes/integrations.js';
 import { registerSyncRoutes } from './routes/sync.js';
 import { registerAnalyticsRoutes } from './routes/analytics.js';
+import { registerDecisionRoutes } from './routes/decisions.js';
 import { registerHealthRoutes } from './routes/health.js';
 import { verifyCsrf } from './context.js';
 
@@ -163,6 +164,7 @@ export async function buildServer(): Promise<FastifyInstance> {
       await instance.register(registerIntegrationRoutes, { prefix: '/v1' });
       await instance.register(registerSyncRoutes, { prefix: '/v1' });
       await instance.register(registerAnalyticsRoutes, { prefix: '/v1' });
+      await instance.register(registerDecisionRoutes, { prefix: '/v1' });
     },
     { prefix: '/api' },
   );

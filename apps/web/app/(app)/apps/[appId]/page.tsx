@@ -259,6 +259,9 @@ export default async function CommandCenterPage({
           </p>
         </div>
         <div className="button-row">
+          <Link className="nav-item" href={`/apps/${appId}/decisions`}>
+            Decision Center
+          </Link>
           <Link className="nav-item" href={`/apps/${appId}/integrations`}>
             Integrations
           </Link>
