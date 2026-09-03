@@ -63,6 +63,41 @@ export type AttributionProviderKey = (typeof ATTRIBUTION_PROVIDER_KEYS)[number];
 export const METRIC_GRAINS = ['report_date', 'install_date', 'event_date', 'cohort_date'] as const;
 export type MetricGrain = (typeof METRIC_GRAINS)[number];
 
+/**
+ * The cohort ages MART stores and serves, in days since install.
+ *
+ * Two, deliberately. D1 and D7 are the two cohort facts a UA decision is made
+ * on, and every age added here is one more day a cohort must be re-read after
+ * install before its value is final: an age can only mature in storage if the
+ * restatement lookback is at least that long. Anything beyond D7 needs a
+ * longer lookback than the default and is a decision, not a constant change.
+ *
+ * D1 and D7 are distinct facts about one cohort. They are never derived from
+ * each other and never summed.
+ */
+export const COHORT_AGES = [1, 7] as const;
+export type CohortAge = (typeof COHORT_AGES)[number];
+
+/**
+ * The revenue components a cohort figure can describe. `total` is IAP plus ad
+ * revenue for the same cohort, and exists only when both components - or a
+ * provider-combined total - were actually reported; MART never presents one
+ * component as the total.
+ */
+export const COHORT_REVENUE_TYPES = ['iap', 'ad', 'total'] as const;
+export type CohortRevenueType = (typeof COHORT_REVENUE_TYPES)[number];
+
+/**
+ * The capability key that says "this provider account can supply revenue of
+ * this type at this cohort age". Probed against the account's actual report
+ * definition, not declared: whether a saved report carries `revenues_7d` is a
+ * property of the operator's configuration, and a metric that needs it must
+ * be able to say exactly which provider field is missing.
+ */
+export function cohortCapabilityKey(revenueType: CohortRevenueType, ageDays: CohortAge): string {
+  return `cohort_${revenueType}_revenue_d${ageDays}`;
+}
+
 /** Data domains a connector can synchronize. */
 export const SYNC_DATA_TYPES = [
   'marketing_structure',
@@ -408,6 +443,13 @@ export const METRIC_BLOCKERS = [
   'unsupported_metric',
   /** The denominator is zero, absent, or below the metric's floor. */
   'missing_denominator',
+  /**
+   * No cohort in the window has lived long enough to have the value this
+   * metric describes. A D7 figure read on day 3 is not a small D7 figure; it
+   * is not a D7 figure at all, so nothing is shown rather than a number that
+   * will only ever go up.
+   */
+  'immature_cohort',
 ] as const;
 export type MetricBlocker = (typeof METRIC_BLOCKERS)[number];
 
@@ -464,6 +506,20 @@ export const METRIC_POPULATIONS = [
   'organic_attribution',
   /** Marketing campaigns with delivery inside the selected window. */
   'current_period_marketing',
+  /**
+   * Paid install cohorts whose attribution campaign is operationally mapped to
+   * a marketing campaign that SPENT ON THE COHORT'S INSTALL DAY. The only
+   * cohort population a cohort ROAS numerator may be drawn from: the spend on
+   * that day is what bought these installs.
+   */
+  'cohort_aligned_paid_attribution',
+  /**
+   * The spend side of the same pairs: marketing rows on report_date = the
+   * cohort's install day, for campaigns operationally mapped to attribution.
+   * Numerator and denominator of a cohort ROAS describe the same
+   * (campaign, install day) set, or the ratio is not a return on that spend.
+   */
+  'cohort_aligned_marketing',
   /** Every marketing entity MART knows, whenever it last delivered. */
   'all_structure',
   /** The metric is not a share of anything - a raw measure. */

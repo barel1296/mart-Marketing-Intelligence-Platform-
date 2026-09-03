@@ -130,8 +130,18 @@ export type CanonicalAttributionRevenueMetric = {
    * one cohort would otherwise share an identity and overwrite each other.
    */
   cohortAgeDays?: number | null;
+  /**
+   * For event_date rows: the day the revenue was recorded. For cohort_date
+   * rows: the install day of the cohort the value describes.
+   */
   activityDate: IsoDate;
-  grain: 'event_date' | 'install_date';
+  /**
+   * event_date  - revenue recognized on activityDate, whoever installed when.
+   * install_date - legacy cohort anchor with no age; not produced by MART.
+   * cohort_date - cumulative revenue of the cohort that installed on
+   *               activityDate, measured cohortAgeDays after install.
+   */
+  grain: 'event_date' | 'install_date' | 'cohort_date';
   revenueType: 'iap' | 'ad' | 'total' | 'subscription';
   mediaSource: string | null;
   externalCampaignId: string | null;

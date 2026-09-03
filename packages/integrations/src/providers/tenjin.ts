@@ -2,17 +2,22 @@ import type {
   CanonicalAttributionBatch,
   CanonicalAttributionDailyMetric,
   CanonicalAttributionRevenueMetric,
+  CohortAge,
+  CohortRevenueType,
   IsoDate,
 } from '@mart/shared';
 import {
+  COHORT_AGES,
+  COHORT_REVENUE_TYPES,
   ProviderError,
   SENSITIVE_KEY_PATTERN,
+  cohortCapabilityKey,
   isProviderError,
   normalizePlatform,
 } from '@mart/shared';
 import { getLogger } from '@mart/observability';
 import { ProviderHttpClient, userMessageFor } from '../http.js';
-import { declare, type CapabilityDeclaration } from '../capabilities.js';
+import { declare, type CapabilityDeclaration, type CapabilityKey } from '../capabilities.js';
 import {
   emptyAttributionBatch,
   type AttributionCampaignRef,
@@ -38,9 +43,14 @@ import type { TenjinCredentials } from '../credentials.js';
  *    attributed. Only `tracked_installs` is attribution, so only it is written
  *    to MART's attribution model.
  *  - Non-N-day revenue metrics (`revenues`, `pub_rev`) are revenue recorded on
- *    the report date, whereas `*_Nd` metrics are cohort LTV. MART imports the
- *    former at event_date grain and does not import cohort LTV in Phase 0A, so
- *    the two can never be conflated.
+ *    the report date, whereas `*_Nd` metrics are cumulative cohort revenue:
+ *    the row's date is the INSTALL day, and the value is what that cohort had
+ *    earned N days later. Verified on a real account: the plain
+ *    `ad_mediation_revenue` and `ad_mediation_revenue_0d` on the same row
+ *    differ, `_0d <= _1d <= _7d` on every row, and an immature cohort returns
+ *    its cumulative-so-far value rather than null. MART imports the former at
+ *    event_date grain and the latter at cohort_date grain with an explicit
+ *    age, so the two can never be conflated or summed together.
  *
  * The wire format (endpoint path and parameter names) is configurable because
  * it could not be verified against a live account in this environment; see
@@ -156,6 +166,104 @@ export const TENJIN_REVENUE_METRICS_ACCEPTED = [
  * concept now has more than one provider id, so the list above is the truth.
  */
 export const TENJIN_REVENUE_METRIC_AD = TENJIN_AD_REVENUE_METRICS[0];
+
+/**
+ * Cohort (N-day) revenue vocabulary.
+ *
+ * Tenjin's catalogue lists every cohort revenue metric with
+ * `cohort_type: "cumulative"`, and a real account confirms it: for one row
+ * `_0d <= _1d <= _7d`, and a cohort that installed today reports the same
+ * figure at every age because it has only lived one day. The value is
+ * therefore "everything this cohort earned in its first N days", never the
+ * revenue of day N alone, and never the revenue recorded on the report date.
+ *
+ * Ad revenue has the same two-variant split as the event-date metrics
+ * (`ad_mediation_revenue_Nd` from the mediation layer, `pubrev_Nd` from the
+ * networks - note Tenjin spells the cohort variant without the underscore),
+ * with the same two totals beside them.
+ *
+ * `pltv_Nd` and `proas_Nd` are PREDICTED figures. They are not in this
+ * vocabulary and must never be: MART imports what happened, not a forecast.
+ */
+export const TENJIN_COHORT_TYPE = 'cumulative';
+export const TENJIN_COHORT_IAP_METRIC = (age: number): string => `revenues_${age}d`;
+export const TENJIN_COHORT_AD_METRICS = (age: number): readonly string[] => [
+  `ad_mediation_revenue_${age}d`,
+  `pubrev_${age}d`,
+];
+export const TENJIN_COHORT_TOTAL_METRICS = (age: number): readonly string[] => [
+  `total_ad_mediation_revenue_${age}d`,
+  `total_rev_${age}d`,
+];
+/** Tenjin's own cohort ROAS: `revenues_Nd / spend * 100`, IAP only. */
+export const TENJIN_COHORT_ROAS_METRIC = (age: number): string => `roas_${age}d`;
+/** Metric ids MART refuses to read, because they are predictions. */
+export const TENJIN_PREDICTED_METRIC_PATTERN = /^(pltv|proas)_\d+d$/;
+
+/**
+ * Which cohort components a saved report can supply, per age.
+ *
+ * Decided from the report DEFINITION rather than from rows, because a cohort
+ * with no revenue yields no row and must not be mistaken for a report that
+ * cannot answer the question. `total` is available when the report carries
+ * both components (MART sums its own stored rows) or a provider-combined total
+ * with no component beside it.
+ */
+export type TenjinCohortCoverage = {
+  /** Present metric ids, per age and component. */
+  present: Record<CohortRevenueType, Partial<Record<CohortAge, string>>>;
+  /** What to add to the saved report for each component MART cannot serve. */
+  missing: Array<{ revenueType: CohortRevenueType; ageDays: CohortAge; metric: string }>;
+};
+
+export function tenjinCohortCoverage(metrics: readonly string[]): TenjinCohortCoverage {
+  const present: TenjinCohortCoverage['present'] = { iap: {}, ad: {}, total: {} };
+  const missing: TenjinCohortCoverage['missing'] = [];
+  for (const age of COHORT_AGES) {
+    const iap = metrics.includes(TENJIN_COHORT_IAP_METRIC(age))
+      ? TENJIN_COHORT_IAP_METRIC(age)
+      : null;
+    const ad = TENJIN_COHORT_AD_METRICS(age).find((m) => metrics.includes(m)) ?? null;
+    const total = TENJIN_COHORT_TOTAL_METRICS(age).find((m) => metrics.includes(m)) ?? null;
+    if (iap) present.iap[age] = iap;
+    else missing.push({ revenueType: 'iap', ageDays: age, metric: TENJIN_COHORT_IAP_METRIC(age) });
+    if (ad) present.ad[age] = ad;
+    else {
+      const [preferred] = TENJIN_COHORT_AD_METRICS(age);
+      missing.push({ revenueType: 'ad', ageDays: age, metric: preferred ?? `pubrev_${age}d` });
+    }
+    // A total MART can stand behind: both parts stored, or the provider's own
+    // combined figure when neither part is present to double count.
+    if (iap && ad) present.total[age] = `${iap}+${ad}`;
+    else if (!iap && !ad && total) present.total[age] = total;
+    else {
+      missing.push({
+        revenueType: 'total',
+        ageDays: age,
+        metric: iap ? (TENJIN_COHORT_AD_METRICS(age)[0] ?? '') : TENJIN_COHORT_IAP_METRIC(age),
+      });
+    }
+  }
+  return { present, missing };
+}
+
+/**
+ * The exact change an operator must make, phrased for the Tenjin UI.
+ *
+ * MART only reads saved reports. It will never add a metric to one, so the
+ * only honest response to a missing cohort metric is to say which one.
+ */
+export function tenjinCohortAction(
+  report: Pick<TenjinSavedReport, 'id' | 'name'>,
+  missingMetrics: readonly string[],
+): string {
+  const ids = [...new Set(missingMetrics.filter((m) => m.length > 0))];
+  return (
+    `Add ${ids.join(', ')} to the Tenjin saved report "${report.name ?? report.id}" (${report.id}) ` +
+    'in Tenjin > Reports > Data Exporter, then re-run the attribution revenue sync. ' +
+    'MART reads saved reports and never edits them.'
+  );
+}
 
 /** Report family MART reads. Saved reports of any other type are skipped. */
 export const TENJIN_REPORT_TYPE = 'user_acquisition';
@@ -722,8 +830,9 @@ export class TenjinAttributionProvider implements AttributionProvider {
         // cost from the marketing network so the two are never double counted.
         cost_data: false,
         delivery_metrics: false,
-        // Cohort (N-day) reporting exists in the catalogue but is intentionally
-        // not imported in Phase 0A: MART does not display cohort economics yet.
+        // The catalogue offers cumulative N-day cohort revenue. Whether THIS
+        // account's saved report carries it is probed below, per component
+        // and age, so a cohort metric can name the exact field it lacks.
         cohort_reporting: true,
         raw_data: false,
         events: false,
@@ -739,13 +848,75 @@ export class TenjinAttributionProvider implements AttributionProvider {
       'declared',
       {
         note: 'Tenjin user-acquisition report catalogue',
-        cohortReportingNote:
-          'N-day cohort metrics (retention_Nd, roas_Nd, revenues_Nd) exist but are not imported in Phase 0A.',
+        cohortReportingNote: `N-day cohort revenue (revenues_Nd, ad_mediation_revenue_Nd) is ${TENJIN_COHORT_TYPE} and imported at cohort_date grain for ages ${COHORT_AGES.join('/')} when the saved report carries it. Predicted metrics (pltv_Nd, proas_Nd) are never read.`,
       },
     );
 
     if (!externalAccountId) return declared;
-    return declared;
+    return [...declared, ...(await this.probeCohortCapabilities(externalAccountId))];
+  }
+
+  /**
+   * Which cohort components the bound app's saved report can supply.
+   *
+   * Read-only: the same GET /saved_reports discovery the sync uses, judged
+   * with the same rules, so the capability rows say exactly what the next
+   * revenue sync will import. A discovery failure leaves the keys absent -
+   * "not checked" - rather than recording false, which would read as a
+   * report that lacks the metric.
+   */
+  async probeCohortCapabilities(externalAccountId: string): Promise<CapabilityDeclaration[]> {
+    let reports: TenjinSavedReport[];
+    try {
+      reports = await this.listSavedReports();
+    } catch (error) {
+      getLogger().warn(
+        {
+          provider: 'tenjin',
+          tenjinAppId: externalAccountId,
+          status: isProviderError(error) ? error.errorClass : 'request failed',
+        },
+        'tenjin cohort capability probe skipped: saved reports could not be listed',
+      );
+      return [];
+    }
+    const { chosen } = selectSavedReport(reports, {
+      appId: externalAccountId,
+      requiredMetrics: [],
+      anyOfMetrics: TENJIN_REVENUE_METRICS_ACCEPTED,
+    });
+    const out: CapabilityDeclaration[] = [];
+    const coverage = chosen ? tenjinCohortCoverage(chosen.metrics) : null;
+    for (const revenueType of COHORT_REVENUE_TYPES) {
+      for (const age of COHORT_AGES) {
+        const metric = coverage?.present[revenueType][age] ?? null;
+        const missing = coverage?.missing.find(
+          (m) => m.revenueType === revenueType && m.ageDays === age,
+        );
+        out.push({
+          key: cohortCapabilityKey(revenueType, age) as CapabilityKey,
+          supported: Boolean(metric),
+          discoveryMethod: 'probed',
+          detail: chosen
+            ? {
+                savedReportId: chosen.id,
+                savedReportName: chosen.name,
+                cohortType: TENJIN_COHORT_TYPE,
+                ...(metric ? { metric } : {}),
+                ...(missing
+                  ? {
+                      missingMetric: missing.metric,
+                      action: tenjinCohortAction(chosen, [missing.metric]),
+                    }
+                  : {}),
+              }
+            : {
+                note: 'No saved report usable for attribution revenue; cohort revenue cannot be read until one exists.',
+              },
+        });
+      }
+    }
+    return out;
   }
 
   /**
@@ -964,6 +1135,12 @@ export class TenjinAttributionProvider implements AttributionProvider {
     let bothAdVariants = 0;
     let partialSplit = 0;
     let totalOnly = 0;
+    // Cohort columns are read from the report DEFINITION, not sniffed from
+    // rows: a cohort with no revenue has no value, and that must not look
+    // like a report without the column.
+    const cohort = tenjinCohortCoverage(report.metrics);
+    const cohortRows: Record<string, number> = {};
+    let cohortWithoutInstalls = 0;
 
     for (const row of rows.rows) {
       const activityDate = isoDay(str(row['date'] ?? row['day']));
@@ -995,6 +1172,51 @@ export class TenjinAttributionProvider implements AttributionProvider {
       };
 
       const present = (key: string): boolean => row[key] !== undefined && row[key] !== null;
+
+      // Cohort revenue: the same row, a different fact. `date` is the install
+      // day and `<metric>_Nd` is what that cohort had earned N days later,
+      // cumulatively. Stored at cohort_date grain with the age on the row, so
+      // it can never be summed into the event-date total above, and D1 and
+      // D7 never overwrite each other.
+      //
+      // A row with no tracked installs has no cohort, whatever the columns
+      // say; and a null value means Tenjin had nothing to report, which is
+      // not the same as zero. Both are skipped rather than stored as 0.
+      const installs = present(TENJIN_INSTALL_METRIC) ? num(row[TENJIN_INSTALL_METRIC]) : null;
+      const emitCohort = (
+        revenueType: CanonicalAttributionRevenueMetric['revenueType'],
+        age: CohortAge,
+        metric: string | undefined,
+      ): void => {
+        if (!metric || !present(metric)) return;
+        if (installs !== null && installs <= 0) {
+          cohortWithoutInstalls += 1;
+          return;
+        }
+        const value = num(row[metric]);
+        if (!value) return;
+        batch.revenue.push({
+          activityDate,
+          grain: 'cohort_date',
+          cohortAgeDays: age,
+          revenueType,
+          ...dims,
+          currency: params.currency,
+          revenue: value,
+        });
+        const key = `${revenueType}_d${age}`;
+        cohortRows[key] = (cohortRows[key] ?? 0) + 1;
+      };
+      for (const age of COHORT_AGES) {
+        const iapMetric = cohort.present.iap[age];
+        const adMetric = cohort.present.ad[age];
+        emitCohort('iap', age, iapMetric);
+        emitCohort('ad', age, adMetric);
+        // The provider's combined figure only when no component exists at
+        // this age - the same rule as event-date revenue, for the same
+        // reason: a total beside its own parts double-counts on read.
+        if (!iapMetric && !adMetric) emitCohort('total', age, cohort.present.total[age]);
+      }
       const hasIap = present(TENJIN_REVENUE_METRIC_IAP);
       // Preferred variant first; both mean `ad` inside MART.
       const adKeys = TENJIN_AD_REVENUE_METRICS.filter(present);
@@ -1034,6 +1256,28 @@ export class TenjinAttributionProvider implements AttributionProvider {
     if (totalOnly > 0) {
       warnings.push(
         `${totalOnly} row(s) carried no revenue component, so the combined figure was imported as revenue_type=total rather than guessed as IAP or ad.`,
+      );
+    }
+    if (cohortWithoutInstalls > 0) {
+      warnings.push(
+        `${cohortWithoutInstalls} cohort value(s) sat on rows with no tracked installs and were not stored: a cohort nobody joined has no revenue at any age.`,
+      );
+    }
+    // Which cohort facts this report can and cannot supply, stated once per
+    // run. The missing side names the exact metric and where to add it,
+    // because MART will not create or edit the report itself.
+    const emitted = Object.entries(cohortRows)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, n]) => `${key}=${n}`);
+    const unreadable = cohort.missing.filter((m) => m.revenueType !== 'total').map((m) => m.metric);
+    if (emitted.length > 0) {
+      warnings.push(
+        `Cohort revenue imported at cohort_date grain (${TENJIN_COHORT_TYPE}, rows per component/age: ${emitted.join(', ')}).`,
+      );
+    }
+    if (unreadable.length > 0) {
+      warnings.push(
+        `Cohort revenue not available for ${unreadable.join(', ')}: the saved report does not carry these metrics, so the matching cohort figures stay unavailable. ${tenjinCohortAction(report, unreadable)}`,
       );
     }
 

@@ -183,6 +183,56 @@ export function checkAttributionBatch(
     }
   }
 
+  // Cohort revenue is cumulative: a cohort's D7 figure contains its D1 figure.
+  // A batch in which a later age is smaller than an earlier one for the same
+  // cohort means the provider changed what the column means, and every cohort
+  // metric built on it would be quietly wrong. Checked per cohort identity so
+  // one restated row cannot hide behind another cohort's growth.
+  const byCohort = new Map<string, Array<{ age: number; revenue: number }>>();
+  for (const revenue of batch.revenue) {
+    if (revenue.grain !== 'cohort_date' || typeof revenue.cohortAgeDays !== 'number') continue;
+    const key = [
+      revenue.activityDate,
+      revenue.revenueType,
+      revenue.mediaSource ?? '',
+      revenue.externalCampaignId ?? '',
+      revenue.country ?? '',
+      revenue.platform ?? '',
+      revenue.currency,
+    ].join('|');
+    const list = byCohort.get(key) ?? [];
+    list.push({ age: revenue.cohortAgeDays, revenue: revenue.revenue });
+    byCohort.set(key, list);
+  }
+  for (const [key, ages] of byCohort) {
+    const sorted = [...ages].sort((a, b) => a.age - b.age);
+    for (let i = 1; i < sorted.length; i += 1) {
+      const earlier = sorted[i - 1];
+      const later = sorted[i];
+      if (!earlier || !later || later.revenue >= earlier.revenue) continue;
+      const [activityDate, revenueType, , externalCampaignId] = key.split('|');
+      findings.push({
+        organizationId: ctx.organizationId,
+        appId: ctx.appId,
+        connectionId: ctx.connectionId,
+        syncRunId: ctx.syncRunId,
+        checkKey: 'attribution.cohort_not_cumulative',
+        severity: 'error',
+        entityType: 'campaign',
+        entityRef: externalCampaignId || null,
+        observedDate: activityDate as IsoDate,
+        message: `Cohort ${revenueType} revenue at D${later.age} (${later.revenue}) is below D${earlier.age} (${earlier.revenue}); cohort revenue must be cumulative`,
+        detail: {
+          revenueType,
+          earlierAge: earlier.age,
+          earlierRevenue: earlier.revenue,
+          laterAge: later.age,
+          laterRevenue: later.revenue,
+        },
+      });
+    }
+  }
+
   return findings;
 }
 

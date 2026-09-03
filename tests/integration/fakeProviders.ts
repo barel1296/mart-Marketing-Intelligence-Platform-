@@ -43,6 +43,17 @@ export type FakeControls = {
     revenue?: number;
     /** Defaults to the paid network. Set 'Organic' to exercise unpaid traffic. */
     mediaSource?: string;
+    /**
+     * Cumulative cohort revenue for this install cohort, by component and
+     * age, the way an MMP's `<metric>_Nd` columns carry it. Emitted at
+     * cohort_date grain beside the event-date row, never instead of it.
+     */
+    cohort?: Partial<Record<'iap' | 'ad', Partial<Record<1 | 7, number>>>>;
+    /**
+     * Revenue currency for this row. Defaults to USD; a second currency is
+     * how the mixed-currency gate is exercised end to end.
+     */
+    currency?: string;
   }>;
   /** Windows (from..to) that should fail, to exercise partial completion. */
   failWindows: Set<string>;
@@ -280,6 +291,16 @@ class FakeAttributionProvider implements AttributionProvider {
       country: true,
       // Overridable so a test can simulate a provider without campaign IDs.
       campaign_id: controls.attributionCapabilities['campaign_id'] ?? true,
+      // The fake carries every cohort component at both ages, the way a
+      // fully configured saved report would. A test that wants to see a
+      // missing component overrides the specific key.
+      cohort_reporting: true,
+      cohort_iap_revenue_d1: true,
+      cohort_iap_revenue_d7: true,
+      cohort_ad_revenue_d1: true,
+      cohort_ad_revenue_d7: true,
+      cohort_total_revenue_d1: true,
+      cohort_total_revenue_d7: true,
       ...controls.attributionCapabilities,
     });
   }
@@ -349,21 +370,45 @@ class FakeAttributionProvider implements AttributionProvider {
     controls.calls.revenue += 1;
     maybeFail(params);
     const rows = controls.attributionRows.filter(
-      (r) => inWindow(r.installDate, params) && typeof r.revenue === 'number',
+      (r) => inWindow(r.installDate, params) && (typeof r.revenue === 'number' || r.cohort),
     );
-    const revenue = rows.map((row) => ({
-      activityDate: row.installDate,
-      // Event-date grain: revenue on the day it happened, never cohort LTV.
-      grain: 'event_date' as const,
-      revenueType: 'iap' as const,
-      mediaSource: row.mediaSource ?? 'facebook',
-      externalCampaignId: row.campaignId,
-      campaignName: row.campaignName,
-      country: row.country ?? null,
-      platform: normalizePlatform(row.platform ?? 'ios'),
-      currency: 'USD',
-      revenue: row.revenue ?? 0,
-    }));
+    const revenue: CanonicalAttributionBatch['revenue'] = [];
+    for (const row of rows) {
+      const dims = {
+        mediaSource: row.mediaSource ?? 'facebook',
+        externalCampaignId: row.campaignId,
+        campaignName: row.campaignName,
+        country: row.country ?? null,
+        platform: normalizePlatform(row.platform ?? 'ios'),
+        currency: row.currency ?? 'USD',
+      };
+      if (typeof row.revenue === 'number') {
+        revenue.push({
+          activityDate: row.installDate,
+          // Event-date grain: revenue on the day it happened, never cohort LTV.
+          grain: 'event_date',
+          revenueType: 'iap',
+          ...dims,
+          revenue: row.revenue,
+        });
+      }
+      // Cohort grain: the same install day, observed N days later. A distinct
+      // fact with its own age, emitted beside the event-date row.
+      for (const revenueType of ['iap', 'ad'] as const) {
+        for (const age of [1, 7] as const) {
+          const value = row.cohort?.[revenueType]?.[age];
+          if (typeof value !== 'number') continue;
+          revenue.push({
+            activityDate: row.installDate,
+            grain: 'cohort_date',
+            cohortAgeDays: age,
+            revenueType,
+            ...dims,
+            revenue: value,
+          });
+        }
+      }
+    }
     return {
       batch: { installs: [], events: [], revenue },
       pagesFetched: 1,

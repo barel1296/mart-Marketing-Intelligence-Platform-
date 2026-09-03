@@ -8,6 +8,17 @@
  * whether a field may be displayed at all, so an unavailable dimension shows an
  * explicit unavailable state instead of a fabricated value.
  */
+import { COHORT_AGES, COHORT_REVENUE_TYPES, cohortCapabilityKey } from '@mart/shared';
+
+/**
+ * One key per (revenue type, cohort age) MART can serve, e.g.
+ * `cohort_ad_revenue_d7`. Probed from the account's saved report definition,
+ * so a cohort metric can name the exact provider field it is missing.
+ */
+export const COHORT_CAPABILITY_KEYS = COHORT_REVENUE_TYPES.flatMap((revenueType) =>
+  COHORT_AGES.map((age) => cohortCapabilityKey(revenueType, age)),
+);
+
 export const CAPABILITY_KEYS = [
   // Datasets
   'installs',
@@ -18,6 +29,15 @@ export const CAPABILITY_KEYS = [
   'raw_data',
   'cohort_reporting',
   'skan_data',
+  // Cohort revenue, per component and age. Declared here as literals so the
+  // key type stays closed; the generated list above must match it, which the
+  // capabilities unit test asserts.
+  'cohort_iap_revenue_d1',
+  'cohort_iap_revenue_d7',
+  'cohort_ad_revenue_d1',
+  'cohort_ad_revenue_d7',
+  'cohort_total_revenue_d1',
+  'cohort_total_revenue_d7',
   // Dimensions
   'media_source',
   'campaign',
