@@ -168,6 +168,7 @@ export async function runSync(run: SyncRunRow, request: SyncRequest): Promise<Sy
       continue;
     }
 
+    let dataWindow: { from: IsoDate; to: IsoDate } | null = null;
     try {
       const qualityCtx: QualityContext = {
         organizationId: request.organizationId,
@@ -245,6 +246,21 @@ export async function runSync(run: SyncRunRow, request: SyncRequest): Promise<Sy
         summary.warnings.push(...result.warnings);
         summary.latestDataDate = maxDate(summary.latestDataDate, result.latestDataDate);
         summary.rowsNormalized += await persistAttribution(scope, result.batch);
+        // The dates the revenue rows actually carried, recorded with the
+        // window checkpoint. Cohort maturity reads this to tell a day the
+        // provider reported nothing for from a day MART never read.
+        if (request.dataType === 'attribution_revenue') {
+          if (result.coveredWindow !== undefined) {
+            // The adapter knows what the provider answered - including the
+            // quiet days it answered with nothing. Preferred over the rows.
+            dataWindow = result.coveredWindow;
+          } else {
+            const dates = result.batch.revenue.map((r) => r.activityDate).sort();
+            const first = dates[0];
+            const last = dates[dates.length - 1];
+            dataWindow = first && last ? { from: first, to: last } : null;
+          }
+        }
         // Carried out of the loop so the freshness row can say "never fetched"
         // instead of "fresh" for a stream the adapter does not implement.
         if (result.support && result.support !== 'supported') support = result.support;
@@ -259,7 +275,7 @@ export async function runSync(run: SyncRunRow, request: SyncRequest): Promise<Sy
         });
       }
 
-      await syncRepo.checkpointWindow(run.id, windowKey);
+      await syncRepo.checkpointWindow(run.id, windowKey, undefined, dataWindow);
       // Recorded only here, after the window's rows are persisted: an attempted
       // window is not evidence that anything loaded, and this list is what
       // later closes the earlier errors this run supersedes.

@@ -85,9 +85,21 @@ const ALIGNED = `t.external_campaign_id IN (
    WHERE m.organization_id = t.organization_id AND m.app_id = t.app_id
      AND m.entity_type = 'campaign' AND m.target_provider = t.provider_key
      AND m.target_external_id IS NOT NULL AND ${OPERATIONAL})`;
-/** Mature: old enough as of the horizon, and last read after reaching the age. */
+/**
+ * The audit's own coverage test: the revenue sync recorded reading `day`
+ * (checkpoint.dataWindows) in a run that finished after the cohort reached
+ * `age`. A day nobody read since it matured is not a day that earned nothing.
+ */
+const COVERED = (alias: string, day: string, age: string): string => `EXISTS (
+  SELECT 1 FROM sync_runs r, jsonb_array_elements(COALESCE(r.checkpoint->'dataWindows', '[]'::jsonb)) w
+   WHERE r.app_id = ${alias}.app_id AND r.data_type = 'attribution_revenue'
+     AND r.status IN ('completed', 'partially_completed')
+     AND (w->>'from')::date <= ${day} AND ${day} <= (w->>'to')::date
+     AND (r.finished_at AT TIME ZONE a.timezone)::date > (${day} + ${age}::int))`;
+/** Mature: old enough as of the horizon, last read after reaching the age, and the day covered since. */
 const MATURE = `(t.activity_date + t.cohort_age_days) < $4::date
-  AND (t.observed_at AT TIME ZONE a.timezone)::date > (t.activity_date + t.cohort_age_days)`;
+  AND (t.observed_at AT TIME ZONE a.timezone)::date > (t.activity_date + t.cohort_age_days)
+  AND ${COVERED('t', 't.activity_date', 't.cohort_age_days')}`;
 
 type Row = Record<string, string | null>;
 
@@ -394,6 +406,25 @@ async function auditApp(
       ? `ages stored: ${[...storedAges].sort().join(', ') || '(none)'}`
       : `unserved age(s) stored: ${unservedAges.join(', ')}`,
   );
+  // A provider total left behind when the report gained the IAP/ad split
+  // would double the cohort if it were still counted. Storage may carry both;
+  // the metric layer reads the total only where no component exists, and
+  // this records how many such rows are being set aside.
+  const totalsBesideParts = await queryRows<Row>(
+    `SELECT count(*)::text AS n FROM attribution_revenue_metrics t
+      WHERE t.app_id = $1 AND t.grain = 'cohort_date' AND t.revenue_type = 'total'
+        AND t.activity_date BETWEEN $2 AND $3
+        AND EXISTS (SELECT 1 FROM attribution_revenue_metrics c
+                     WHERE c.connection_id = t.connection_id AND c.app_id = t.app_id
+                       AND c.grain = 'cohort_date' AND c.cohort_age_days = t.cohort_age_days
+                       AND c.activity_date = t.activity_date AND c.revenue_type IN ('iap', 'ad')
+                       AND c.media_source IS NOT DISTINCT FROM t.media_source
+                       AND c.external_campaign_id IS NOT DISTINCT FROM t.external_campaign_id
+                       AND c.country IS NOT DISTINCT FROM t.country
+                       AND c.platform = t.platform AND c.currency = t.currency)`,
+    [appId, from, to],
+  );
+  line('provider totals stored beside their components', totalsBesideParts[0]?.['n'] ?? '0');
   if (cohortRowCount === 0) {
     const missingKeys = COHORT_AGES.flatMap((age) =>
       (['iap', 'ad'] as const)
@@ -482,10 +513,16 @@ async function auditApp(
 
   // ---------------------------------------------------------- maturity ---
   heading(ctx, 'MATURITY');
+  // The earlier of the two attribution streams' horizons - installs define the
+  // cohorts, revenue rows what they earned, and a day only one has reached is
+  // a day nothing can be said about.
   const horizonRows = await queryRows<Row>(
-    `SELECT MAX(latest_provider_data_date)::text AS as_of FROM data_freshness
-      WHERE organization_id = $1 AND app_id = $2
-        AND data_type IN ('attribution_installs', 'attribution_revenue')`,
+    `SELECT CASE WHEN count(*) = 2 THEN MIN(latest) END::text AS as_of
+       FROM (SELECT data_type, MAX(latest_provider_data_date) AS latest FROM data_freshness
+              WHERE organization_id = $1 AND app_id = $2
+                AND data_type IN ('attribution_installs', 'attribution_revenue')
+                AND latest_provider_data_date IS NOT NULL
+              GROUP BY data_type) s`,
     [organizationId, appId],
   );
   const asOf = horizonRows[0]?.['as_of'] ?? null;
@@ -519,10 +556,14 @@ async function auditApp(
   }
   for (const age of asOf ? COHORT_AGES : []) {
     const recomputed = await queryRows<Row>(
-      `SELECT count(DISTINCT t.install_date) FILTER (WHERE (t.install_date + $5::int) < $4::date)::text AS mature_days,
+      `SELECT count(DISTINCT t.install_date) FILTER (WHERE (t.install_date + $5::int) < $4::date
+                AND ${COVERED('t', 't.install_date', '$5')})::text AS mature_days,
               count(DISTINCT t.install_date) FILTER (WHERE NOT ((t.install_date + $5::int) < $4::date))::text AS immature_days,
-              COALESCE(SUM(t.attributed_installs) FILTER (WHERE (t.install_date + $5::int) < $4::date), 0)::text AS installs
-         FROM attribution_daily_metrics t
+              count(DISTINCT t.install_date) FILTER (WHERE (t.install_date + $5::int) < $4::date
+                AND NOT ${COVERED('t', 't.install_date', '$5')})::text AS uncovered_days,
+              COALESCE(SUM(t.attributed_installs) FILTER (WHERE (t.install_date + $5::int) < $4::date
+                AND ${COVERED('t', 't.install_date', '$5')}), 0)::text AS installs
+         FROM attribution_daily_metrics t JOIN apps a ON a.id = t.app_id
         WHERE t.organization_id = $1 AND t.app_id = $2 AND t.install_date BETWEEN $3 AND $6`,
       [organizationId, appId, from, asOf, age, to],
     );
@@ -534,13 +575,22 @@ async function auditApp(
               COALESCE(SUM(t.revenue) FILTER (WHERE ${MATURE} AND ${PAID} AND ${ALIGNED}), 0)::text AS aligned
          FROM attribution_revenue_metrics t JOIN apps a ON a.id = t.app_id
         WHERE t.organization_id = $1 AND t.app_id = $2 AND t.grain = 'cohort_date'
-          AND t.cohort_age_days = $5 AND t.activity_date BETWEEN $3 AND $6`,
+          AND t.cohort_age_days = $5 AND t.activity_date BETWEEN $3 AND $6
+          AND (t.revenue_type <> 'total' OR NOT EXISTS (
+                SELECT 1 FROM attribution_revenue_metrics c
+                 WHERE c.connection_id = t.connection_id AND c.app_id = t.app_id
+                   AND c.grain = 'cohort_date' AND c.cohort_age_days = t.cohort_age_days
+                   AND c.activity_date = t.activity_date AND c.revenue_type IN ('iap', 'ad')
+                   AND c.media_source IS NOT DISTINCT FROM t.media_source
+                   AND c.external_campaign_id IS NOT DISTINCT FROM t.external_campaign_id
+                   AND c.country IS NOT DISTINCT FROM t.country
+                   AND c.platform = t.platform AND c.currency = t.currency))`,
       [organizationId, appId, from, asOf, age, to],
     );
     const byAge = cohort.byAge[age];
     line(
-      `D${age} mature / immature install days`,
-      `${recomputed[0]?.['mature_days']} / ${recomputed[0]?.['immature_days']}`,
+      `D${age} mature / immature / uncovered install days`,
+      `${recomputed[0]?.['mature_days']} / ${recomputed[0]?.['immature_days']} / ${recomputed[0]?.['uncovered_days']}`,
     );
     compare(
       ctx,
@@ -553,6 +603,14 @@ async function auditApp(
       `D${age} immature cohort days`,
       toNumber(recomputed[0]?.['immature_days']),
       byAge.immatureCohortDays,
+    );
+    // Days old enough that the revenue sync has not read since: excluded from
+    // every side, never read as zero. Recomputed from the sync's own record.
+    compare(
+      ctx,
+      `D${age} uncovered cohort days`,
+      toNumber(recomputed[0]?.['uncovered_days']),
+      byAge.uncoveredCohortDays,
     );
     compare(
       ctx,
@@ -710,9 +768,10 @@ async function auditApp(
       `SELECT COALESCE(SUM(md.spend), 0)::text AS aligned,
               (SELECT COALESCE(SUM(x.spend), 0) FROM marketing_daily_metrics x
                 WHERE x.app_id = $2 AND x.report_date BETWEEN $3 AND $6)::text AS window_spend
-         FROM marketing_daily_metrics md
+         FROM marketing_daily_metrics md JOIN apps a ON a.id = md.app_id
         WHERE md.organization_id = $1 AND md.app_id = $2 AND md.report_date BETWEEN $3 AND $6
           AND md.spend > 0 AND (md.report_date + $5::int) < $4::date
+          AND ${COVERED('md', 'md.report_date', '$5')}
           AND md.external_campaign_id IN (
             SELECT m.source_external_id FROM provider_entity_mappings m
              WHERE m.organization_id = md.organization_id AND m.app_id = md.app_id
@@ -730,7 +789,16 @@ async function auditApp(
                 AS aligned_without_same_day_spend
          FROM attribution_revenue_metrics t JOIN apps a ON a.id = t.app_id
         WHERE t.organization_id = $1 AND t.app_id = $2 AND t.grain = 'cohort_date'
-          AND t.cohort_age_days = $5 AND t.activity_date BETWEEN $3 AND $6`,
+          AND t.cohort_age_days = $5 AND t.activity_date BETWEEN $3 AND $6
+          AND (t.revenue_type <> 'total' OR NOT EXISTS (
+                SELECT 1 FROM attribution_revenue_metrics c
+                 WHERE c.connection_id = t.connection_id AND c.app_id = t.app_id
+                   AND c.grain = 'cohort_date' AND c.cohort_age_days = t.cohort_age_days
+                   AND c.activity_date = t.activity_date AND c.revenue_type IN ('iap', 'ad')
+                   AND c.media_source IS NOT DISTINCT FROM t.media_source
+                   AND c.external_campaign_id IS NOT DISTINCT FROM t.external_campaign_id
+                   AND c.country IS NOT DISTINCT FROM t.country
+                   AND c.platform = t.platform AND c.currency = t.currency))`,
       [organizationId, appId, from, asOf, age, to],
     );
     const roasKey = cohortMetricKey({ ageDays: age, revenueType: 'total', measure: 'roas' });
@@ -904,16 +972,31 @@ async function auditApp(
         ? `verified - ${Object.keys(proof.rollback.before).length} table snapshots identical`
         : `FAILED - drift in ${drift.join(', ')}`,
     );
-    assert(
-      ctx,
-      'cohort mixed currency is blocked, never summed',
-      proof.verdict.passed && proof.rollback.verified,
-      proof.verdict.passed && proof.rollback.verified
-        ? `production cohort path refused ${proof.injected.currency}; rollback verified`
-        : !proof.rollback.verified
-          ? 'ROLLBACK NOT VERIFIED - synthetic rows may have survived'
+    if (!proof.rollback.verified) {
+      assert(
+        ctx,
+        'cohort mixed currency is blocked, never summed',
+        false,
+        'ROLLBACK NOT VERIFIED - synthetic rows may have survived',
+      );
+    } else if (!proof.evaluable) {
+      // The gate was never reached, so nothing was proven either way.
+      record(
+        ctx,
+        'cohort mixed currency is blocked, never summed',
+        'UNPROVEN',
+        `could not reach the currency gate: ${proof.skipReason ?? 'unknown'}`,
+      );
+    } else {
+      assert(
+        ctx,
+        'cohort mixed currency is blocked, never summed',
+        proof.verdict.passed,
+        proof.verdict.passed
+          ? `production cohort path (${proof.injected.revenueType} at D${proof.injected.ageDays}) refused ${proof.injected.currency}; rollback verified`
           : 'production cohort path did not refuse the mixed aggregate',
-    );
+      );
+    }
   }
 
   // ------------------------------------------------------- no forecasting --

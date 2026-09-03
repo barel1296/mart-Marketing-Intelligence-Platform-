@@ -131,6 +131,18 @@ What each rule protects, and how it is enforced:
   and reported in the reason ("3 of 5 install days have not reached D7 ... not
   counted as zero"); a window with no mature cohort is `blocked` with
   `immature_cohort`, never zero.
+- **A day nobody read is not a day that earned nothing.** A cohort that earned
+  nothing leaves no row, so absence of rows proves nothing. Each install day
+  counts at age N only if a revenue sync recorded reading that day
+  (`sync_runs.checkpoint.dataWindows`, the dates its rows actually carried) in a
+  run that finished after the cohort reached N. The same test gates the
+  revenue rows, the installs behind RPI and the spend behind ROAS, so all
+  three describe the same days. A saved report whose rolling range is shorter
+  than the request, a failed window, or history synced before this rule
+  existed all read as _uncovered_: excluded from every side and reported
+  (`provider_stale` when nothing in the window is covered), never as zero.
+  After upgrading, run one attribution revenue backfill so older cohorts are
+  read again.
 - **D1 and D7 are two facts.** Distinct rows, distinct identities
   (`cohort_age_days` is part of the row's identity), distinct metric keys. They
   are never derived from each other.

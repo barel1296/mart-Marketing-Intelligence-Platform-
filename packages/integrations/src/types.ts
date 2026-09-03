@@ -66,6 +66,15 @@ export type SyncResult<TBatch> = {
   /** Latest provider-reported date actually present in the response. */
   latestDataDate: IsoDate | null;
   /**
+   * The dates this call actually answered for, when the adapter can tell:
+   * the requested window less whatever the provider's report could not reach.
+   * Null means "nothing was answered"; undefined means the adapter does not
+   * know, and the engine falls back to the dates its rows carried. Cohort
+   * maturity reads this to keep "the provider said nothing happened" apart
+   * from "MART never asked".
+   */
+  coveredWindow?: { from: IsoDate; to: IsoDate } | null;
+  /**
    * Whether this stream can be fetched at all. Omitted means `supported`.
    *
    * An adapter that returns an empty batch without making a request must say

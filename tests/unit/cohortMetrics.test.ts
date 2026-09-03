@@ -399,3 +399,35 @@ describe('cohort metric computation', () => {
     expect(value.reason).toMatch(/no attribution sync has completed/i);
   });
 });
+
+describe('cohort coverage', () => {
+  it('blocks a figure whose mature days were never read by the revenue sync, as unknown rather than zero', () => {
+    const cohort = cohortFixture();
+    const d7 = cohort.byAge[7];
+    // Old enough, but the revenue stream has not read them since: unknown.
+    d7.matureCohortDays = 0;
+    d7.immatureCohortDays = 0;
+    d7.uncoveredCohortDays = 5;
+    for (const key of ['cohort_ad_revenue_d7', 'cohort_ad_rpi_d7', 'cohort_ad_roas_d7']) {
+      const value = metric(key, cohort);
+      expect(value.value, key).toBeNull();
+      expect(value.availability, key).toBe('blocked');
+      expect(value.blocker, key).toBe('provider_stale');
+      expect(value.reason, key).toMatch(/has not read them since they reached D7/);
+      expect(value.reason, key).toMatch(/unknown, not zero/);
+    }
+  });
+
+  it('names uncovered days beside immature ones when some cohorts are mature', () => {
+    const cohort = cohortFixture();
+    cohort.byAge[7].uncoveredCohortDays = 2;
+    const d7 = metric('cohort_ad_revenue_d7', cohort);
+    expect(d7.value).toBe(90);
+    expect(d7.availability).toBe('partial');
+    expect(d7.reason).toMatch(/3 of 7 install day\(s\) have not reached D7/);
+    expect(d7.reason).toMatch(
+      /2 of 7 install day\(s\) are old enough for D7 but the attribution revenue sync has not read them/,
+    );
+    expect(d7.reason).toMatch(/excluded from both sides/);
+  });
+});

@@ -1,6 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { getPool, queryRows, type Queryable } from '@mart/db';
-import { COHORT_AGES } from '@mart/shared';
+import {
+  COHORT_AGES,
+  addDays,
+  cohortCapabilityKey,
+  type CohortAge,
+  type CohortRevenueType,
+} from '@mart/shared';
 import {
   computeMetricValues,
   loadAttributionAggregate,
@@ -366,7 +372,15 @@ function appId(filters: MetricFilters): string {
  * computation are asked what they see.
  */
 export type CohortCurrencyProofResult = {
-  injected: { currency: string; cohortDate: string; ageDays: number };
+  injected: { currency: string; cohortDate: string; ageDays: number; revenueType: string };
+  /**
+   * Whether the proof could reach the currency gate at all. False when the
+   * account supplies no cohort component or the window has no mature day; the
+   * verdict is then not a verdict, and an audit records it as UNPROVEN with
+   * `skipReason`, never as FAIL.
+   */
+  evaluable: boolean;
+  skipReason: string | null;
   natural: { revenueCurrencies: string[]; spendCurrencies: string[] };
   gate: {
     revenueCurrencies: string[];
@@ -414,18 +428,40 @@ async function runCohortProof(
   filters: MetricFilters,
   context: MetricContext,
 ): Promise<Omit<CohortCurrencyProofResult, 'rollback'>> {
-  const ageDays = COHORT_AGES[0];
-  const revenueKey = cohortMetricKey({ ageDays, revenueType: 'total', measure: 'revenue' });
-  const roasKey = cohortMetricKey({ ageDays, revenueType: 'total', measure: 'roas' });
+  // The proof must reach the currency gate, which sits behind the capability
+  // and maturity gates. So it picks an (age, component) the account's report
+  // actually supplies, and a cohort day old enough to be mature; if neither
+  // exists in this window the proof says so rather than failing a gate it
+  // never reached.
+  const naturalCohort = await loadCohortAggregate(filters, client);
+  const supports = (type: CohortRevenueType, age: CohortAge): boolean =>
+    context.supportedCapabilities.has('cohort_reporting') &&
+    context.supportedCapabilities.has(cohortCapabilityKey(type, age));
+  let chosen: { ageDays: CohortAge; revenueType: CohortRevenueType } | null = null;
+  for (const age of COHORT_AGES) {
+    for (const type of ['total', 'iap', 'ad'] as const) {
+      if (!chosen && supports(type, age)) chosen = { ageDays: age, revenueType: type };
+    }
+  }
+  const ageDays = chosen?.ageDays ?? COHORT_AGES[0];
+  const revenueType = chosen?.revenueType ?? 'total';
+  const revenueKey = cohortMetricKey({ ageDays, revenueType, measure: 'revenue' });
+  const roasKey = cohortMetricKey({ ageDays, revenueType, measure: 'roas' });
   const summarizeKeys = (metrics: MetricValue[]) => ({
     cohortRevenue: summarize(metrics.find((m) => m.metricKey === revenueKey)),
     cohortRoas: summarize(metrics.find((m) => m.metricKey === roasKey)),
   });
+  const cohortDate = filters.from;
+  const mature = naturalCohort.asOf !== null && addDays(cohortDate, ageDays) < naturalCohort.asOf;
+  const skipReason = !chosen
+    ? 'the account supplies no cohort component at any served age, so no cohort figure reaches the currency gate'
+    : !mature
+      ? `the window starts ${cohortDate}, which is not ${ageDays} day(s) old as of the data horizon ${naturalCohort.asOf ?? '(none)'}; widen the window so a mature cohort day exists`
+      : null;
 
-  const naturalCohort = await loadCohortAggregate(filters, client);
   const naturalAge = naturalCohort.byAge[ageDays];
   const present = new Set([
-    ...naturalAge.revenue.total.currencies,
+    ...naturalAge.revenue[revenueType].currencies,
     ...naturalAge.alignedSpendCurrencies,
   ]);
   const currency = pickInjectedCurrency(present);
@@ -453,8 +489,8 @@ async function runCohortProof(
 
   // The injected cohort must be MATURE, or the maturity gate - correctly -
   // hides it before the currency gate ever sees it. Dated at the window start
-  // and observed far enough after; the horizon is whatever the app has.
-  const cohortDate = filters.from;
+  // and observed far enough after; whether that day is old enough was decided
+  // above, and the revenue run that covered it is the app's own.
   const attributionCampaignId = `${PROOF_TAG}:cohort:${nonce}`;
   const marketingCampaignId = `${PROOF_TAG}:spend:${nonce}`;
   await queryRows(
@@ -462,7 +498,7 @@ async function runCohortProof(
        (organization_id, app_id, connection_id, provider_key, grain, activity_date, cohort_age_days,
         revenue_type, media_source, normalized_media_source, external_campaign_id,
         country, platform, currency, revenue, dimension_hash, observed_at)
-     VALUES ($1, $2, $3, $4, 'cohort_date', $5, $6, 'iap', $7, 'meta', $8, NULL, 'unknown', $9, 1, $10,
+     VALUES ($1, $2, $3, $4, 'cohort_date', $5, $6, $11, $7, 'meta', $8, NULL, 'unknown', $9, 1, $10,
              ($5::date + $6::int + 2)::timestamptz + interval '1 year')`,
     [
       filters.organizationId,
@@ -475,6 +511,8 @@ async function runCohortProof(
       attributionCampaignId,
       currency,
       `${PROOF_TAG}:cohort:${nonce}`,
+      // The component the chosen figure reads; a total reads every component.
+      revenueType === 'ad' ? 'ad' : 'iap',
     ],
     client,
   );
@@ -531,7 +569,7 @@ async function runCohortProof(
     }),
   );
 
-  const revenueCurrencies = mixedAge.revenue.total.currencies;
+  const revenueCurrencies = mixedAge.revenue[revenueType].currencies;
   const spendCurrencies = mixedAge.alignedSpendCurrencies;
   const detected = revenueCurrencies.includes(currency) && spendCurrencies.includes(currency);
   const notSummed = gate.cohortRevenue.value === null && gate.cohortRoas.value === null;
@@ -545,9 +583,11 @@ async function runCohortProof(
     (gate.cohortRoas.reason ?? '').includes(currency);
 
   return {
-    injected: { currency, cohortDate, ageDays },
+    injected: { currency, cohortDate, ageDays, revenueType },
+    evaluable: skipReason === null,
+    skipReason,
     natural: {
-      revenueCurrencies: naturalAge.revenue.total.currencies,
+      revenueCurrencies: naturalAge.revenue[revenueType].currencies,
       spendCurrencies: naturalAge.alignedSpendCurrencies,
     },
     gate: { revenueCurrencies, spendCurrencies, ...gate },
@@ -556,7 +596,7 @@ async function runCohortProof(
       notSummed,
       blocked,
       reasonNamesCurrency,
-      passed: detected && notSummed && blocked && reasonNamesCurrency,
+      passed: skipReason === null && detected && notSummed && blocked && reasonNamesCurrency,
     },
   };
 }

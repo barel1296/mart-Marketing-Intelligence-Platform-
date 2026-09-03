@@ -463,6 +463,13 @@ export type CohortAgeAggregate = {
   matureCohortDays: number;
   /** Distinct install days in the window not yet this old. Counted, never zeroed. */
   immatureCohortDays: number;
+  /**
+   * Distinct install days old enough for this age that the revenue stream has
+   * not read since they reached it. A day the provider was never asked about
+   * after the cohort matured is not a day the cohort earned nothing on; it is
+   * excluded from BOTH sides and reported, like an immature day.
+   */
+  uncoveredCohortDays: number;
   /** Installs of mature cohorts: the RPI denominator. */
   installs: number;
   paidInstalls: number;
@@ -508,6 +515,7 @@ function emptyAge(ageDays: CohortAge): CohortAgeAggregate {
     ageDays,
     matureCohortDays: 0,
     immatureCohortDays: 0,
+    uncoveredCohortDays: 0,
     installs: 0,
     paidInstalls: 0,
     organicInstalls: 0,
@@ -522,6 +530,40 @@ export function emptyCohortAggregate(asOf: IsoDate | null = null): CohortAggrega
   const byAge = {} as Record<CohortAge, CohortAgeAggregate>;
   for (const age of COHORT_AGES) byAge[age] = emptyAge(age);
   return { asOf, byAge };
+}
+
+/**
+ * Whether the attribution revenue stream READ `dayExpr` after the cohort that
+ * installed that day reached `ageParam` days, in the app's own calendar.
+ *
+ * Coverage comes from the revenue sync's own record of the dates its rows
+ * carried (sync_runs.checkpoint.dataWindows), never from the rows in storage:
+ * a cohort that earned nothing leaves no row, and that must stay distinct
+ * from a day MART never read - or read only before the cohort matured. A day
+ * that is not covered is excluded from every side of every cohort figure and
+ * reported, exactly like an immature day. This is what keeps a shorter saved
+ * report, a failed window or a sync that has not run yet from reading as
+ * "these cohorts earned nothing".
+ */
+function revenueCovered(input: {
+  alias: string;
+  dayExpr: string;
+  ageParam: string;
+  timezoneExpr: string;
+  providerParam?: string | undefined;
+}): string {
+  const { alias, dayExpr, ageParam, timezoneExpr, providerParam } = input;
+  return `EXISTS (
+    SELECT 1 FROM sync_runs r,
+         jsonb_array_elements(COALESCE(r.checkpoint->'dataWindows', '[]'::jsonb)) w
+     WHERE r.organization_id = ${alias}.organization_id AND r.app_id = ${alias}.app_id
+       AND r.data_type = 'attribution_revenue'
+       AND r.status IN ('completed', 'partially_completed')${
+         providerParam ? `\n       AND r.provider_key = ${providerParam}` : ''
+       }
+       AND (w->>'from')::date <= ${dayExpr} AND ${dayExpr} <= (w->>'to')::date
+       AND (r.finished_at AT TIME ZONE ${timezoneExpr})::date > (${dayExpr} + ${ageParam}::int)
+  )`;
 }
 
 /**
@@ -543,9 +585,12 @@ export async function loadCohortAggregate(
   filters: MetricFilters,
   client?: Queryable,
 ): Promise<CohortAggregate> {
-  // The data horizon: the latest day any attribution stream has data for. A
-  // cohort's age is measured against this, not against the wall clock, so a
-  // stale sync cannot make a cohort look mature before the provider said so.
+  // The data horizon: the latest day BOTH attribution streams have data for.
+  // Installs define the cohorts and revenue rows define what they earned, so
+  // a day only one stream has reached is a day nothing can be said about. The
+  // earlier of the two, never the later: a cohort's age is measured against
+  // this rather than the wall clock, so a lagging stream cannot make a cohort
+  // look mature - or look like it earned nothing - before the provider said so.
   const horizonParams: unknown[] = [filters.organizationId, filters.appId];
   let horizonWhere = `organization_id = $1 AND app_id = $2
        AND data_type IN ('attribution_installs', 'attribution_revenue')`;
@@ -554,7 +599,9 @@ export async function loadCohortAggregate(
     horizonWhere += ` AND provider_key = $${horizonParams.length}`;
   }
   const horizon = await queryRows<{ as_of: string | null }>(
-    `SELECT MAX(latest_provider_data_date)::text AS as_of FROM data_freshness WHERE ${horizonWhere}`,
+    `SELECT CASE WHEN count(*) = 2 AND count(latest) = 2 THEN MIN(latest) END::text AS as_of
+       FROM (SELECT data_type, MAX(latest_provider_data_date) AS latest
+               FROM data_freshness WHERE ${horizonWhere} GROUP BY data_type) streams`,
     horizonParams,
     client,
   );
@@ -573,9 +620,11 @@ export async function loadCohortAggregate(
   ];
   let revenueWhere = `t.organization_id = $1 AND t.app_id = $2 AND t.activity_date BETWEEN $3 AND $4
        AND t.grain = 'cohort_date' AND t.cohort_age_days = ANY($6::int[])`;
+  let revenueProvider: string | undefined;
   if (filters.attributionProviderKey) {
     revenueParams.push(filters.attributionProviderKey);
-    revenueWhere += ` AND t.provider_key = $${revenueParams.length}`;
+    revenueProvider = `$${revenueParams.length}`;
+    revenueWhere += ` AND t.provider_key = ${revenueProvider}`;
   }
   if (filters.channel === 'organic') {
     revenueWhere += ` AND ${organic('t')}`;
@@ -593,6 +642,18 @@ export async function loadCohortAggregate(
     revenueParams.push(filters.platform);
     revenueWhere += ` AND t.platform = $${revenueParams.length}`;
     revenueDelivery += ` AND md.platform = $${revenueParams.length}`;
+  }
+  // The spend side of "aligned" is narrowed by exactly the marketing binds the
+  // denominator query applies below. Without this a cohort mapped to another
+  // account's campaign would sit in the numerator while that account's spend
+  // is filtered out of the denominator.
+  if (filters.marketingProviderKey) {
+    revenueParams.push(filters.marketingProviderKey);
+    revenueDelivery += ` AND md.provider_key = $${revenueParams.length}`;
+  }
+  if (filters.marketingAccountExternalId) {
+    revenueParams.push(filters.marketingAccountExternalId);
+    revenueDelivery += ` AND md.external_account_id = $${revenueParams.length}`;
   }
 
   const revenueRows = await queryRows<{
@@ -618,31 +679,56 @@ export async function loadCohortAggregate(
               -- figure whatever the column says.
               (t.observed_at AT TIME ZONE a.timezone)::date > (t.activity_date + t.cohort_age_days)
                 AS read_after,
+              -- Mature: old enough, read after reaching the age, AND the day
+              -- is one the revenue stream covered after that - the same test
+              -- the install and spend sides apply, so the three describe the
+              -- same days.
+              ((t.activity_date + t.cohort_age_days) < $5::date
+                AND (t.observed_at AT TIME ZONE a.timezone)::date > (t.activity_date + t.cohort_age_days)
+                AND ${revenueCovered({
+                  alias: 't',
+                  dayExpr: 't.activity_date',
+                  ageParam: 't.cohort_age_days',
+                  timezoneExpr: 'a.timezone',
+                  providerParam: revenueProvider,
+                })}) AS mature,
               (${NOT_ORGANIC}) AS paid,
               (${MAPPED_ATTRIBUTION_CAMPAIGN}) AS mapped,
               (${cohortSpendAlignedCampaign(revenueDelivery, 't')}) AS aligned
          FROM attribution_revenue_metrics t
          JOIN apps a ON a.id = t.app_id
         WHERE ${revenueWhere}
+          -- A provider total is read only where no component row exists for
+          -- the same cohort. A report that gains the split later leaves its
+          -- old totals behind, and those must not be added to the parts.
+          AND (t.revenue_type <> 'total' OR NOT EXISTS (
+                SELECT 1 FROM attribution_revenue_metrics c
+                 WHERE c.connection_id = t.connection_id AND c.app_id = t.app_id
+                   AND c.grain = 'cohort_date' AND c.cohort_age_days = t.cohort_age_days
+                   AND c.activity_date = t.activity_date AND c.revenue_type IN ('iap', 'ad')
+                   AND c.media_source IS NOT DISTINCT FROM t.media_source
+                   AND c.external_campaign_id IS NOT DISTINCT FROM t.external_campaign_id
+                   AND c.country IS NOT DISTINCT FROM t.country
+                   AND c.platform = t.platform AND c.currency = t.currency))
      )
      SELECT age, revenue_type,
-            COALESCE(SUM(revenue) FILTER (WHERE matured AND read_after), 0)::text AS revenue,
-            COALESCE(SUM(revenue) FILTER (WHERE matured AND read_after AND NOT paid), 0)::text
+            COALESCE(SUM(revenue) FILTER (WHERE mature), 0)::text AS revenue,
+            COALESCE(SUM(revenue) FILTER (WHERE mature AND NOT paid), 0)::text
               AS organic_revenue,
-            COALESCE(SUM(revenue) FILTER (WHERE matured AND read_after AND paid AND mapped), 0)::text
+            COALESCE(SUM(revenue) FILTER (WHERE mature AND paid AND mapped), 0)::text
               AS mapped_paid_revenue,
-            COALESCE(SUM(revenue) FILTER (WHERE matured AND read_after AND paid AND NOT mapped), 0)::text
+            COALESCE(SUM(revenue) FILTER (WHERE mature AND paid AND NOT mapped), 0)::text
               AS unmapped_paid_revenue,
-            COALESCE(SUM(revenue) FILTER (WHERE matured AND read_after AND paid AND aligned), 0)::text
+            COALESCE(SUM(revenue) FILTER (WHERE mature AND paid AND aligned), 0)::text
               AS aligned_revenue,
             COALESCE(SUM(revenue) FILTER (WHERE NOT matured), 0)::text AS immature_revenue,
             COALESCE(SUM(revenue) FILTER (WHERE matured AND NOT read_after), 0)::text
               AS early_read_revenue,
             count(*) FILTER (WHERE matured AND NOT read_after)::text AS early_read_rows,
-            COALESCE(array_agg(DISTINCT currency) FILTER (WHERE matured AND read_after), '{}')
+            COALESCE(array_agg(DISTINCT currency) FILTER (WHERE mature), '{}')
               AS currencies,
             COALESCE(array_agg(DISTINCT currency)
-              FILTER (WHERE matured AND read_after AND paid AND aligned), '{}') AS aligned_currencies,
+              FILTER (WHERE mature AND paid AND aligned), '{}') AS aligned_currencies,
             count(*)::text AS row_count
        FROM cohort
       GROUP BY age, revenue_type`,
@@ -685,8 +771,9 @@ export async function loadCohortAggregate(
     if (row.revenue_type === 'iap' || row.revenue_type === 'ad') {
       addSlice(age.revenue[row.revenue_type], slice);
     }
-    // `total` is every component stored at this age. The adapters never store
-    // a provider total beside its own components, so this cannot double count.
+    // `total` is every component stored at this age, plus a provider total
+    // only where the query above found no component for the same cohort - a
+    // report that gained the split later cannot count both.
     addSlice(age.revenue.total, slice);
   }
 
@@ -701,9 +788,11 @@ export async function loadCohortAggregate(
       ageDays,
     ];
     let installWhere = `t.organization_id = $1 AND t.app_id = $2 AND t.install_date BETWEEN $3 AND $4`;
+    let installProvider: string | undefined;
     if (filters.attributionProviderKey) {
       installParams.push(filters.attributionProviderKey);
-      installWhere += ` AND t.provider_key = $${installParams.length}`;
+      installProvider = `$${installParams.length}`;
+      installWhere += ` AND t.provider_key = ${installProvider}`;
     }
     if (filters.channel === 'organic') {
       installWhere += ` AND ${organic('t')}`;
@@ -719,22 +808,37 @@ export async function loadCohortAggregate(
       installParams.push(filters.platform);
       installWhere += ` AND t.platform = $${installParams.length}`;
     }
-    const mature = `(t.install_date + $6::int) < $5::date`;
+    // Three states for an install day, never two: old enough and read by the
+    // revenue stream since (mature), not old enough (immature), or old enough
+    // but never read since it matured (uncovered). Only the first is counted.
+    const oldEnough = `(t.install_date + $6::int) < $5::date`;
+    const covered = revenueCovered({
+      alias: 't',
+      dayExpr: 't.install_date',
+      ageParam: '$6',
+      timezoneExpr: 'a.timezone',
+      providerParam: installProvider,
+    });
+    const mature = `(${oldEnough} AND ${covered})`;
     const installRows = await queryRows<{
       installs: string;
       paid_installs: string;
       organic_installs: string;
       mature_days: string;
       immature_days: string;
+      uncovered_days: string;
     }>(
-      `SELECT COALESCE(SUM(attributed_installs) FILTER (WHERE ${mature}), 0)::text AS installs,
-              COALESCE(SUM(attributed_installs) FILTER (WHERE ${mature} AND ${NOT_ORGANIC}), 0)::text
+      `SELECT COALESCE(SUM(t.attributed_installs) FILTER (WHERE ${mature}), 0)::text AS installs,
+              COALESCE(SUM(t.attributed_installs) FILTER (WHERE ${mature} AND ${NOT_ORGANIC}), 0)::text
                 AS paid_installs,
-              COALESCE(SUM(attributed_installs) FILTER (WHERE ${mature} AND NOT (${NOT_ORGANIC})), 0)::text
+              COALESCE(SUM(t.attributed_installs) FILTER (WHERE ${mature} AND NOT (${NOT_ORGANIC})), 0)::text
                 AS organic_installs,
-              count(DISTINCT install_date) FILTER (WHERE ${mature})::text AS mature_days,
-              count(DISTINCT install_date) FILTER (WHERE NOT (${mature}))::text AS immature_days
+              count(DISTINCT t.install_date) FILTER (WHERE ${mature})::text AS mature_days,
+              count(DISTINCT t.install_date) FILTER (WHERE NOT (${oldEnough}))::text AS immature_days,
+              count(DISTINCT t.install_date) FILTER (WHERE ${oldEnough} AND NOT (${covered}))::text
+                AS uncovered_days
          FROM attribution_daily_metrics t
+         JOIN apps a ON a.id = t.app_id
         WHERE ${installWhere}`,
       installParams,
       client,
@@ -745,6 +849,7 @@ export async function loadCohortAggregate(
     age.organicInstalls = toNumber(installRows[0]?.organic_installs);
     age.matureCohortDays = toNumber(installRows[0]?.mature_days);
     age.immatureCohortDays = toNumber(installRows[0]?.immature_days);
+    age.uncoveredCohortDays = toNumber(installRows[0]?.uncovered_days);
 
     // ------------------------------------------------ cohort-aligned spend ---
     // Spend on the install day, for campaigns that map to the bound
@@ -788,11 +893,22 @@ export async function loadCohortAggregate(
       currencies: string[];
       campaign_days: string;
     }>(
+      // The same coverage test as the install and revenue sides: spend on a
+      // day the revenue stream has not read since the cohort matured is spend
+      // whose return MART does not know, not spend that returned nothing.
       `SELECT COALESCE(SUM(md.spend), 0)::text AS spend,
               COALESCE(array_agg(DISTINCT md.currency), '{}') AS currencies,
               count(DISTINCT (md.external_campaign_id, md.report_date))::text AS campaign_days
          FROM marketing_daily_metrics md
-        WHERE ${spendWhere} AND ${mappedMarketingCampaign('md', targetProvider)}`,
+         JOIN apps a ON a.id = md.app_id
+        WHERE ${spendWhere} AND ${mappedMarketingCampaign('md', targetProvider)}
+          AND ${revenueCovered({
+            alias: 'md',
+            dayExpr: 'md.report_date',
+            ageParam: '$6',
+            timezoneExpr: 'a.timezone',
+            providerParam: targetProvider,
+          })}`,
       spendParams,
       client,
     );
@@ -1353,7 +1469,7 @@ function buildCohortMetric(
   }
   const age = cohort.byAge[N];
   const slice = age.revenue[spec.revenueType];
-  const cohortDays = age.matureCohortDays + age.immatureCohortDays;
+  const cohortDays = age.matureCohortDays + age.immatureCohortDays + age.uncoveredCohortDays;
   const freshness = context.attributionFreshness;
   const finish = (value: MetricValue): MetricValue => ({
     ...value,
@@ -1370,11 +1486,31 @@ function buildCohortMetric(
     });
   }
   if (age.matureCohortDays === 0) {
+    // Old enough but never read since: the revenue stream owes MART a read,
+    // and until it happens these cohorts are unknown - not zero, not young.
+    // Named first even when younger days sit beside them, because it is the
+    // condition a person can act on now.
+    if (age.uncoveredCohortDays > 0) {
+      return finish({
+        ...base,
+        availability: 'blocked',
+        blocker: 'provider_stale',
+        reason:
+          `${age.uncoveredCohortDays} install day(s) in this window are ${N} day(s) old, but the attribution revenue sync has not read them since they reached D${N}. Run an attribution revenue sync over these days (a backfill after upgrading); until then their D${N} figure is unknown, not zero.` +
+          (age.immatureCohortDays > 0
+            ? ` A further ${age.immatureCohortDays} day(s) have not reached D${N} as of ${cohort.asOf}.`
+            : ''),
+      });
+    }
     return finish({
       ...base,
       availability: 'blocked',
       blocker: 'immature_cohort',
-      reason: `None of the ${age.immatureCohortDays} install day(s) in this window is ${N} day(s) old as of ${cohort.asOf}. A D${N} figure does not exist for them yet; it is not zero.`,
+      reason:
+        `None of the ${age.immatureCohortDays} install day(s) in this window is ${N} day(s) old as of ${cohort.asOf}. A D${N} figure does not exist for them yet; it is not zero.` +
+        (age.uncoveredCohortDays > 0
+          ? ` A further ${age.uncoveredCohortDays} day(s) are old enough but have not been read by the revenue sync since reaching D${N}.`
+          : ''),
     });
   }
 
@@ -1401,6 +1537,11 @@ function buildCohortMetric(
   if (age.immatureCohortDays > 0) {
     caveats.push(
       `${age.immatureCohortDays} of ${cohortDays} install day(s) have not reached D${N} as of ${cohort.asOf} and are excluded, not counted as zero`,
+    );
+  }
+  if (age.uncoveredCohortDays > 0) {
+    caveats.push(
+      `${age.uncoveredCohortDays} of ${cohortDays} install day(s) are old enough for D${N} but the attribution revenue sync has not read them since they reached it; they are excluded from both sides, not counted as zero - run an attribution revenue sync over them`,
     );
   }
   if (slice.earlyReadRows > 0) {

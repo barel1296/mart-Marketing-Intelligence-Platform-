@@ -502,12 +502,20 @@ export function selectSavedReport(
     candidate.report.appIds.length === 1 && candidate.report.appIds[0] === requirement.appId
       ? 1
       : 0;
+  // How many cohort components (per age) the report can supply. Ranked after
+  // the event-date split so a report that cannot separate IAP from ad never
+  // wins on cohort columns alone - and both the sync and the capability probe
+  // rank the same way, so what is probed is what is read.
+  const cohortScore = (candidate: TenjinReportCompatibility): number =>
+    COHORT_AGES.length * COHORT_REVENUE_TYPES.length -
+    tenjinCohortCoverage(candidate.report.metrics).missing.length;
   usable.sort(
     (a, b) =>
       appScoped(b) - appScoped(a) ||
       groupByRank(b.groupBy) - groupByRank(a.groupBy) ||
       // A report that splits IAP from ad beats one carrying only a total.
       componentScore(b) - componentScore(a) ||
+      cohortScore(b) - cohortScore(a) ||
       b.report.metrics.length - a.report.metrics.length ||
       (b.report.pastNumberDays ?? 0) - (a.report.pastNumberDays ?? 0),
   );
@@ -1288,6 +1296,7 @@ export class TenjinAttributionProvider implements AttributionProvider {
       rowsRejected: rejected,
       warnings,
       latestDataDate,
+      coveredWindow: rows.coveredWindow,
     };
   }
 
@@ -1319,6 +1328,8 @@ export class TenjinAttributionProvider implements AttributionProvider {
     rowsFetched: number;
     rowsSkipped: number;
     warnings: string[];
+    /** The dates this pull answered for; null when it returned nothing. */
+    coveredWindow: { from: IsoDate; to: IsoDate } | null;
   }> {
     const rows: TenjinRow[] = [];
     const warnings: string[] = [];
@@ -1421,12 +1432,24 @@ export class TenjinAttributionProvider implements AttributionProvider {
       );
     }
 
+    // What this pull actually answered. A rolling report's shortfall is
+    // always at the start of the window - it reaches up to today - so the
+    // covered range runs from the later of the request start and the earliest
+    // returned day, to the request end. Quiet days inside that range were
+    // asked about and answered with nothing; days before it were never read.
+    // With no rows at all, nothing is claimed.
+    const coveredWindow =
+      rowsFetched > 0 && earliest
+        ? { from: (earliest > params.from ? earliest : params.from) as IsoDate, to: params.to }
+        : null;
+
     return {
       rows,
       pages,
       rowsFetched,
       rowsSkipped: otherApp + unattributableApp + outsideWindow,
       warnings,
+      coveredWindow,
     };
   }
 

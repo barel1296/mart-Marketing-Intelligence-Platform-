@@ -234,16 +234,32 @@ export async function checkpointWindow(
   runId: string,
   windowKey: string,
   client?: Queryable,
+  /**
+   * The provider-reported dates actually present in this window's rows, when
+   * the engine can tell. Kept apart from the requested window on purpose: a
+   * saved report whose rolling range is shorter than the request answers the
+   * whole window "successfully" while covering only its tail, and a cohort
+   * figure must not read the days it silently lacked as days that earned
+   * nothing. Recorded under checkpoint.dataWindows; a window with no rows
+   * records nothing, which downstream reads as "not covered".
+   */
+  dataWindow?: { from: string; to: string } | null,
 ): Promise<void> {
   await query(
     `UPDATE sync_runs
      SET checkpoint = jsonb_set(
-           COALESCE(checkpoint, '{}'::jsonb),
-           '{completedWindows}',
-           COALESCE(checkpoint->'completedWindows', '[]'::jsonb) || to_jsonb($2::text),
+           jsonb_set(
+             COALESCE(checkpoint, '{}'::jsonb),
+             '{completedWindows}',
+             COALESCE(checkpoint->'completedWindows', '[]'::jsonb) || to_jsonb($2::text),
+             true),
+           '{dataWindows}',
+           COALESCE(checkpoint->'dataWindows', '[]'::jsonb)
+             || CASE WHEN $3::text IS NULL THEN '[]'::jsonb
+                     ELSE jsonb_build_array(jsonb_build_object('from', $3::text, 'to', $4::text)) END,
            true)
      WHERE id = $1`,
-    [runId, windowKey],
+    [runId, windowKey, dataWindow?.from ?? null, dataWindow?.to ?? null],
     client,
   );
 }

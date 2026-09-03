@@ -334,3 +334,69 @@ describe('cohort data quality', () => {
     );
   });
 });
+
+describe('tenjin report selection with cohort columns', () => {
+  it('prefers the report that can supply cohort revenue, after the IAP/ad split', async () => {
+    const { selectSavedReport, parseSavedReport } = await import('@mart/integrations');
+    const base = {
+      report_type: 'user_acquisition',
+      app_ids: [APP],
+      granularity: 'daily',
+      group_by: 'campaign_country',
+      past_number_days: 30,
+      channel_ids: [],
+    };
+    const plain = parseSavedReport({
+      id: 'plain',
+      attributes: {
+        ...base,
+        name: 'plain',
+        metrics: ['tracked_installs', 'revenues', 'ad_mediation_revenue', 'spend'],
+      },
+    });
+    const withCohort = parseSavedReport({
+      id: 'cohort',
+      attributes: {
+        ...base,
+        name: 'cohort',
+        metrics: [
+          'tracked_installs',
+          'revenues',
+          'ad_mediation_revenue',
+          'revenues_7d',
+          'ad_mediation_revenue_7d',
+        ],
+      },
+    });
+    const totalOnly = parseSavedReport({
+      id: 'total',
+      attributes: {
+        ...base,
+        name: 'total',
+        metrics: [
+          'tracked_installs',
+          'total_rev',
+          'revenues_1d',
+          'revenues_7d',
+          'pubrev_1d',
+          'pubrev_7d',
+        ],
+      },
+    });
+    if (!plain || !withCohort || !totalOnly) throw new Error('fixture parse failed');
+    const { chosen } = selectSavedReport([plain, totalOnly, withCohort], {
+      appId: APP,
+      requiredMetrics: [],
+      anyOfMetrics: [
+        'revenues',
+        'ad_mediation_revenue',
+        'pub_rev',
+        'total_ad_mediation_revenue',
+        'total_rev',
+      ],
+    });
+    // Cohort columns break the tie between two split reports, but never let a
+    // total-only report beat one that separates IAP from ad.
+    expect(chosen?.id).toBe('cohort');
+  });
+});

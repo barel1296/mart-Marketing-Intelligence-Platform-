@@ -468,14 +468,18 @@ async function auditApp(
   // two ways: every non-event row is a cohort row that says which age it is,
   // and the production event-date total equals the audit's own SUM over
   // event-date rows alone - cohort rows in the same window contribute nothing.
+  // Scoped to the bound attribution provider, as the production aggregate is,
+  // so a second provider's rows cannot make the two sums disagree for a
+  // reason that has nothing to do with grain.
   const cohortShapeRows = await queryRows<Row>(
     `SELECT count(*) FILTER (WHERE grain <> 'event_date')::text AS non_event,
             count(*) FILTER (WHERE grain = 'cohort_date' AND cohort_age_days IS NOT NULL)::text AS cohort,
             COALESCE(SUM(revenue) FILTER (WHERE grain = 'event_date'), 0)::text AS event_revenue,
             COALESCE(SUM(revenue) FILTER (WHERE grain <> 'event_date'), 0)::text AS other_revenue
        FROM attribution_revenue_metrics
-      WHERE app_id = $1 AND activity_date BETWEEN $2 AND $3`,
-    [appId, from, to],
+      WHERE app_id = $1 AND activity_date BETWEEN $2 AND $3
+        AND ($4::text IS NULL OR provider_key = $4)`,
+    [appId, from, to, attributionProviderKey],
   );
   const nonEvent = toNumber(cohortShapeRows[0]?.['non_event']);
   const cohortRows = toNumber(cohortShapeRows[0]?.['cohort']);

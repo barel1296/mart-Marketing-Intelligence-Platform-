@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { queryRows, toNumber } from '@mart/db';
+import { query, queryRows, toNumber } from '@mart/db';
 import { proveCohortCurrencyGate, type MetricContext, type MetricFilters } from '@mart/metrics';
 import {
   closeServer,
@@ -475,5 +475,93 @@ describe('cohort pipeline', () => {
       [ctx.appId],
     );
     expect(after[0]?.n).toBe(before[0]?.n);
+  });
+});
+
+describe('cohort coverage and storage guards', () => {
+  it('treats install days the revenue sync never read as unknown, on every side', async () => {
+    const ctx = await setup();
+    await syncAndReconcile(ctx);
+    // Forget what the revenue runs read. The rows are still there; what is
+    // gone is the evidence that any day was read after its cohort matured.
+    await query(
+      `UPDATE sync_runs SET checkpoint = checkpoint - 'dataWindows'
+        WHERE app_id = $1 AND data_type = 'attribution_revenue'`,
+      [ctx.appId],
+    );
+    const metrics = await metricsFor(ctx);
+    for (const key of [
+      'cohort_iap_revenue_d7',
+      'cohort_rpi_d7',
+      'cohort_iap_roas_d7',
+      'cohort_iap_revenue_d1',
+    ]) {
+      const m = metrics.get(key);
+      expect(m?.value, key).toBeNull();
+      expect(m?.availability, key).toBe('blocked');
+      expect(m?.blocker, key).toBe('provider_stale');
+      expect(m?.reason, key).toMatch(/unknown, not zero/);
+    }
+    // Event-date figures do not depend on cohort coverage.
+    expect(metrics.get('attributed_revenue')?.value).toBe(55);
+  });
+
+  it('excludes a day only the installs stream reached', async () => {
+    // A revenue run that only ever read up to B: the H-8 spend day and the H
+    // cohort are beyond what the revenue stream covered, so the denominator
+    // loses the 999 and the numerator is unchanged.
+    const ctx = await setup();
+    await syncAndReconcile(ctx);
+    await query(
+      `UPDATE sync_runs
+          SET checkpoint = jsonb_set(checkpoint, '{dataWindows}', jsonb_build_array(jsonb_build_object('from', $2::text, 'to', $3::text)))
+        WHERE app_id = $1 AND data_type = 'attribution_revenue'`,
+      [ctx.appId, A, B],
+    );
+    const metrics = await metricsFor(ctx);
+    const roas = metrics.get('cohort_iap_roas_d7');
+    expect(roas?.numerator).toBe(55);
+    expect(roas?.denominator).toBe(250);
+    expect(roas?.reason).toMatch(/1 of 3 install day\(s\) have not reached D7/);
+  });
+
+  it('does not add a provider total to the components it was later split into', async () => {
+    const ctx = await setup();
+    await syncAndReconcile(ctx);
+    const before = (await metricsFor(ctx)).get('cohort_revenue_d7')?.value;
+    const connection = await queryRows<{ id: string }>(
+      `SELECT connection_id AS id FROM attribution_revenue_metrics WHERE app_id = $1 LIMIT 1`,
+      [ctx.appId],
+    );
+    // The leftover a report gains its split leaves behind: a total for cohort
+    // A at D7, beside the iap and ad rows the later sync stored.
+    await query(
+      `INSERT INTO attribution_revenue_metrics
+         (organization_id, app_id, connection_id, provider_key, grain, activity_date, cohort_age_days,
+          revenue_type, media_source, normalized_media_source, external_campaign_id, campaign_name,
+          country, platform, currency, revenue, dimension_hash)
+       VALUES ($1, $2, $3, 'appsflyer', 'cohort_date', $4, 7, 'total', 'facebook', 'meta', '900',
+               'Summer US', 'US', 'ios', 'USD', 34, 'leftover-total')`,
+      [ctx.user.organizationId, ctx.appId, connection[0]?.id, A],
+    );
+    const after = (await metricsFor(ctx)).get('cohort_revenue_d7')?.value;
+    expect(after).toBe(before);
+  });
+
+  it('refuses a reporting timezone PostgreSQL would not recognize', async () => {
+    const user = await registerUser();
+    const response = await request(
+      user,
+      'POST',
+      `/api/v1/organizations/${user.organizationId}/apps`,
+      {
+        name: 'Bad zone',
+        platform: 'ios',
+        bundleId: 'com.example.badzone',
+        timezone: 'Europe/Lodnon',
+        defaultCurrency: 'USD',
+      },
+    );
+    expect(response.statusCode).toBe(400);
   });
 });

@@ -416,6 +416,8 @@ class FakeAttributionProvider implements AttributionProvider {
       rowsRejected: 0,
       warnings: [],
       latestDataDate: rows.at(-1)?.installDate ?? null,
+      // The fake answers the whole requested window, quiet days included.
+      coveredWindow: { from: params.from, to: params.to },
     };
   }
 }

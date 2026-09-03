@@ -13,11 +13,33 @@ import { mutationLimiter } from '../rateLimit.js';
 
 const createOrganizationSchema = z.object({ name: z.string().min(1).max(120) });
 
+/**
+ * An IANA zone name the runtime recognizes. The reporting timezone is now used
+ * inside SQL (`AT TIME ZONE`) to decide when a cohort was read, and PostgreSQL
+ * raises on a name it does not know - so a typo has to be refused at entry
+ * rather than surfacing as a failed metrics request later.
+ */
+const timezoneSchema = z
+  .string()
+  .min(1)
+  .max(64)
+  .refine(
+    (zone) => {
+      try {
+        new Intl.DateTimeFormat('en-US', { timeZone: zone });
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    { message: 'timezone must be a valid IANA zone name, e.g. Europe/London' },
+  );
+
 const createAppSchema = z.object({
   name: z.string().min(1).max(120),
   platform: z.enum(APP_PLATFORMS),
   bundleId: z.string().min(1).max(200),
-  timezone: z.string().min(1).max(64).optional(),
+  timezone: timezoneSchema.optional(),
   defaultCurrency: z
     .string()
     .regex(/^[A-Z]{3}$/, 'Currency must be a 3-letter ISO code')
@@ -26,7 +48,7 @@ const createAppSchema = z.object({
 
 const updateAppSchema = z.object({
   name: z.string().min(1).max(120).optional(),
-  timezone: z.string().min(1).max(64).optional(),
+  timezone: timezoneSchema.optional(),
   defaultCurrency: z
     .string()
     .regex(/^[A-Z]{3}$/)

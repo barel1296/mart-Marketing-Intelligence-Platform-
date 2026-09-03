@@ -619,7 +619,15 @@ const server = createServer((req, res) => {
       // The provider's data horizon: the last day it has rows for. A cohort
       // younger than N days reports its cumulative-so-far figure, as the
       // live account does - never null, never zero.
-      const horizon = new Date(`${to}T00:00:00Z`).getTime();
+      // Cohort columns are cumulative AS OF NOW, whatever window was asked for
+      // - a real account answers a request for last month with what those
+      // cohorts have earned to date, not what they had earned by the window's
+      // end. A chunked backfill would otherwise receive partial figures for
+      // cohorts that are in fact mature.
+      const horizon = Math.max(
+        new Date(`${to}T00:00:00Z`).getTime(),
+        new Date(new Date().toISOString().slice(0, 10) + 'T00:00:00Z').getTime(),
+      );
       // Cumulative by construction: what the cohort has earned through day
       // min(lived, age), on one accrual curve per cohort. So a D7 column read
       // at age 2 equals the D1 column plus day 2 - never less than D1.
