@@ -82,3 +82,41 @@ Phase 0B should still contain no agents and no AI. The specification's autonomou
 layer is only worth building on top of data an operator already trusts, and the
 fastest way to lose that trust is to automate a decision on a metric whose grain
 nobody checked.
+
+## Phase 2 — cohort intelligence (built)
+
+Phase 2 adds the cohort foundation Phase 0A left an explicit hole for, and
+nothing beyond it.
+
+**Ground truth established first, on a real Tenjin account (read-only):**
+`revenues_Nd`, `ad_mediation_revenue_Nd` and `pubrev_Nd` are cumulative cohort
+revenue keyed on the install day; a young cohort reports its cumulative-so-far
+value rather than null; the plain metric on the same row is event-date revenue
+and differs from `_0d`; `roas_Nd` is IAP LTV over the same campaign's spend on
+the same install day and is null for organic rows; `pltv_Nd` and `proas_Nd` are
+predictions.
+
+**Built:**
+
+- `cohort_date` grain rows in `attribution_revenue_metrics`, one per cohort,
+  component and age (D1, D7), from whichever `_Nd` metrics the saved report
+  carries. Event-date rows and every existing reader are untouched.
+- Cohort revenue, RPI and ROAS at D1 and D7 for IAP, ad and total - eighteen
+  registry metrics generated from one vocabulary, served in their own `cohort`
+  group of the unified performance object.
+- Maturity decided per row from the provider's data horizon and the row's own
+  last-read time; immature cohorts counted and excluded, never zero
+  (`immature_cohort` blocker).
+- Cohort ROAS anchored on the install day: numerator and denominator are the
+  same (campaign, install day) pairs, organic and unmapped cohorts in neither
+  side, currency checked across both sides.
+- Per-component cohort capabilities probed from the saved report definition,
+  refreshed after every revenue sync, so a missing provider field is reported
+  with the exact metric to add.
+- An in-sync data-quality check that cohort revenue is cumulative, and a
+  Phase 2 audit (`pnpm phase2-audit <org> <from> <to> [app]`) that recomputes
+  maturity, alignment, exclusions and the provider's own ROAS definition with
+  independent SQL, and proves the cohort currency gate inside a rollback.
+
+**Deliberately out of scope, still:** predicted LTV/ROAS, retention curves, ages
+beyond D7, forecasting, agents, and any write-back to a provider.

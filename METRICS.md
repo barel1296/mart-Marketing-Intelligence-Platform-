@@ -8,25 +8,27 @@ where it came from, what date grain it is expressed in, and how fresh it is.
 
 ## The registry
 
-| Key                            | Formula                                                                    | Grain            | Sources                     |
-| ------------------------------ | -------------------------------------------------------------------------- | ---------------- | --------------------------- |
-| `spend`                        | `SUM(spend)`                                                               | report date      | marketing network           |
-| `impressions`                  | `SUM(impressions)`                                                         | report date      | marketing network           |
-| `clicks`                       | `SUM(clicks)`                                                              | report date      | marketing network           |
-| `link_clicks`                  | `SUM(link_clicks)`                                                         | report date      | marketing network           |
-| `ctr`                          | `SUM(clicks) / SUM(impressions)`                                           | report date      | marketing network           |
-| `cpm`                          | `SUM(spend) / SUM(impressions) * 1000`                                     | report date      | marketing network           |
-| `cpc`                          | `SUM(spend) / SUM(clicks)`                                                 | report date      | marketing network           |
-| `attributed_installs`          | `SUM(attributed_installs)` — organic included                              | **install date** | MMP                         |
-| `mapped_paid_installs`         | `SUM(attributed_installs)` on mapped campaigns, organic excluded           | **install date** | MMP + reconciliation        |
-| `organic_installs`             | `SUM(attributed_installs) WHERE media_source = organic`                    | **install date** | MMP                         |
-| `attributed_revenue`           | `SUM(revenue) WHERE grain = event_date` — organic included                 | **event date**   | MMP                         |
-| `mapped_attributed_revenue`    | `SUM(revenue)` on mapped campaigns, organic excluded                       | **event date**   | MMP + reconciliation        |
-| `mapped_cpi`                   | `SUM(mapped spend)[report_date] / SUM(mapped installs)[install_date]`      | **mixed**        | both                        |
-| `blended_cpi`                  | `SUM(spend)[report_date] / SUM(all attributed installs)[install_date]`     | **mixed**        | both                        |
-| `mapping_coverage`             | `(matched_exact + matched_confident + manually_verified) / total_mappings` | n/a              | reconciliation              |
-| `operational_mapping_coverage` | `(authoritative + high-confidence name matches) / total_mappings`          | n/a              | reconciliation              |
-| `cohort_roas`                  | `cumulative_cohort_revenue / cohort_allocated_spend`                       | cohort date      | **unavailable in Phase 0A** |
+| Key                              | Formula                                                                         | Grain                                                   | Sources                               |
+| -------------------------------- | ------------------------------------------------------------------------------- | ------------------------------------------------------- | ------------------------------------- |
+| `spend`                          | `SUM(spend)`                                                                    | report date                                             | marketing network                     |
+| `impressions`                    | `SUM(impressions)`                                                              | report date                                             | marketing network                     |
+| `clicks`                         | `SUM(clicks)`                                                                   | report date                                             | marketing network                     |
+| `link_clicks`                    | `SUM(link_clicks)`                                                              | report date                                             | marketing network                     |
+| `ctr`                            | `SUM(clicks) / SUM(impressions)`                                                | report date                                             | marketing network                     |
+| `cpm`                            | `SUM(spend) / SUM(impressions) * 1000`                                          | report date                                             | marketing network                     |
+| `cpc`                            | `SUM(spend) / SUM(clicks)`                                                      | report date                                             | marketing network                     |
+| `attributed_installs`            | `SUM(attributed_installs)` — organic included                                   | **install date**                                        | MMP                                   |
+| `mapped_paid_installs`           | `SUM(attributed_installs)` on mapped campaigns, organic excluded                | **install date**                                        | MMP + reconciliation                  |
+| `organic_installs`               | `SUM(attributed_installs) WHERE media_source = organic`                         | **install date**                                        | MMP                                   |
+| `attributed_revenue`             | `SUM(revenue) WHERE grain = event_date` — organic included                      | **event date**                                          | MMP                                   |
+| `mapped_attributed_revenue`      | `SUM(revenue)` on mapped campaigns, organic excluded                            | **event date**                                          | MMP + reconciliation                  |
+| `mapped_cpi`                     | `SUM(mapped spend)[report_date] / SUM(mapped installs)[install_date]`           | **mixed**                                               | both                                  |
+| `blended_cpi`                    | `SUM(spend)[report_date] / SUM(all attributed installs)[install_date]`          | **mixed**                                               | both                                  |
+| `mapping_coverage`               | `(matched_exact + matched_confident + manually_verified) / total_mappings`      | n/a                                                     | reconciliation                        |
+| `operational_mapping_coverage`   | `(authoritative + high-confidence name matches) / total_mappings`               | n/a                                                     | reconciliation                        |
+| `cohort_{iap,ad,}revenue_d{1,7}` | `SUM(revenue at D{N})` over install cohorts in the window                       | cohort date                                             | mature cohorts only                   |
+| `cohort_{iap,ad,}rpi_d{1,7}`     | `SUM(revenue at D{N}) / SUM(installs)` of the same mature cohorts               | cohort date                                             | mature cohorts only                   |
+| `cohort_{iap,ad,}roas_d{1,7}`    | `SUM(aligned cohort revenue at D{N}) / SUM(spend on the cohorts' install days)` | cohort date (spend joined on report_date = install day) | see [Cohort metrics](#cohort-metrics) |
 
 ## Four rules
 
@@ -110,20 +112,58 @@ So MART reports what it can defend and names it precisely, rather than computing
 a plausible-looking CPI and letting the reader assume it is cohort-based. Cohort
 CPI, cohort ROAS and retention curves are Phase 0B/0C work.
 
-## Cohort ROAS is permanently unavailable in Phase 0A
+## Cohort metrics
 
-`cohort_roas` is in the registry with a permanent `unavailableReason`:
+Phase 2 replaced the permanent `cohort_roas` placeholder with eighteen cohort
+metrics generated from one vocabulary: three measures (revenue, RPI, ROAS) for
+three components (IAP, ad, total) at two ages (D1, D7). Every one of them is a
+**cohort fact**: its date is the install day, and its value is what that cohort
+had earned by day N, cumulatively. Nothing in this family is ever added to an
+event-date figure.
 
-> Cohort-matched spend is not available yet. MART will not divide report-date
-> spend by event-date revenue and call the result ROAS.
+What each rule protects, and how it is enforced:
 
-It is listed rather than hidden on purpose. The tile is where a user looks for
-ROAS; finding an explanation there is more useful than finding nothing, and far
-more useful than finding a number that divides two incompatible grains. That
-division would produce a figure that moves for reasons unrelated to return —
-a spend spike on day 30 makes "ROAS" fall even if every cohort is performing
-identically — and an incorrect ROAS tile is worse than no ROAS tile, because
-someone will spend money on it.
+- **A D7 number describes a cohort observed at day 7.** A row counts at age N
+  only if the install day plus N is strictly before the attribution provider's
+  data horizon _and_ the row was last read from the provider after that day.
+  Tenjin returns a cumulative-so-far value for a young cohort, and that value is
+  stored - but it is never presented as D7. Cohorts still growing are counted
+  and reported in the reason ("3 of 5 install days have not reached D7 ... not
+  counted as zero"); a window with no mature cohort is `blocked` with
+  `immature_cohort`, never zero.
+- **D1 and D7 are two facts.** Distinct rows, distinct identities
+  (`cohort_age_days` is part of the row's identity), distinct metric keys. They
+  are never derived from each other.
+- **Cohort ROAS divides by the spend that bought the cohort.** Numerator: paid
+  cohorts whose attribution campaign maps operationally to a marketing campaign
+  that spent on the cohort's install day. Denominator: that spend, on those
+  days, for those campaigns - `report_date = install day`, never the window's
+  spend. Spend on a mapped campaign's day that bought nothing stays in the
+  denominator: it returned nothing. The grain is declared mixed
+  (`cohort_date` + `report_date`) because that is what it is.
+- **Organic cohorts have no paid ROAS.** They carry no spend, so they are in
+  neither side. Filtering to organic yields cohort revenue and RPI, and a ROAS
+  that says "a return on spend does not exist for them" (`missing_denominator`).
+- **Unmapped and ambiguous cohorts borrow no spend.** Paid cohorts on campaigns
+  without an operational mapping are in neither side of any ROAS, and the
+  excluded amount is named in the reason.
+- **Two currencies are never added.** Revenue and RPI check the currencies of
+  the rows they read; ROAS checks revenue and spend together, so USD revenue
+  over JPY spend is `blocked` with `mixed_currency` even though each side is
+  single-currency.
+- **Missing provider fields are named, not zeroed.** Each metric requires the
+  probed capability `cohort_<type>_revenue_d<N>`, recorded from the saved
+  report definition. When the report lacks `revenues_7d`, the IAP and total
+  figures at D7 are `unavailable` with the exact metric to add to the report;
+  the ad figure is still served as ad.
+
+Cohort revenue matures in storage only if the cohort is re-read after reaching
+its age, so `SYNC_RESTATEMENT_LOOKBACK_DAYS` must be at least the oldest age
+served (7). The Phase 2 audit checks this.
+
+Not built, deliberately: predicted LTV or ROAS (`pltv_Nd`, `proas_Nd` are refused
+by pattern), retention, D30 and beyond (each age added needs a longer lookback),
+and any forecasting.
 
 ## Two coverage numbers
 

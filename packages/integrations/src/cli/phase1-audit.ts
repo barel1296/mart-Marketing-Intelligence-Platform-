@@ -463,17 +463,33 @@ async function auditApp(
     offGrain.length === 0,
     offGrain.length === 0 ? 'no off-grain rows' : 'off-grain rows present',
   );
-  // Cohort revenue must never be summed into an event-date total.
-  const cohortLeak = await queryRows<Row>(
-    `SELECT count(*)::text AS n FROM attribution_revenue_metrics
-      WHERE app_id = $1 AND grain <> 'event_date' AND activity_date BETWEEN $2 AND $3`,
+  // Cohort revenue must never be summed into an event-date total. Phase 2
+  // stores cohort rows beside the event-date ones, so "kept apart" is proven
+  // two ways: every non-event row is a cohort row that says which age it is,
+  // and the production event-date total equals the audit's own SUM over
+  // event-date rows alone - cohort rows in the same window contribute nothing.
+  const cohortShapeRows = await queryRows<Row>(
+    `SELECT count(*) FILTER (WHERE grain <> 'event_date')::text AS non_event,
+            count(*) FILTER (WHERE grain = 'cohort_date' AND cohort_age_days IS NOT NULL)::text AS cohort,
+            COALESCE(SUM(revenue) FILTER (WHERE grain = 'event_date'), 0)::text AS event_revenue,
+            COALESCE(SUM(revenue) FILTER (WHERE grain <> 'event_date'), 0)::text AS other_revenue
+       FROM attribution_revenue_metrics
+      WHERE app_id = $1 AND activity_date BETWEEN $2 AND $3`,
     [appId, from, to],
   );
+  const nonEvent = toNumber(cohortShapeRows[0]?.['non_event']);
+  const cohortRows = toNumber(cohortShapeRows[0]?.['cohort']);
+  line('non-event revenue rows in range', nonEvent);
+  line('  of which cohort rows with an age', cohortRows);
   assert(
     ctx,
     'event and cohort revenue kept apart',
-    toNumber(cohortLeak[0]?.['n']) === 0,
-    `${cohortLeak[0]?.['n'] ?? '0'} non-event-date revenue row(s) in range`,
+    nonEvent === cohortRows &&
+      Math.abs(toNumber(cohortShapeRows[0]?.['event_revenue']) - attribution.attributedRevenue) <=
+        1e-6,
+    nonEvent === cohortRows
+      ? `event-date total ${attribution.attributedRevenue} equals SUM over event rows alone; ${cohortRows} cohort row(s) worth ${cohortShapeRows[0]?.['other_revenue']} excluded`
+      : `${nonEvent - cohortRows} non-event row(s) are not cohort rows with an age`,
   );
 
   // ---------------------------------------------------------- currency ----

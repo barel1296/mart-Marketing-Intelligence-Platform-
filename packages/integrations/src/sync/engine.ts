@@ -386,6 +386,49 @@ export async function runSync(run: SyncRunRow, request: SyncRequest): Promise<Sy
     lastErrorClass: failure?.errorClass ?? null,
   });
 
+  // Which cohort components the account's report carries is a property of the
+  // operator's saved report, which can change without MART being told. After
+  // every successful revenue sync the account is re-probed - the same
+  // read-only discovery the sync itself just used - so a cohort figure that
+  // says "unavailable: add revenues_7d" is describing the report as it is now,
+  // and starts computing on the sync after the operator adds the metric.
+  if (
+    succeeded &&
+    !support &&
+    request.dataType === 'attribution_revenue' &&
+    provider &&
+    isAttributionProvider(provider)
+  ) {
+    try {
+      const bindings = await integrationsRepo.listAppBindings(
+        request.organizationId,
+        request.appId,
+      );
+      const binding = bindings.find((b) => b.connection_id === request.connectionId);
+      if (binding?.integration_account_id) {
+        const capabilities = await provider.getCapabilities(request.externalAccountId);
+        await integrationsRepo.replaceCapabilities({
+          organizationId: request.organizationId,
+          connectionId: request.connectionId,
+          integrationAccountId: binding.integration_account_id,
+          capabilities: capabilities.map((c) => ({
+            key: c.key,
+            supported: c.supported,
+            discoveryMethod: c.discoveryMethod,
+            ...(c.detail ? { detail: c.detail } : {}),
+          })),
+        });
+      }
+    } catch (error) {
+      // The rows are stored and the run succeeded; a capability row that is a
+      // sync behind is a degraded label, not a failed ingestion.
+      log.warn(
+        { errorClass: isProviderError(error) ? error.errorClass : 'unknown' },
+        'capability refresh after revenue sync failed; existing capability rows kept',
+      );
+    }
+  }
+
   if (request.syncJobId) await syncRepo.setSyncJobStatus(request.syncJobId, status);
 
   // Connection health follows the run: an authentication failure should surface

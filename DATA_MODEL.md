@@ -10,12 +10,12 @@ cannot apply the same migration twice.
 Three different date meanings appear in marketing data, and conflating them
 produces numbers that look plausible and are wrong.
 
-| Grain          | Meaning                                             | Source                     |
-| -------------- | --------------------------------------------------- | -------------------------- |
-| `report_date`  | The day the ad network reported delivery and cost   | Marketing network          |
-| `install_date` | The day a user installed, per the MMP's attribution | MMP                        |
-| `event_date`   | The day an in-app event or purchase occurred        | MMP                        |
-| `cohort_date`  | The install day a later event is credited back to   | _not produced in Phase 0A_ |
+| Grain          | Meaning                                                                                                                                                        | Source                                                                                                              |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `report_date`  | The day the ad network reported delivery and cost                                                                                                              | Marketing network                                                                                                   |
+| `install_date` | The day a user installed, per the MMP's attribution                                                                                                            | MMP                                                                                                                 |
+| `event_date`   | The day an in-app event or purchase occurred                                                                                                                   | MMP                                                                                                                 |
+| `cohort_date`  | An install cohort observed at a fixed age: `activity_date` is the install day, `cohort_age_days` (1 or 7) the age, `revenue` the cumulative figure at that age | `attribution_revenue_metrics` (Phase 2; one row per cohort, component and age, never summed with `event_date` rows) |
 
 MART keeps them in **separate tables**, each pinned by a `CHECK` constraint:
 
@@ -23,7 +23,8 @@ MART keeps them in **separate tables**, each pinned by a `CHECK` constraint:
 marketing_daily_metrics    grain CHECK (grain = 'report_date')
 attribution_daily_metrics  grain CHECK (grain = 'install_date')
 attribution_event_metrics  event_date  -- event grain by construction
-attribution_revenue_metrics grain CHECK (grain IN ('event_date','install_date'))
+attribution_revenue_metrics grain CHECK (grain IN ('event_date','install_date','cohort_date'))
+                            -- and: cohort_date rows carry cohort_age_days, others never do
 ```
 
 This is structural, not conventional: a bug cannot write install-date rows into

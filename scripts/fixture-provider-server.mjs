@@ -77,6 +77,18 @@ const TENJIN_SAVED_REPORTS = [
       'ad_mediation_revenue',
       'total_rev',
       'spend',
+      // Cumulative cohort revenue, the way the real catalogue carries it:
+      // `date` is the install day and `_Nd` is what that cohort had earned N
+      // days later. The fixture returns the cumulative-so-far figure for a
+      // cohort younger than N, exactly as the live account does.
+      'revenues_1d',
+      'revenues_7d',
+      'ad_mediation_revenue_1d',
+      'ad_mediation_revenue_7d',
+      // Tenjin's own IAP cohort ROAS: revenues_7d / spend * 100, same
+      // campaign and same install day. Kept so an audit can cross-check
+      // MART's alignment rule against the provider's.
+      'roas_7d',
     ],
     granularity: 'daily',
     // The provider's own saved-report spelling: an underscore, not a comma.
@@ -494,6 +506,7 @@ const server = createServer((req, res) => {
   if (
     tenjinPath === '/apps' ||
     tenjinPath.startsWith('/apps/') ||
+    tenjinPath === '/campaigns' ||
     tenjinPath === '/saved_reports' ||
     tenjinPath.startsWith('/saved_reports/') ||
     tenjinPath.startsWith('/reports/')
@@ -525,6 +538,34 @@ const server = createServer((req, res) => {
               store_id: 'id000000000',
             },
           },
+        },
+        headers,
+      );
+    }
+
+    // The campaign directory. `remote_campaign_id` is the ad network's own id
+    // for what Tenjin calls a campaign - on a real Meta account that is the
+    // AD SET id, never the campaign id, which is why MART resolves it at
+    // ad-group level first. Reproduced here so reconciliation lands on a
+    // stable identifier rather than a name, as it does on a live account.
+    if (tenjinPath === '/campaigns') {
+      if (q.get('app_id') !== TENJIN_APP) return json(res, 200, { data: [] }, headers);
+      return json(
+        res,
+        200,
+        {
+          data: CAMPAIGNS.slice(0, 2).map((campaign) => ({
+            id: `FIXTURE-TENJIN-${campaign.id}`,
+            type: 'campaign',
+            attributes: {
+              id: `FIXTURE-TENJIN-${campaign.id}`,
+              name: campaign.name,
+              remote_campaign_id: `${campaign.id}_AS1`,
+              channel_id: 3,
+              channel_name: 'Meta',
+            },
+          })),
+          has_more: false,
         },
         headers,
       );
@@ -575,9 +616,34 @@ const server = createServer((req, res) => {
       if (!from || !to) return json(res, 400, { error: 'date range required' }, headers);
 
       const data = [];
+      // The provider's data horizon: the last day it has rows for. A cohort
+      // younger than N days reports its cumulative-so-far figure, as the
+      // live account does - never null, never zero.
+      const horizon = new Date(`${to}T00:00:00Z`).getTime();
+      // Cumulative by construction: what the cohort has earned through day
+      // min(lived, age), on one accrual curve per cohort. So a D7 column read
+      // at age 2 equals the D1 column plus day 2 - never less than D1.
+      const accrued = (perInstall, installs, days) =>
+        Math.round(perInstall * installs * (1 - Math.pow(0.7, days + 1)) * 1000) / 1000;
+      const cohortValue = (perInstall, installs, date, age) => {
+        const lived = Math.floor((horizon - new Date(`${date}T00:00:00Z`).getTime()) / 86400000);
+        return accrued(perInstall, installs, Math.min(Math.max(lived, 0), age));
+      };
       for (const date of daysIn(from, to)) {
         for (const campaign of CAMPAIGNS.slice(0, 2)) {
           const d = delivery(date, campaign, null);
+          const tracked = Math.round(d.installs * 0.82);
+          // Cumulative: what the cohort had earned by D1 and by D7, with
+          // D7 >= D1 by construction. Country-split delivery is summed on the
+          // Meta side, so the Tenjin spend here is the campaign-day total.
+          const spend = COUNTRIES.reduce(
+            (sum, country) => sum + delivery(date, campaign, country).spend,
+            0,
+          );
+          const iapD1 = cohortValue(0.9, tracked, date, 1);
+          const iapD7 = cohortValue(0.9, tracked, date, 7);
+          const adD1 = cohortValue(0.3, tracked, date, 1);
+          const adD7 = cohortValue(0.3, tracked, date, 7);
           data.push({
             type: 'report',
             // Rows are JSON:API resources: the metrics live under attributes.
@@ -593,7 +659,7 @@ const server = createServer((req, res) => {
               ad_network_name: 'Meta',
               country: 'US',
               platform: 'ios',
-              tracked_installs: Math.round(d.installs * 0.82),
+              tracked_installs: tracked,
               tracked_clicks: d.clicks,
               tracked_impressions: d.impressions,
               revenues: Math.round(d.installs * 0.9 * 100) / 100,
@@ -601,10 +667,47 @@ const server = createServer((req, res) => {
               // total_rev does not include it - it is revenues + pub_rev.
               ad_mediation_revenue: Math.round(d.installs * 0.21 * 1000) / 1000,
               total_rev: Math.round(d.installs * 0.9 * 100) / 100,
-              spend: null,
+              spend: Math.round(spend * 100) / 100,
+              revenues_1d: iapD1,
+              revenues_7d: iapD7,
+              ad_mediation_revenue_1d: adD1,
+              ad_mediation_revenue_7d: adD7,
+              // Tenjin's definition, reproduced: IAP LTV over the spend on
+              // the same campaign and install day, as a percentage.
+              roas_7d: spend > 0 ? Math.round((iapD7 / spend) * 100 * 10000) / 10000 : null,
             },
           });
         }
+        // Organic installs: the app's own id as the campaign, no network and
+        // no spend. Real cohorts that must never acquire a paid ROAS.
+        const organic = delivery(date, { id: 'ORGANIC' }, null);
+        const organicInstalls = Math.round(organic.installs * 0.3);
+        data.push({
+          type: 'report',
+          attributes: {
+            date,
+            app_id: TENJIN_APP,
+            app_name: 'FIXTURE Tenjin App (synthetic)',
+            campaign_id: TENJIN_APP,
+            name: 'Organic',
+            ad_network_id: null,
+            ad_network_name: 'Organic',
+            country: 'US',
+            platform: 'ios',
+            tracked_installs: organicInstalls,
+            tracked_clicks: null,
+            tracked_impressions: null,
+            revenues: Math.round(organicInstalls * 0.5 * 100) / 100,
+            ad_mediation_revenue: Math.round(organicInstalls * 0.1 * 1000) / 1000,
+            total_rev: Math.round(organicInstalls * 0.5 * 100) / 100,
+            spend: null,
+            revenues_1d: cohortValue(0.5, organicInstalls, date, 1),
+            revenues_7d: cohortValue(0.5, organicInstalls, date, 7),
+            ad_mediation_revenue_1d: cohortValue(0.12, organicInstalls, date, 1),
+            ad_mediation_revenue_7d: cohortValue(0.12, organicInstalls, date, 7),
+            roas_7d: null,
+          },
+        });
       }
       return json(res, 200, { data, links: { next: null } }, headers);
     }

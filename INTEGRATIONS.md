@@ -273,10 +273,21 @@ unreachable there). Whatever the API does, MART reports what it received.
   `revenue_type=total`, never relabelled as IAP or ad: storage sums every
   revenue row for a date, so a total beside its own parts would double-count.
 
-- **Not imported**: `*_Nd` cohort metrics (`revenues_Nd`, `roas_Nd`,
-  `retention_Nd`). Tenjin declares `cohort_reporting: true` as a capability, but
-  Phase 0A does not import cohort data — declaring a capability is not the same as
-  using it, and cohort ROAS remains unavailable (see [METRICS.md](METRICS.md)).
+- **Cohort revenue (Phase 2)**: `revenues_Nd`, `ad_mediation_revenue_Nd` /
+  `pubrev_Nd` and the two matching totals are imported at `cohort_date` grain for
+  N in {1, 7}, from whichever of them the saved report definition carries. The
+  row's `date` is the install day and the value is cumulative
+  (`cohort_type: cumulative` in Tenjin's catalogue; verified on a real account:
+  `_0d <= _1d <= _7d` on every row, and a cohort installed today reports the same
+  figure at every age). Which components the report can supply is probed per
+  component and age (`cohort_iap_revenue_d7` and friends) at account selection
+  and again after every successful revenue sync, so a cohort metric can name
+  the exact metric to add to the saved report. MART never edits the report.
+  Tenjin's `spend` is not stored (cost comes from the marketing network); its
+  `roas_Nd` (IAP LTV over same-day spend) is kept in the raw payload and used by
+  the Phase 2 audit as a cross-check of MART's alignment rule.
+- **Never imported**: `pltv_Nd`, `proas_Nd` (predicted), `retention_Nd`, and any
+  age beyond D7 (see [METRICS.md](METRICS.md#cohort-metrics)).
 
 ### The campaign directory settles what names cannot — at whichever level it means
 
