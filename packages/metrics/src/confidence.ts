@@ -41,6 +41,13 @@ export type ConfidenceInputs = {
   sampleSize?: number | null;
   /** The denominator this metric's definition considers meaningful. */
   minimumSample?: number;
+  /**
+   * Components assessed by the caller, multiplied in like the others. The
+   * decision layer adds maturity (mature days over all cohort days) and
+   * mapping strength here, so a recommendation's confidence decomposes the
+   * same way a metric's does.
+   */
+  additional?: ConfidenceComponent[];
 };
 
 /**
@@ -105,6 +112,14 @@ export function scoreConfidence(inputs: ConfidenceInputs): MetricConfidence {
         minimum <= 0
           ? `${inputs.sampleSize} row(s) behind this figure.`
           : `${inputs.sampleSize} of the ${minimum} the definition considers meaningful.`,
+    });
+  }
+
+  for (const component of inputs.additional ?? []) {
+    components.push({
+      input: component.input,
+      score: Math.max(0, Math.min(1, component.score)),
+      detail: component.detail,
     });
   }
 

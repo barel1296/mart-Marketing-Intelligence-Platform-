@@ -10,6 +10,8 @@ export * as factsRepo from './repositories/facts.js';
 export * as mappingsRepo from './repositories/mappings.js';
 export * as auditRepo from './repositories/audit.js';
 export * as dataQualityRepo from './repositories/dataQuality.js';
+export * as decisionsRepo from './repositories/decisions.js';
+export type { DecisionPolicyRow, DecisionPolicyUpsert } from './repositories/decisions.js';
 
 // Pure helpers that are part of the canonical model rather than persistence.
 export {

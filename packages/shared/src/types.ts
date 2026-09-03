@@ -527,6 +527,84 @@ export const METRIC_POPULATIONS = [
 ] as const;
 export type MetricPopulation = (typeof METRIC_POPULATIONS)[number];
 
+/**
+ * Decision signals - Phase 3.
+ *
+ * Five words, deliberately. A signal is the deterministic reading of trusted
+ * metrics against an operator-configured policy; it is never an action, and
+ * nothing in MART executes one. `scale` and `reduce` exist only where the data
+ * is fresh, mature, mapped, single-currency and above the volume floors and a
+ * target is configured; everything else resolves to `hold`, `investigate` or
+ * `insufficient_data`, each with its evidence.
+ */
+export const DECISION_SIGNALS = [
+  'scale',
+  'hold',
+  'reduce',
+  'investigate',
+  'insufficient_data',
+] as const;
+export type DecisionSignal = (typeof DECISION_SIGNALS)[number];
+
+/**
+ * What a signal is about. A tracking problem and a marketing-performance
+ * problem must never wear the same label: the first is fixed in a pipeline,
+ * the second with money.
+ */
+export const DECISION_CATEGORIES = [
+  'performance',
+  'data_quality',
+  'pacing',
+  'coverage',
+  /** MART could not tell whether the cause is data or performance, and says so. */
+  'undetermined',
+] as const;
+export type DecisionCategory = (typeof DECISION_CATEGORIES)[number];
+
+/**
+ * How an anomaly is classified once the data around it has been checked.
+ *
+ * - delivery      the marketing network delivered differently (spend moved)
+ * - attribution   installs moved while delivery did not, with no data gap
+ *                 MART can point at - the SDK or the MMP may be the cause
+ * - data_gap      MART did not read, or could not read, that day
+ * - monetization  event-date revenue moved
+ * - undetermined  MART cannot tell which; says so rather than guessing
+ */
+export const ANOMALY_CLASSIFICATIONS = [
+  'delivery',
+  'attribution',
+  'data_gap',
+  'monetization',
+  'undetermined',
+] as const;
+export type AnomalyClassification = (typeof ANOMALY_CLASSIFICATIONS)[number];
+
+/**
+ * Why a scale or reduce signal could not be issued.
+ *
+ * Every metric blocker applies unchanged - a recommendation drawn from a
+ * blocked figure inherits the figure's blocker - plus the conditions that
+ * exist only once a figure is read against a policy.
+ */
+export const DECISION_BLOCKERS = [
+  ...METRIC_BLOCKERS,
+  /** An error-severity data-quality finding was recorded inside the window. */
+  'data_quality_finding',
+  /** A day inside the window moved in a way MART cannot attribute to delivery. */
+  'anomalous_data',
+  /** The operator has stored no target this figure could be judged against. */
+  'no_target',
+  /** Only one revenue component is reported, so the full return is unknown. */
+  'partial_return',
+  /** The newest mature days contradict the reading drawn from the whole window. */
+  'trend_contradicts',
+] as const;
+export type DecisionBlocker = (typeof DECISION_BLOCKERS)[number];
+
+/** Bumped whenever a rule changes, so a stored or audited recommendation says which rules produced it. */
+export const DECISION_RULE_VERSION = 'phase3.v1';
+
 export type Iso8601 = string;
 /** Calendar date in YYYY-MM-DD, always interpreted in the app's reporting timezone. */
 export type IsoDate = string;

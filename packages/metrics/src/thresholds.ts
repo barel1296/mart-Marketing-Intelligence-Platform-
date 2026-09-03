@@ -56,3 +56,43 @@ export const CONFIDENCE_THRESHOLDS = {
   /** At or above this, the figure is usable with its caveats in view. */
   medium: 0.5,
 } as const;
+
+/**
+ * Where the decision layer draws its lines - Phase 3.
+ *
+ * Every number here is a floor or a band, never a target: targets are the
+ * operator's business inputs and live in the app's decision policy. These say
+ * how much data a signal needs before it may exist at all, and how far a
+ * figure has to move before MART calls the movement real.
+ */
+export const DECISION_THRESHOLDS = {
+  /** Spend (in the app's currency) over the mature days a signal is drawn from. */
+  minimumSpend: 50,
+  /** Mature, mapped, paid installs behind a scale/reduce/hold reading. */
+  minimumInstalls: MINIMUM_RATIO_DENOMINATORS.installs,
+  /** Mature days with delivery behind a reading; one big day is an anecdote. */
+  minimumMatureDays: 3,
+  /**
+   * Band around a target inside which a figure is "at target". A cohort ROAS
+   * of 0.52 against a target of 0.5 is not a reason to do anything.
+   */
+  tolerancePct: 15,
+  /** Mature days in each half of a trend comparison. */
+  trendWindowDays: 7,
+  /** Below this relative change a trend is reported as stable. */
+  trendMaterialChangePct: 20,
+  /** Days of history a day is judged against. */
+  anomalyBaselineDays: 14,
+  /** Fewer baseline points than this and no anomaly can be called. */
+  anomalyMinimumBaselinePoints: 7,
+  /** Robust z-score (MAD-scaled) at which a day is anomalous. */
+  anomalyRobustZ: 3.5,
+  /** ...and it must also differ from the baseline median by at least this share. */
+  anomalyMinimumRelativeDeviation: 0.3,
+  /** ...and by at least this much in absolute terms, so noise on a tiny day is not an alarm. */
+  anomalyMinimumAbsolute: { spend: 20, installs: 20, revenue: 20 },
+  /** Average daily spend below this share of the daily budget is under-pacing. */
+  pacingUnderRatio: 0.5,
+  /** Above this share is over-pacing; networks may exceed a daily budget by a margin. */
+  pacingOverRatio: 1.25,
+} as const;

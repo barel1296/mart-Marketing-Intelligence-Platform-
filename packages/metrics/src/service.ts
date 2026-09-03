@@ -545,7 +545,7 @@ export function emptyCohortAggregate(asOf: IsoDate | null = null): CohortAggrega
  * report, a failed window or a sync that has not run yet from reading as
  * "these cohorts earned nothing".
  */
-function revenueCovered(input: {
+export function revenueCovered(input: {
   alias: string;
   dayExpr: string;
   ageParam: string;
