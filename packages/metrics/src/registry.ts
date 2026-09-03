@@ -1,4 +1,6 @@
 import type {
+  CohortAge,
+  CohortRevenueType,
   MetricAggregation,
   MetricAvailability,
   MetricBlocker,
@@ -8,6 +10,8 @@ import type {
   MetricPopulation,
   MetricUnit,
 } from '@mart/shared';
+import { COHORT_AGES, COHORT_REVENUE_TYPES, cohortCapabilityKey } from '@mart/shared';
+import { MINIMUM_RATIO_DENOMINATORS } from './thresholds.js';
 
 /**
  * Governed metric registry.
@@ -81,7 +85,152 @@ export type MetricDefinition = {
    * instead of a wrong number.
    */
   unavailableReason?: string;
+  /**
+   * Present on cohort metrics: which cohort age, which revenue component and
+   * which measure the key describes. The metric layer dispatches on this
+   * rather than on the key, so D1 and D7 are handled by one rule and cannot
+   * drift apart.
+   */
+  cohort?: CohortMetricSpec;
 };
+
+export type CohortMeasure = 'revenue' | 'rpi' | 'roas';
+
+export type CohortMetricSpec = {
+  ageDays: CohortAge;
+  revenueType: CohortRevenueType;
+  measure: CohortMeasure;
+};
+
+/** `cohort_ad_revenue_d7`, `cohort_rpi_d1`, `cohort_roas_d7` - the total form drops the type. */
+export function cohortMetricKey(spec: CohortMetricSpec): string {
+  const type = spec.revenueType === 'total' ? '' : `${spec.revenueType}_`;
+  return `cohort_${type}${spec.measure}_d${spec.ageDays}`;
+}
+
+const COHORT_TYPE_LABEL: Record<CohortRevenueType, string> = {
+  iap: 'IAP',
+  ad: 'ad',
+  total: 'total',
+};
+
+/**
+ * The cohort metric set, generated from the vocabulary rather than written out
+ * eighteen times.
+ *
+ * Three measures per (age, component):
+ *
+ *   revenue  cumulative revenue of the cohorts that installed in the window,
+ *            measured D{N} after install. Paid and organic alike - it is a
+ *            fact about the app's cohorts, not about a campaign.
+ *   rpi      that revenue per install of the same cohorts. Same population on
+ *            both sides, both restricted to cohorts old enough to have a D{N}.
+ *   roas     cohort revenue over the spend that acquired the cohort. Numerator:
+ *            paid cohorts whose attribution campaign maps operationally to a
+ *            marketing campaign that spent on the cohort's install day.
+ *            Denominator: that spend, on those days, for those campaigns.
+ *            Organic cohorts have no spend and are in neither side; unmapped
+ *            and ambiguous cohorts are in neither side either, because they
+ *            cannot borrow another campaign's spend.
+ *
+ * Every entry requires the capability that says the account's report actually
+ * carries the component at that age, so a missing provider field is reported
+ * as exactly that rather than as zero revenue.
+ */
+function cohortDefinitions(): MetricDefinition[] {
+  const out: MetricDefinition[] = [];
+  for (const ageDays of COHORT_AGES) {
+    for (const revenueType of COHORT_REVENUE_TYPES) {
+      const label = COHORT_TYPE_LABEL[revenueType];
+      const component =
+        revenueType === 'total'
+          ? 'IAP plus ad revenue for the same cohort, only when both were reported'
+          : `${label} revenue only`;
+      const capability = cohortCapabilityKey(revenueType, ageDays);
+      const cohortNote = `Install cohorts inside the reporting window, measured ${ageDays} day(s) after install. A cohort younger than D${ageDays} as of the provider's data horizon is excluded and counted, never treated as zero.`;
+
+      out.push({
+        metricKey: cohortMetricKey({ ageDays, revenueType, measure: 'revenue' }),
+        displayName: `D${ageDays} cohort ${label} revenue`,
+        description: `Cumulative ${component} earned by the install cohorts in the window during their first ${ageDays} day(s). A cohort fact: it says what the cohort had earned by D${ageDays}, not what was earned on any calendar day.`,
+        formula: `SUM(${revenueType} revenue at D${ageDays}) over cohorts installed in the window`,
+        family: 'cohort',
+        unit: 'currency',
+        aggregation: 'sum',
+        semanticClass: 'cohort',
+        population: {
+          numerator: 'all_attribution',
+          note: `${cohortNote} Paid and organic cohorts alike.`,
+        },
+        grain: {
+          primary: 'cohort_date',
+          note: `Cohort grain: the row's date is the install day and the value is cumulative at D${ageDays}. Never summed with event-date revenue.`,
+        },
+        sources: ['attribution'],
+        requiredCapabilities: ['cohort_reporting', capability],
+        minimumDenominator: 0,
+        format: 'currency',
+        maxAcceptableStalenessMinutes: 24 * 60,
+        cohort: { ageDays, revenueType, measure: 'revenue' },
+      });
+
+      out.push({
+        metricKey: cohortMetricKey({ ageDays, revenueType, measure: 'rpi' }),
+        displayName: `D${ageDays} cohort RPI (${label})`,
+        description: `Cumulative ${component} per install for the cohorts in the window, ${ageDays} day(s) after install. Both sides are the same cohorts; both exclude cohorts too young to have a D${ageDays}.`,
+        formula: `SUM(${revenueType} revenue at D${ageDays}) / SUM(installs) over mature cohorts installed in the window`,
+        family: 'cohort',
+        unit: 'currency',
+        aggregation: 'ratio_of_sums',
+        semanticClass: 'cohort',
+        population: {
+          numerator: 'all_attribution',
+          denominator: 'all_attribution',
+          note: `${cohortNote} Revenue and installs come from the same cohorts, paid and organic alike.`,
+        },
+        grain: {
+          primary: 'cohort_date',
+          note: `Cohort grain on both sides: revenue at D${ageDays} over the installs of the same install days.`,
+        },
+        sources: ['attribution'],
+        requiredCapabilities: ['cohort_reporting', 'attributed_installs', capability],
+        minimumDenominator: MINIMUM_RATIO_DENOMINATORS.installs,
+        format: 'currency',
+        maxAcceptableStalenessMinutes: 24 * 60,
+        cohort: { ageDays, revenueType, measure: 'rpi' },
+      });
+
+      out.push({
+        metricKey: cohortMetricKey({ ageDays, revenueType, measure: 'roas' }),
+        displayName: `D${ageDays} cohort ROAS (${label})`,
+        description: `Cumulative ${component} of paid cohorts at D${ageDays}, divided by the marketing spend on the install day of those same cohorts, for the same campaigns. Organic cohorts have no spend and are in neither side; cohorts on unmapped or ambiguous campaigns are in neither side, because they cannot borrow another campaign's spend.`,
+        formula: `SUM(${revenueType} revenue at D${ageDays} of cohort-aligned paid cohorts) / SUM(spend on report_date = install day for the mapped campaigns)`,
+        family: 'cohort',
+        unit: 'ratio',
+        aggregation: 'ratio_of_sums',
+        semanticClass: 'cohort',
+        population: {
+          numerator: 'cohort_aligned_paid_attribution',
+          denominator: 'cohort_aligned_marketing',
+          note: `${cohortNote} Numerator: paid cohorts whose campaign maps operationally to a marketing campaign that spent on the cohort's install day. Denominator: that spend on those days for those campaigns. Both sides are the same (campaign, install day) pairs.`,
+        },
+        grain: {
+          primary: 'cohort_date',
+          mixed: ['cohort_date', 'report_date'],
+          note: `Spend is report-date grain, joined on report_date = the cohort's install day, so both sides describe the same acquisition day. Never window spend over cohort revenue.`,
+        },
+        sources: ['marketing', 'attribution', 'mapping'],
+        requiredCapabilities: ['cohort_reporting', 'cost_data', capability],
+        // One unit of currency: below that there was no acquisition to return on.
+        minimumDenominator: 1,
+        format: 'ratio',
+        maxAcceptableStalenessMinutes: 24 * 60,
+        cohort: { ageDays, revenueType, measure: 'roas' },
+      });
+    }
+  }
+  return out;
+}
 
 export const METRIC_DEFINITIONS: readonly MetricDefinition[] = [
   {
@@ -631,35 +780,10 @@ export const METRIC_DEFINITIONS: readonly MetricDefinition[] = [
     format: 'percent',
     maxAcceptableStalenessMinutes: 24 * 60,
   },
-  {
-    metricKey: 'cohort_roas',
-    displayName: 'Cohort ROAS',
-    description:
-      'Cumulative cohort revenue divided by the spend that acquired that cohort. Requires cohort-matched spend, which MART does not compute in Phase 0A.',
-    formula: 'cumulative_cohort_revenue / cohort_allocated_spend',
-    family: 'cohort',
-    unit: 'ratio',
-    aggregation: 'ratio_of_sums',
-    semanticClass: 'cohort',
-    population: {
-      numerator: 'delivery_aligned_paid_attribution',
-      denominator: 'current_period_marketing',
-      note: 'Cohort revenue over the spend that acquired the cohort. Both sides must be anchored on the same install cohort, which is why this stays uncomputed while only report-date spend exists.',
-    },
-    grain: {
-      primary: 'cohort_date',
-      note: 'Cohort grain. Both numerator and denominator must be anchored to the same install cohort.',
-    },
-    sources: ['marketing', 'attribution'],
-    requiredCapabilities: ['cohort_reporting'],
-    minimumDenominator: 1,
-    format: 'ratio',
-    maxAcceptableStalenessMinutes: 24 * 60,
-    // Deliberate: showing report-date spend over event-date revenue would be a
-    // plausible-looking, mathematically invalid number.
-    unavailableReason:
-      'Cohort-matched spend is not available yet. MART will not divide report-date spend by event-date revenue and call the result ROAS.',
-  },
+  // Cohort revenue, RPI and ROAS at D1 and D7, per component. Generated from
+  // the cohort vocabulary; see cohortDefinitions for what each one means and
+  // why cohort ROAS is anchored on the install day rather than the window.
+  ...cohortDefinitions(),
 ] as const;
 
 const BY_KEY = new Map(METRIC_DEFINITIONS.map((m) => [m.metricKey, m]));

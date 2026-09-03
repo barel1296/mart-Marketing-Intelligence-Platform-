@@ -2828,7 +2828,10 @@ describe('dashboard data', () => {
     expect(metrics.get('blended_cpi')?.grain.mixed).toEqual(['report_date', 'install_date']);
   });
 
-  it('refuses to present cohort ROAS', async () => {
+  it('never presents a cohort ROAS built from window spend and event-date revenue', async () => {
+    // Spend and event-date revenue both exist for this window. No cohort in
+    // it is seven days old as of the provider's data horizon, so the only
+    // honest D7 answer is "not yet" - not spend / revenue, and not zero.
     const ctx = await setup();
     await triggerSync(ctx, '2026-08-20', '2026-08-21');
     const response = await request(
@@ -2836,19 +2839,24 @@ describe('dashboard data', () => {
       'GET',
       `/api/v1/organizations/${ctx.user.organizationId}/apps/${ctx.appId}/metrics?from=2026-08-20&to=2026-08-21`,
     );
-    const roas = (
+    const metrics = (
       response.json() as {
         metrics: Array<{
           metricKey: string;
           value: number | null;
           availability: string;
+          blocker?: string;
           reason?: string;
         }>;
       }
-    ).metrics.find((m) => m.metricKey === 'cohort_roas');
-    expect(roas?.value).toBeNull();
-    expect(roas?.availability).toBe('unavailable');
-    expect(roas?.reason).toMatch(/cohort-matched spend/i);
+    ).metrics;
+    for (const key of ['cohort_roas_d7', 'cohort_iap_roas_d7', 'cohort_revenue_d7']) {
+      const value = metrics.find((m) => m.metricKey === key);
+      expect(value?.value, key).toBeNull();
+      expect(value?.availability, key).toBe('blocked');
+      expect(value?.blocker, key).toBe('immature_cohort');
+      expect(value?.reason, key).toMatch(/it is not zero/);
+    }
   });
 
   it('keeps marketing and attribution series on separate, labelled grains', async () => {

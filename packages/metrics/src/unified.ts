@@ -1,6 +1,7 @@
 import type { MetricBlocker, ReportingWindow } from '@mart/shared';
 import {
   loadAttributionAggregate,
+  loadCohortAggregate,
   loadMarketingAggregate,
   computeMetricValues,
   type MetricContext,
@@ -43,6 +44,13 @@ export type UnifiedPerformance = {
   revenue: MetricGroup;
   efficiency: MetricGroup;
   coverage: MetricGroup;
+  /**
+   * Cohort figures: D1/D7 revenue, RPI and ROAS. A different class of
+   * measurement from everything above - a group of users followed over time
+   * rather than a window of activity - and grouped apart so nothing reads
+   * them side by side with an operational figure as if they were the same.
+   */
+  cohort: MetricGroup;
 
   /** Conditions qualifying anything in the result, deduplicated. */
   quality: {
@@ -90,11 +98,12 @@ export async function loadUnifiedPerformance(input: {
   window: ReportingWindow;
 }): Promise<UnifiedPerformance> {
   const { filters, context, window } = input;
-  const [marketing, attribution] = await Promise.all([
+  const [marketing, attribution, cohort] = await Promise.all([
     loadMarketingAggregate(filters),
     loadAttributionAggregate(filters),
+    loadCohortAggregate(filters),
   ]);
-  const metrics = computeMetricValues({ context, marketing, attribution });
+  const metrics = computeMetricValues({ context, marketing, attribution, cohort });
 
   const qualified = metrics
     .filter((m) => m.availability !== 'available')
@@ -165,6 +174,7 @@ export async function loadUnifiedPerformance(input: {
     revenue: group(metrics, 'revenue'),
     efficiency: group(metrics, 'efficiency'),
     coverage: group(metrics, 'coverage'),
+    cohort: group(metrics, 'cohort'),
     quality: { blockers, qualified },
     freshness: {
       marketing: context.marketingFreshness

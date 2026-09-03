@@ -246,8 +246,18 @@ describe('fixture provider flow over real HTTP', () => {
     const impressions = metric('impressions')?.value ?? 1;
     expect(ctr?.value).toBeCloseTo(clicks / impressions, 10);
 
-    // Cohort ROAS stays unavailable: nothing in Phase 0A can compute it.
-    expect(metric('cohort_roas')?.availability).toBe('unavailable');
+    // This flow binds AppsFlyer, which exposes no cohort revenue. Every cohort
+    // figure must therefore be unavailable with the missing capability named -
+    // never a number derived from window spend and event-date revenue.
+    for (const key of ['cohort_roas_d7', 'cohort_ad_roas_d1', 'cohort_revenue_d7']) {
+      const value = payload.metrics.find((m) => m.metricKey === key) as
+        | { value: number | null; availability: string; blocker?: string; reason?: string }
+        | undefined;
+      expect(value?.value, key).toBeNull();
+      expect(value?.availability, key).toBe('unavailable');
+      expect(value?.blocker, key).toBe('unsupported_metric');
+      expect(value?.reason, key).toMatch(/cohort_/);
+    }
 
     // The fixture deliberately includes a Meta campaign the MMP never reports,
     // so unmatched entities must be visible rather than quietly dropped.
@@ -369,12 +379,29 @@ describe('tenjin adapter over real HTTP', () => {
     expect(result.latestDataDate).toBe('2026-08-03');
   });
 
-  it('ingests revenue from the same report at event_date grain', async () => {
+  it('ingests revenue from the same report at event_date grain, and cohort revenue apart from it', async () => {
     const result = await provider().syncRevenue(window);
     expect(result.batch.revenue.length).toBeGreaterThan(0);
-    expect(result.batch.revenue.every((row) => row.grain === 'event_date')).toBe(true);
     expect(result.batch.revenue.every((row) => row.currency === 'USD')).toBe(true);
-    expect(result.batch.revenue.some((row) => row.revenueType === 'iap')).toBe(true);
+
+    const event = result.batch.revenue.filter((row) => row.grain === 'event_date');
+    const cohort = result.batch.revenue.filter((row) => row.grain === 'cohort_date');
+    expect(event.length).toBeGreaterThan(0);
+    expect(event.some((row) => row.revenueType === 'iap')).toBe(true);
+    expect(
+      event.every((row) => row.cohortAgeDays === undefined || row.cohortAgeDays === null),
+    ).toBe(true);
+
+    // The report carries revenues_Nd and ad_mediation_revenue_Nd, so cohort
+    // rows arrive for both components at both ages - each with its age, on
+    // the install day, never as a provider total beside its own parts.
+    expect(cohort.length).toBeGreaterThan(0);
+    expect(new Set(cohort.map((row) => row.cohortAgeDays))).toEqual(new Set([1, 7]));
+    expect(new Set(cohort.map((row) => row.revenueType))).toEqual(new Set(['iap', 'ad']));
+    expect(
+      cohort.every((row) => row.activityDate >= window.from && row.activityDate <= window.to),
+    ).toBe(true);
+    expect(result.warnings.join(' ')).toMatch(/cohort revenue imported at cohort_date grain/i);
   });
 
   it('reports a rejected api key as an authentication failure, not a schema change', async () => {

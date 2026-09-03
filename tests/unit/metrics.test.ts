@@ -256,11 +256,27 @@ describe('grain safety', () => {
     }
   });
 
-  it('never returns a cohort ROAS value in this phase', () => {
-    const roas = metric('cohort_roas');
-    expect(roas.value).toBeNull();
-    expect(roas.availability).toBe('unavailable');
-    expect(roas.reason).toMatch(/cohort-matched spend/i);
+  it('never derives a cohort ROAS from the operational aggregates', () => {
+    // The operational aggregates carry window spend and event-date revenue.
+    // Dividing those is exactly the number MART refuses to call ROAS, so a
+    // cohort metric computed without a cohort aggregate has no value at all.
+    for (const key of ['cohort_roas_d7', 'cohort_ad_roas_d1', 'cohort_revenue_d7']) {
+      const value = metric(
+        key,
+        context({
+          supportedCapabilities: new Set([
+            'cohort_reporting',
+            'cost_data',
+            'cohort_total_revenue_d7',
+            'cohort_ad_revenue_d1',
+            'attributed_installs',
+          ]),
+        }),
+      );
+      expect(value.value, key).toBeNull();
+      expect(value.availability, key).toBe('unavailable');
+      expect(value.reason, key).toMatch(/not loaded/i);
+    }
   });
 
   it('declares a single grain for every non-mixed metric', () => {
@@ -327,10 +343,35 @@ describe('availability gating', () => {
 
 describe('determineAvailability', () => {
   it('prefers the explicit unavailable reason over any data state', () => {
-    const definition = getMetricDefinition('cohort_roas');
-    if (!definition) throw new Error('missing definition');
-    const result = determineAvailability(definition, context());
+    const spend = getMetricDefinition('spend');
+    if (!spend) throw new Error('missing definition');
+    // No registry entry is permanently unavailable any more, so the rule is
+    // exercised on a definition that declares one.
+    const result = determineAvailability(
+      { ...spend, unavailableReason: 'Deliberately withheld for this test.' },
+      context(),
+    );
     expect(result.availability).toBe('unavailable');
+    expect(result.blocker).toBe('unsupported_metric');
+    expect(result.reason).toMatch(/deliberately withheld/i);
+  });
+
+  it('names the external action recorded for a missing capability', () => {
+    const definition = getMetricDefinition('cohort_iap_revenue_d7');
+    if (!definition) throw new Error('missing definition');
+    const result = determineAvailability(
+      definition,
+      context({
+        supportedCapabilities: new Set(['cohort_reporting']),
+        capabilityNotes: {
+          cohort_iap_revenue_d7: 'Add revenues_7d to the Tenjin saved report "UA" (abc).',
+        },
+      }),
+    );
+    expect(result.availability).toBe('unavailable');
+    expect(result.blocker).toBe('unsupported_metric');
+    expect(result.reason).toContain('cohort_iap_revenue_d7');
+    expect(result.reason).toContain('Add revenues_7d');
   });
 });
 

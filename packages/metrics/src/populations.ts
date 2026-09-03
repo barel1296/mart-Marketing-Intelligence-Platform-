@@ -143,3 +143,52 @@ export function deliveryAlignedCampaign(
 export function delivered(alias = 'md'): string {
   return `(${alias}.spend > 0 OR ${alias}.impressions > 0 OR ${alias}.clicks > 0)`;
 }
+
+/**
+ * Marketing rows for campaigns that resolve operationally to attribution.
+ *
+ * The spend side of every mapped figure. `targetProvider` narrows the link to
+ * one attribution provider's campaigns, bound by the caller, so spend mapped to
+ * a provider that is not the app's MMP cannot count.
+ */
+export function mappedMarketingCampaign(alias = 'md', targetProvider?: string): string {
+  return `${alias}.external_campaign_id IN (
+    SELECT m.source_external_id FROM provider_entity_mappings m
+    WHERE m.organization_id = ${alias}.organization_id AND m.app_id = ${alias}.app_id
+      AND m.entity_type = 'campaign'
+      AND m.source_provider = ${alias}.provider_key
+      AND m.target_external_id IS NOT NULL${targetProvider ? ` AND m.target_provider = ${targetProvider}` : ''}
+      AND ${operationalMapping('m')}
+  )`;
+}
+
+/**
+ * Cohort rows whose marketing campaign SPENT ON THE COHORT'S INSTALL DAY.
+ *
+ * The window-based {@link deliveryAlignedCampaign} is the wrong test for a
+ * cohort: a campaign that spent somewhere in the window did not necessarily
+ * spend on the day this cohort installed, and a D7 return on spend that did
+ * not buy the cohort is not a return. The join is on report_date = the row's
+ * own activity_date (the install day), so numerator and denominator of a
+ * cohort ROAS describe exactly the same (campaign, install day) pairs.
+ *
+ * `delivery` narrows the spend side by the same country/platform binds the
+ * caller applied to the cohort rows, bound to alias `md`, for the reason
+ * given on deliveryAlignedCampaign.
+ */
+export function cohortSpendAlignedCampaign(delivery = '', alias = 't'): string {
+  return `${alias}.external_campaign_id IN (
+    SELECT m.target_external_id FROM provider_entity_mappings m
+    JOIN marketing_daily_metrics md
+      ON md.external_campaign_id = m.source_external_id
+     AND md.provider_key = m.source_provider
+     AND md.organization_id = ${alias}.organization_id AND md.app_id = ${alias}.app_id
+     AND md.report_date = ${alias}.activity_date
+     AND md.spend > 0${delivery}
+    WHERE m.organization_id = ${alias}.organization_id AND m.app_id = ${alias}.app_id
+      AND m.entity_type = 'campaign'
+      AND m.target_provider = ${alias}.provider_key
+      AND m.target_external_id IS NOT NULL
+      AND ${operationalMapping('m')}
+  )`;
+}

@@ -1,8 +1,21 @@
-import type { IsoDate, MetricAvailability, MetricBlocker } from '@mart/shared';
-import { channelForProvider, mediaSourcesForChannel, type CanonicalChannel } from '@mart/shared';
+import type {
+  CohortAge,
+  CohortRevenueType,
+  IsoDate,
+  MetricAvailability,
+  MetricBlocker,
+} from '@mart/shared';
 import {
+  COHORT_AGES,
+  channelForProvider,
+  mediaSourcesForChannel,
+  type CanonicalChannel,
+} from '@mart/shared';
+import {
+  cohortSpendAlignedCampaign,
   deliveryAlignedCampaign,
   mappedAttributionCampaign,
+  mappedMarketingCampaign,
   notOrganic,
   operationalMapping,
   organic,
@@ -70,6 +83,14 @@ export type MetricContext = {
   marketingProviders: string[];
   attributionProviders: string[];
   supportedCapabilities: Set<string>;
+  /**
+   * For a capability the provider does NOT support: the exact external action
+   * that would enable it, as recorded when the capability was probed (for
+   * example which metric to add to a Tenjin saved report). Surfaced in the
+   * metric's reason so an unavailable figure says what to change, not just
+   * that it cannot be shown.
+   */
+  capabilityNotes?: Record<string, string> | undefined;
   marketingFreshness?:
     | { status: string; latestDataDate: string | null; minutesSinceSuccess?: number | null }
     | undefined;
@@ -410,6 +431,380 @@ export async function loadAttributionAggregate(
 }
 
 /**
+ * One revenue component of the window's cohorts at one age.
+ *
+ * Every figure is over MATURE cohorts only: cohorts whose install day plus the
+ * age is strictly before the provider's data horizon, and whose stored row was
+ * last read after that day. The two immature figures are carried so a caller
+ * can say how much was excluded - they are never added to anything.
+ */
+export type CohortRevenueSlice = {
+  /** Mature cohorts, every media source. */
+  revenue: number;
+  organicRevenue: number;
+  mappedPaidRevenue: number;
+  /** Paid cohorts on campaigns with no operational mapping: no spend to borrow. */
+  unmappedPaidRevenue: number;
+  /** Mature, paid, mapped, and the marketing campaign spent on the install day. */
+  alignedRevenue: number;
+  /** Cohorts in the window younger than this age. Reported, never summed. */
+  immatureRevenue: number;
+  /** Old enough by the calendar, but last read before reaching the age. */
+  earlyReadRevenue: number;
+  earlyReadRows: number;
+  currencies: string[];
+  alignedCurrencies: string[];
+  rows: number;
+};
+
+export type CohortAgeAggregate = {
+  ageDays: CohortAge;
+  /** Distinct install days in the window old enough for this age, from install rows. */
+  matureCohortDays: number;
+  /** Distinct install days in the window not yet this old. Counted, never zeroed. */
+  immatureCohortDays: number;
+  /** Installs of mature cohorts: the RPI denominator. */
+  installs: number;
+  paidInstalls: number;
+  organicInstalls: number;
+  /**
+   * Spend on (mapped campaign, install day) pairs for mature install days -
+   * the only spend a cohort ROAS may be divided by.
+   */
+  alignedSpend: number;
+  alignedSpendCurrencies: string[];
+  alignedCampaignDays: number;
+  revenue: Record<CohortRevenueType, CohortRevenueSlice>;
+};
+
+export type CohortAggregate = {
+  /**
+   * The attribution provider's data horizon: the latest date any attribution
+   * stream has data for. A cohort is mature at age N only when its install
+   * day plus N is strictly before this. Null until a sync has landed.
+   */
+  asOf: IsoDate | null;
+  byAge: Record<CohortAge, CohortAgeAggregate>;
+};
+
+function emptySlice(): CohortRevenueSlice {
+  return {
+    revenue: 0,
+    organicRevenue: 0,
+    mappedPaidRevenue: 0,
+    unmappedPaidRevenue: 0,
+    alignedRevenue: 0,
+    immatureRevenue: 0,
+    earlyReadRevenue: 0,
+    earlyReadRows: 0,
+    currencies: [],
+    alignedCurrencies: [],
+    rows: 0,
+  };
+}
+
+function emptyAge(ageDays: CohortAge): CohortAgeAggregate {
+  return {
+    ageDays,
+    matureCohortDays: 0,
+    immatureCohortDays: 0,
+    installs: 0,
+    paidInstalls: 0,
+    organicInstalls: 0,
+    alignedSpend: 0,
+    alignedSpendCurrencies: [],
+    alignedCampaignDays: 0,
+    revenue: { iap: emptySlice(), ad: emptySlice(), total: emptySlice() },
+  };
+}
+
+export function emptyCohortAggregate(asOf: IsoDate | null = null): CohortAggregate {
+  const byAge = {} as Record<CohortAge, CohortAgeAggregate>;
+  for (const age of COHORT_AGES) byAge[age] = emptyAge(age);
+  return { asOf, byAge };
+}
+
+/**
+ * The window's install cohorts, at every age MART serves.
+ *
+ * Three questions, each answered from its own fact table and never from
+ * another's rows:
+ *
+ *  - Which install days exist and how old are they? From the install rows,
+ *    so an immature cohort is counted even when it has earned nothing yet.
+ *  - What did the mature cohorts earn by D{N}? From cohort_date revenue rows,
+ *    split by who can honestly claim it: organic, mapped, unmapped, aligned.
+ *  - What was spent acquiring them? From marketing rows on report_date = the
+ *    install day, for the campaigns those cohorts map to.
+ *
+ * `client` lets the currency proof run this exact path inside a transaction.
+ */
+export async function loadCohortAggregate(
+  filters: MetricFilters,
+  client?: Queryable,
+): Promise<CohortAggregate> {
+  // The data horizon: the latest day any attribution stream has data for. A
+  // cohort's age is measured against this, not against the wall clock, so a
+  // stale sync cannot make a cohort look mature before the provider said so.
+  const horizonParams: unknown[] = [filters.organizationId, filters.appId];
+  let horizonWhere = `organization_id = $1 AND app_id = $2
+       AND data_type IN ('attribution_installs', 'attribution_revenue')`;
+  if (filters.attributionProviderKey) {
+    horizonParams.push(filters.attributionProviderKey);
+    horizonWhere += ` AND provider_key = $${horizonParams.length}`;
+  }
+  const horizon = await queryRows<{ as_of: string | null }>(
+    `SELECT MAX(latest_provider_data_date)::text AS as_of FROM data_freshness WHERE ${horizonWhere}`,
+    horizonParams,
+    client,
+  );
+  const asOf = (horizon[0]?.as_of as IsoDate | null | undefined) ?? null;
+  const aggregate = emptyCohortAggregate(asOf);
+  if (!asOf) return aggregate;
+
+  // ----------------------------------------------------- cohort revenue ---
+  const revenueParams: unknown[] = [
+    filters.organizationId,
+    filters.appId,
+    filters.from,
+    filters.to,
+    asOf,
+    [...COHORT_AGES],
+  ];
+  let revenueWhere = `t.organization_id = $1 AND t.app_id = $2 AND t.activity_date BETWEEN $3 AND $4
+       AND t.grain = 'cohort_date' AND t.cohort_age_days = ANY($6::int[])`;
+  if (filters.attributionProviderKey) {
+    revenueParams.push(filters.attributionProviderKey);
+    revenueWhere += ` AND t.provider_key = $${revenueParams.length}`;
+  }
+  if (filters.channel === 'organic') {
+    revenueWhere += ` AND ${organic('t')}`;
+  } else if (filters.channel) {
+    revenueParams.push(mediaSourcesForChannel(filters.channel as CanonicalChannel));
+    revenueWhere += ` AND t.normalized_media_source = ANY($${revenueParams.length}::text[])`;
+  }
+  let revenueDelivery = '';
+  if (filters.country) {
+    revenueParams.push(filters.country);
+    revenueWhere += ` AND t.country = $${revenueParams.length}`;
+    revenueDelivery += ` AND md.country = $${revenueParams.length}`;
+  }
+  if (filters.platform) {
+    revenueParams.push(filters.platform);
+    revenueWhere += ` AND t.platform = $${revenueParams.length}`;
+    revenueDelivery += ` AND md.platform = $${revenueParams.length}`;
+  }
+
+  const revenueRows = await queryRows<{
+    age: number;
+    revenue_type: string;
+    revenue: string;
+    organic_revenue: string;
+    mapped_paid_revenue: string;
+    unmapped_paid_revenue: string;
+    aligned_revenue: string;
+    immature_revenue: string;
+    early_read_revenue: string;
+    early_read_rows: string;
+    currencies: string[];
+    aligned_currencies: string[];
+    row_count: string;
+  }>(
+    `WITH cohort AS (
+       SELECT t.cohort_age_days AS age, t.revenue_type, t.revenue, t.currency,
+              (t.activity_date + t.cohort_age_days) < $5::date AS matured,
+              -- Read after the cohort reached this age, in the app's own
+              -- calendar. A value read on day 3 and labelled D7 is a partial
+              -- figure whatever the column says.
+              (t.observed_at AT TIME ZONE a.timezone)::date > (t.activity_date + t.cohort_age_days)
+                AS read_after,
+              (${NOT_ORGANIC}) AS paid,
+              (${MAPPED_ATTRIBUTION_CAMPAIGN}) AS mapped,
+              (${cohortSpendAlignedCampaign(revenueDelivery, 't')}) AS aligned
+         FROM attribution_revenue_metrics t
+         JOIN apps a ON a.id = t.app_id
+        WHERE ${revenueWhere}
+     )
+     SELECT age, revenue_type,
+            COALESCE(SUM(revenue) FILTER (WHERE matured AND read_after), 0)::text AS revenue,
+            COALESCE(SUM(revenue) FILTER (WHERE matured AND read_after AND NOT paid), 0)::text
+              AS organic_revenue,
+            COALESCE(SUM(revenue) FILTER (WHERE matured AND read_after AND paid AND mapped), 0)::text
+              AS mapped_paid_revenue,
+            COALESCE(SUM(revenue) FILTER (WHERE matured AND read_after AND paid AND NOT mapped), 0)::text
+              AS unmapped_paid_revenue,
+            COALESCE(SUM(revenue) FILTER (WHERE matured AND read_after AND paid AND aligned), 0)::text
+              AS aligned_revenue,
+            COALESCE(SUM(revenue) FILTER (WHERE NOT matured), 0)::text AS immature_revenue,
+            COALESCE(SUM(revenue) FILTER (WHERE matured AND NOT read_after), 0)::text
+              AS early_read_revenue,
+            count(*) FILTER (WHERE matured AND NOT read_after)::text AS early_read_rows,
+            COALESCE(array_agg(DISTINCT currency) FILTER (WHERE matured AND read_after), '{}')
+              AS currencies,
+            COALESCE(array_agg(DISTINCT currency)
+              FILTER (WHERE matured AND read_after AND paid AND aligned), '{}') AS aligned_currencies,
+            count(*)::text AS row_count
+       FROM cohort
+      GROUP BY age, revenue_type`,
+    revenueParams,
+    client,
+  );
+
+  const sliceFrom = (row: (typeof revenueRows)[number]): CohortRevenueSlice => ({
+    revenue: toNumber(row.revenue),
+    organicRevenue: toNumber(row.organic_revenue),
+    mappedPaidRevenue: toNumber(row.mapped_paid_revenue),
+    unmappedPaidRevenue: toNumber(row.unmapped_paid_revenue),
+    alignedRevenue: toNumber(row.aligned_revenue),
+    immatureRevenue: toNumber(row.immature_revenue),
+    earlyReadRevenue: toNumber(row.early_read_revenue),
+    earlyReadRows: toNumber(row.early_read_rows),
+    currencies: row.currencies ?? [],
+    alignedCurrencies: row.aligned_currencies ?? [],
+    rows: toNumber(row.row_count),
+  });
+  const addSlice = (into: CohortRevenueSlice, from: CohortRevenueSlice): void => {
+    into.revenue += from.revenue;
+    into.organicRevenue += from.organicRevenue;
+    into.mappedPaidRevenue += from.mappedPaidRevenue;
+    into.unmappedPaidRevenue += from.unmappedPaidRevenue;
+    into.alignedRevenue += from.alignedRevenue;
+    into.immatureRevenue += from.immatureRevenue;
+    into.earlyReadRevenue += from.earlyReadRevenue;
+    into.earlyReadRows += from.earlyReadRows;
+    into.currencies = [...new Set([...into.currencies, ...from.currencies])].sort();
+    into.alignedCurrencies = [
+      ...new Set([...into.alignedCurrencies, ...from.alignedCurrencies]),
+    ].sort();
+    into.rows += from.rows;
+  };
+  for (const row of revenueRows) {
+    const age = aggregate.byAge[toNumber(row.age) as CohortAge];
+    if (!age) continue;
+    const slice = sliceFrom(row);
+    if (row.revenue_type === 'iap' || row.revenue_type === 'ad') {
+      addSlice(age.revenue[row.revenue_type], slice);
+    }
+    // `total` is every component stored at this age. The adapters never store
+    // a provider total beside its own components, so this cannot double count.
+    addSlice(age.revenue.total, slice);
+  }
+
+  // ---------------------------------------------------- cohort installs ---
+  for (const ageDays of COHORT_AGES) {
+    const installParams: unknown[] = [
+      filters.organizationId,
+      filters.appId,
+      filters.from,
+      filters.to,
+      asOf,
+      ageDays,
+    ];
+    let installWhere = `t.organization_id = $1 AND t.app_id = $2 AND t.install_date BETWEEN $3 AND $4`;
+    if (filters.attributionProviderKey) {
+      installParams.push(filters.attributionProviderKey);
+      installWhere += ` AND t.provider_key = $${installParams.length}`;
+    }
+    if (filters.channel === 'organic') {
+      installWhere += ` AND ${organic('t')}`;
+    } else if (filters.channel) {
+      installParams.push(mediaSourcesForChannel(filters.channel as CanonicalChannel));
+      installWhere += ` AND t.normalized_media_source = ANY($${installParams.length}::text[])`;
+    }
+    if (filters.country) {
+      installParams.push(filters.country);
+      installWhere += ` AND t.country = $${installParams.length}`;
+    }
+    if (filters.platform) {
+      installParams.push(filters.platform);
+      installWhere += ` AND t.platform = $${installParams.length}`;
+    }
+    const mature = `(t.install_date + $6::int) < $5::date`;
+    const installRows = await queryRows<{
+      installs: string;
+      paid_installs: string;
+      organic_installs: string;
+      mature_days: string;
+      immature_days: string;
+    }>(
+      `SELECT COALESCE(SUM(attributed_installs) FILTER (WHERE ${mature}), 0)::text AS installs,
+              COALESCE(SUM(attributed_installs) FILTER (WHERE ${mature} AND ${NOT_ORGANIC}), 0)::text
+                AS paid_installs,
+              COALESCE(SUM(attributed_installs) FILTER (WHERE ${mature} AND NOT (${NOT_ORGANIC})), 0)::text
+                AS organic_installs,
+              count(DISTINCT install_date) FILTER (WHERE ${mature})::text AS mature_days,
+              count(DISTINCT install_date) FILTER (WHERE NOT (${mature}))::text AS immature_days
+         FROM attribution_daily_metrics t
+        WHERE ${installWhere}`,
+      installParams,
+      client,
+    );
+    const age = aggregate.byAge[ageDays];
+    age.installs = toNumber(installRows[0]?.installs);
+    age.paidInstalls = toNumber(installRows[0]?.paid_installs);
+    age.organicInstalls = toNumber(installRows[0]?.organic_installs);
+    age.matureCohortDays = toNumber(installRows[0]?.mature_days);
+    age.immatureCohortDays = toNumber(installRows[0]?.immature_days);
+
+    // ------------------------------------------------ cohort-aligned spend ---
+    // Spend on the install day, for campaigns that map to the bound
+    // attribution provider's campaigns. Organic has no spend by definition, and
+    // a channel the marketing provider does not belong to matches nothing.
+    const channelExcluded = !channelMatchesProvider(filters.channel, filters.marketingProviderKey);
+    if (channelExcluded) continue;
+    const spendParams: unknown[] = [
+      filters.organizationId,
+      filters.appId,
+      filters.from,
+      filters.to,
+      asOf,
+      ageDays,
+    ];
+    let spendWhere = `md.organization_id = $1 AND md.app_id = $2 AND md.report_date BETWEEN $3 AND $4
+         AND md.spend > 0 AND (md.report_date + $6::int) < $5::date`;
+    if (filters.marketingProviderKey) {
+      spendParams.push(filters.marketingProviderKey);
+      spendWhere += ` AND md.provider_key = $${spendParams.length}`;
+    }
+    if (filters.marketingAccountExternalId) {
+      spendParams.push(filters.marketingAccountExternalId);
+      spendWhere += ` AND md.external_account_id = $${spendParams.length}`;
+    }
+    if (filters.country) {
+      spendParams.push(filters.country);
+      spendWhere += ` AND md.country = $${spendParams.length}`;
+    }
+    if (filters.platform) {
+      spendParams.push(filters.platform);
+      spendWhere += ` AND md.platform = $${spendParams.length}`;
+    }
+    let targetProvider: string | undefined;
+    if (filters.attributionProviderKey) {
+      spendParams.push(filters.attributionProviderKey);
+      targetProvider = `$${spendParams.length}`;
+    }
+    const spendRows = await queryRows<{
+      spend: string;
+      currencies: string[];
+      campaign_days: string;
+    }>(
+      `SELECT COALESCE(SUM(md.spend), 0)::text AS spend,
+              COALESCE(array_agg(DISTINCT md.currency), '{}') AS currencies,
+              count(DISTINCT (md.external_campaign_id, md.report_date))::text AS campaign_days
+         FROM marketing_daily_metrics md
+        WHERE ${spendWhere} AND ${mappedMarketingCampaign('md', targetProvider)}`,
+      spendParams,
+      client,
+    );
+    age.alignedSpend = toNumber(spendRows[0]?.spend);
+    age.alignedSpendCurrencies = spendRows[0]?.currencies ?? [];
+    age.alignedCampaignDays = toNumber(spendRows[0]?.campaign_days);
+  }
+
+  return aggregate;
+}
+
+/**
  * Decide availability before looking at the number.
  *
  * Returning zero when a source is missing is the failure mode this exists to
@@ -452,9 +847,16 @@ export function determineAvailability(
     (capability) => !context.supportedCapabilities.has(capability),
   );
   if (missing.length > 0) {
+    // The probe that recorded the gap may also have recorded what would close
+    // it. Saying so here is the difference between "cannot" and "cannot yet".
+    const actions = missing
+      .map((key) => context.capabilityNotes?.[key])
+      .filter((note): note is string => Boolean(note));
     return {
       availability: 'unavailable',
-      reason: `The connected provider does not expose: ${missing.join(', ')}.`,
+      reason:
+        `The connected provider does not expose: ${missing.join(', ')}.` +
+        (actions.length > 0 ? ` ${[...new Set(actions)].join(' ')}` : ''),
       blocker: 'unsupported_metric',
     };
   }
@@ -541,6 +943,12 @@ export function computeMetricValues(input: {
   context: MetricContext;
   marketing: MarketingAggregate;
   attribution: AttributionAggregate;
+  /**
+   * The window's cohorts. Optional because the operational metrics never need
+   * it; a cohort metric computed without it reports that it was not loaded
+   * rather than pretending the cohorts earned nothing.
+   */
+  cohort?: CohortAggregate;
 }): MetricValue[] {
   const definitions = input.metricKeys
     ? input.metricKeys
@@ -557,6 +965,7 @@ function buildMetricValue(
     context: MetricContext;
     marketing: MarketingAggregate;
     attribution: AttributionAggregate;
+    cohort?: CohortAggregate;
   },
 ): MetricValue {
   const { context, marketing, attribution } = input;
@@ -598,6 +1007,13 @@ function buildMetricValue(
       ...(gate.reason ? { reason: gate.reason } : {}),
       ...(gate.blocker ? { blocker: gate.blocker } : {}),
     };
+  }
+
+  // Cohort metrics have their own arithmetic and their own currency sets, and
+  // every one of them - D1 or D7, IAP or ad, revenue, RPI or ROAS - goes
+  // through one rule, so the ages cannot drift apart.
+  if (definition.cohort) {
+    return buildCohortMetric(definition, definition.cohort, base, gate, context, input.cohort);
   }
 
   // A money metric drawn from rows in more than one currency is not a number
@@ -893,6 +1309,174 @@ function buildMetricValue(
         availability: 'unavailable',
         reason: 'Metric is defined but not implemented in this phase.',
       };
+  }
+}
+
+/**
+ * One rule for every cohort figure.
+ *
+ * The order matters and is the same for revenue, RPI and ROAS:
+ *
+ *  1. No data horizon: nothing can be mature, say so.
+ *  2. No mature cohort in the window: the value does not exist yet. Blocked as
+ *     immature_cohort, with the count of cohorts still growing - never zero,
+ *     never the partial figure Tenjin returns for a young cohort.
+ *  3. Currency: the rows that feed THIS figure, on both sides for a ratio.
+ *  4. The arithmetic, over mature cohorts only.
+ *  5. Qualification: immature cohorts excluded, rows read too early excluded,
+ *     unmapped paid cohorts excluded from a ROAS - each named in the reason.
+ */
+function buildCohortMetric(
+  definition: MetricDefinition,
+  spec: NonNullable<MetricDefinition['cohort']>,
+  base: MetricValue,
+  gate: ReturnType<typeof determineAvailability>,
+  context: MetricContext,
+  cohort: CohortAggregate | undefined,
+): MetricValue {
+  const N = spec.ageDays;
+  if (!cohort) {
+    return {
+      ...base,
+      availability: 'unavailable',
+      reason: 'Cohort aggregates were not loaded for this request.',
+    };
+  }
+  if (!cohort.asOf) {
+    return {
+      ...base,
+      availability: 'unavailable',
+      blocker: 'provider_stale',
+      reason:
+        'No attribution sync has completed for this app, so no cohort has an observed age yet.',
+    };
+  }
+  const age = cohort.byAge[N];
+  const slice = age.revenue[spec.revenueType];
+  const cohortDays = age.matureCohortDays + age.immatureCohortDays;
+  const freshness = context.attributionFreshness;
+  const finish = (value: MetricValue): MetricValue => ({
+    ...value,
+    ...(freshness
+      ? { freshnessStatus: freshness.status, latestDataDate: freshness.latestDataDate }
+      : {}),
+  });
+
+  if (cohortDays === 0) {
+    return finish({
+      ...base,
+      availability: 'unavailable',
+      reason: 'No install cohorts in the selected window.',
+    });
+  }
+  if (age.matureCohortDays === 0) {
+    return finish({
+      ...base,
+      availability: 'blocked',
+      blocker: 'immature_cohort',
+      reason: `None of the ${age.immatureCohortDays} install day(s) in this window is ${N} day(s) old as of ${cohort.asOf}. A D${N} figure does not exist for them yet; it is not zero.`,
+    });
+  }
+
+  // Currency: only what feeds this figure. A ROAS reads the aligned cohort
+  // rows and the aligned spend rows; revenue and RPI read every mature row.
+  const currencies = new Set<string>(
+    spec.measure === 'roas'
+      ? [...slice.alignedCurrencies, ...age.alignedSpendCurrencies]
+      : slice.currencies,
+  );
+  if (currencies.size > 1) {
+    const listed = [...currencies].sort().join(', ');
+    return finish({
+      ...base,
+      availability: 'blocked',
+      blocker: 'mixed_currency',
+      reason: `The rows behind this figure are in ${currencies.size} currencies (${listed}). MART does not convert between them, so there is no single number to show.`,
+    });
+  }
+
+  // The caveats every cohort figure carries when they apply. Immature cohorts
+  // are the normal case at the end of any window and are stated, not hidden.
+  const caveats: string[] = [];
+  if (age.immatureCohortDays > 0) {
+    caveats.push(
+      `${age.immatureCohortDays} of ${cohortDays} install day(s) have not reached D${N} as of ${cohort.asOf} and are excluded, not counted as zero`,
+    );
+  }
+  if (slice.earlyReadRows > 0) {
+    caveats.push(
+      `${slice.earlyReadRows} cohort row(s) were last read from the provider before reaching D${N} and are excluded; keep SYNC_RESTATEMENT_LOOKBACK_DAYS at ${N} or more so they are re-read`,
+    );
+  }
+
+  // Caveats travel with any value that is shown, whatever the gate said: a
+  // stale figure that also excludes three immature cohorts must say both.
+  const qualify = (value: MetricValue, extra: string[] = []): MetricValue => {
+    const all = [...caveats, ...extra];
+    if (value.value === null || all.length === 0) return value;
+    const availability = value.availability === 'available' ? 'partial' : value.availability;
+    const reason = [value.reason, `${all.join('; ')}.`].filter(Boolean).join(' ');
+    return { ...value, availability, reason };
+  };
+  const withGate = (value: MetricValue): MetricValue =>
+    finish({
+      ...value,
+      availability: gate.availability,
+      ...(gate.reason ? { reason: gate.reason } : {}),
+      ...(gate.blocker ? { blocker: gate.blocker } : {}),
+    });
+
+  switch (spec.measure) {
+    case 'revenue':
+      return qualify(withGate({ ...base, value: slice.revenue, numerator: slice.revenue }));
+    case 'rpi': {
+      const ratio = safeRatio(slice.revenue, age.installs, definition.minimumDenominator);
+      const value = finishRatio(base, withGate, ratio, slice.revenue, age.installs);
+      return qualify(value);
+    }
+    case 'roas': {
+      // Organic cohorts have no acquisition spend. Filtering to organic is a
+      // legitimate question with no ROAS answer, and the answer is not zero.
+      if (age.alignedSpend === 0) {
+        const reason =
+          age.organicInstalls > 0 && age.paidInstalls === 0
+            ? 'These are organic cohorts. Nothing was spent to acquire them, so a return on spend does not exist for them.'
+            : slice.mappedPaidRevenue + slice.unmappedPaidRevenue > 0 || age.paidInstalls > 0
+              ? age.alignedCampaignDays === 0
+                ? 'No marketing campaign that maps to these cohorts spent on their install days. Reconcile campaigns first; spend from other days or other campaigns is not divided into cohort revenue.'
+                : 'No spend on the install days of the mature cohorts.'
+              : 'No paid cohorts in the selected window.';
+        return finish({
+          ...base,
+          numerator: slice.alignedRevenue,
+          denominator: 0,
+          availability: 'unavailable',
+          blocker: 'missing_denominator',
+          reason,
+        });
+      }
+      const ratio = safeRatio(
+        slice.alignedRevenue,
+        age.alignedSpend,
+        definition.minimumDenominator,
+      );
+      const value = finishRatio(base, withGate, ratio, slice.alignedRevenue, age.alignedSpend);
+      const extra: string[] = [];
+      if (slice.unmappedPaidRevenue > 0) {
+        extra.push(
+          `${slice.unmappedPaidRevenue.toFixed(2)} of paid D${N} ${spec.revenueType} revenue is on campaigns MART cannot map and is in neither side of this ratio`,
+        );
+      }
+      const outsideSpend = slice.mappedPaidRevenue - slice.alignedRevenue;
+      if (outsideSpend > 0) {
+        extra.push(
+          `${outsideSpend.toFixed(2)} of mapped D${N} ${spec.revenueType} revenue is on cohorts whose campaign did not spend on their install day and is in neither side`,
+        );
+      }
+      return qualify(value, extra);
+    }
+    default:
+      return { ...base, availability: 'unavailable', reason: 'Unknown cohort measure.' };
   }
 }
 

@@ -85,6 +85,10 @@ export async function buildMetricContext(
   const bindings = await integrationsRepo.listAppBindings(organizationId, app.id);
 
   const supported = new Set<string>();
+  // For a capability the probe found missing, the probe may have recorded the
+  // exact external change that would supply it. Carried into the context so
+  // an unavailable metric can say what to do, not only that it cannot.
+  const capabilityNotes: Record<string, string> = {};
   for (const binding of bindings) {
     const capabilities = await integrationsRepo.listCapabilities(
       binding.connection_id,
@@ -92,6 +96,9 @@ export async function buildMetricContext(
     );
     for (const capability of capabilities) {
       if (capability.supported) supported.add(capability.capability_key);
+      else if (typeof capability.detail?.['action'] === 'string') {
+        capabilityNotes[capability.capability_key] = capability.detail['action'];
+      }
     }
   }
 
@@ -125,6 +132,7 @@ export async function buildMetricContext(
     marketingProviders: state.marketingProviderKey ? [state.marketingProviderKey] : [],
     attributionProviders: state.attributionProviderKey ? [state.attributionProviderKey] : [],
     supportedCapabilities: supported,
+    capabilityNotes,
     marketingFreshness: marketingRows.length
       ? {
           status: worstFreshness(marketingRows.map((r) => r.status)),

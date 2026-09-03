@@ -16,6 +16,7 @@ import {
   loadUnifiedPerformance,
   listMetricDefinitions,
   loadAttributionAggregate,
+  loadCohortAggregate,
   loadCampaignTable,
   loadFilterOptions,
   loadMarketingAggregate,
@@ -107,9 +108,10 @@ export async function registerAnalyticsRoutes(server: FastifyInstance): Promise<
       marketingAccountExternalId: query.marketingAccountExternalId ?? null,
     };
 
-    const [marketing, attribution] = await Promise.all([
+    const [marketing, attribution, cohort] = await Promise.all([
       loadMarketingAggregate(filters),
       loadAttributionAggregate(filters),
+      loadCohortAggregate(filters),
     ]);
 
     const metrics = computeMetricValues({
@@ -117,6 +119,7 @@ export async function registerAnalyticsRoutes(server: FastifyInstance): Promise<
       context: metricContext,
       marketing,
       attribution,
+      cohort,
     });
 
     return {
@@ -494,16 +497,23 @@ export async function registerAnalyticsRoutes(server: FastifyInstance): Promise<
         marketingAccountExternalId: query.marketingAccountExternalId ?? null,
       };
 
-      const [marketing, attribution, freshness, runs, bindings, quality] = await Promise.all([
-        loadMarketingAggregate(filters),
-        loadAttributionAggregate(filters),
-        syncRepo.listFreshness(context.organizationId, app.id),
-        syncRepo.listSyncRuns(context.organizationId, { appId: app.id, limit: 5 }),
-        integrationsRepo.listAppBindings(context.organizationId, app.id),
-        dataQualityRepo.listDataQualityFindings(context.organizationId, app.id, { limit: 10 }),
-      ]);
+      const [marketing, attribution, cohort, freshness, runs, bindings, quality] =
+        await Promise.all([
+          loadMarketingAggregate(filters),
+          loadAttributionAggregate(filters),
+          loadCohortAggregate(filters),
+          syncRepo.listFreshness(context.organizationId, app.id),
+          syncRepo.listSyncRuns(context.organizationId, { appId: app.id, limit: 5 }),
+          integrationsRepo.listAppBindings(context.organizationId, app.id),
+          dataQualityRepo.listDataQualityFindings(context.organizationId, app.id, { limit: 10 }),
+        ]);
 
-      const metrics = computeMetricValues({ context: metricContext, marketing, attribution });
+      const metrics = computeMetricValues({
+        context: metricContext,
+        marketing,
+        attribution,
+        cohort,
+      });
 
       const [series, campaigns, discrepancies, ambiguous] = await Promise.all([
         loadTimeseries(filters),

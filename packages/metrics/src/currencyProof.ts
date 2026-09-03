@@ -1,13 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import { getPool, queryRows, type Queryable } from '@mart/db';
+import { COHORT_AGES } from '@mart/shared';
 import {
   computeMetricValues,
   loadAttributionAggregate,
+  loadCohortAggregate,
   loadMarketingAggregate,
   type MetricContext,
   type MetricFilters,
 } from './service.js';
-import type { MetricValue } from './registry.js';
+import { cohortMetricKey, type MetricValue } from './registry.js';
 
 /**
  * A transaction-scoped proof that MART refuses to add two currencies.
@@ -344,4 +346,217 @@ async function runInsideTransaction(
 
 function appId(filters: MetricFilters): string {
   return filters.appId;
+}
+
+/**
+ * The same proof for the cohort figures.
+ *
+ * A cohort ROAS reads two tables - aligned cohort revenue and aligned spend -
+ * and a cohort revenue figure reads one. Each must refuse the moment its own
+ * inputs carry two currencies, and a second currency on the SPEND side alone
+ * must block the ROAS while leaving cohort revenue (which never reads spend)
+ * computable. That asymmetry is the point of checking per metric: a gate that
+ * blocked everything on any foreign row would be a false refusal, and one that
+ * only looked at revenue would let a mixed-currency ROAS through.
+ *
+ * Two synthetic rows, inside a transaction that is always rolled back: one
+ * cohort_date revenue row at the youngest age MART serves, dated early enough
+ * to be mature, on a campaign nothing real can carry, and one marketing row
+ * on the same day. Then the production loader and the production metric
+ * computation are asked what they see.
+ */
+export type CohortCurrencyProofResult = {
+  injected: { currency: string; cohortDate: string; ageDays: number };
+  natural: { revenueCurrencies: string[]; spendCurrencies: string[] };
+  gate: {
+    revenueCurrencies: string[];
+    spendCurrencies: string[];
+    cohortRevenue: Pick<MetricValue, 'availability' | 'blocker' | 'value' | 'numerator' | 'reason'>;
+    cohortRoas: Pick<MetricValue, 'availability' | 'blocker' | 'value' | 'numerator' | 'reason'>;
+  };
+  verdict: {
+    detected: boolean;
+    notSummed: boolean;
+    blocked: boolean;
+    reasonNamesCurrency: boolean;
+    passed: boolean;
+  };
+  rollback: { verified: boolean; before: CurrencyProofSnapshot; after: CurrencyProofSnapshot };
+};
+
+export async function proveCohortCurrencyGate(input: {
+  filters: MetricFilters;
+  context: MetricContext;
+}): Promise<CohortCurrencyProofResult> {
+  const { filters, context } = input;
+  const before = await snapshotForProof(filters.appId);
+  const client = await getPool().connect();
+  let outcome: Omit<CohortCurrencyProofResult, 'rollback'> | undefined;
+  try {
+    await client.query('BEGIN');
+    outcome = await runCohortProof(client, filters, context);
+  } finally {
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // Released below; the snapshot comparison is the check that matters.
+    }
+    client.release();
+  }
+  const after = await snapshotForProof(filters.appId);
+  const verified = Object.keys(before).every((k) => before[k] === after[k]);
+  if (!outcome) throw new Error('cohort currency proof produced no outcome');
+  return { ...outcome, rollback: { verified, before, after } };
+}
+
+async function runCohortProof(
+  client: Queryable,
+  filters: MetricFilters,
+  context: MetricContext,
+): Promise<Omit<CohortCurrencyProofResult, 'rollback'>> {
+  const ageDays = COHORT_AGES[0];
+  const revenueKey = cohortMetricKey({ ageDays, revenueType: 'total', measure: 'revenue' });
+  const roasKey = cohortMetricKey({ ageDays, revenueType: 'total', measure: 'roas' });
+  const summarizeKeys = (metrics: MetricValue[]) => ({
+    cohortRevenue: summarize(metrics.find((m) => m.metricKey === revenueKey)),
+    cohortRoas: summarize(metrics.find((m) => m.metricKey === roasKey)),
+  });
+
+  const naturalCohort = await loadCohortAggregate(filters, client);
+  const naturalAge = naturalCohort.byAge[ageDays];
+  const present = new Set([
+    ...naturalAge.revenue.total.currencies,
+    ...naturalAge.alignedSpendCurrencies,
+  ]);
+  const currency = pickInjectedCurrency(present);
+  const nonce = randomUUID();
+
+  const connections = await queryRows<{
+    role: string;
+    connection_id: string;
+    provider_key: string;
+  }>(
+    `SELECT b.role, b.connection_id, c.provider_key
+       FROM integration_app_bindings b
+       JOIN integration_connections c ON c.id = b.connection_id
+      WHERE b.app_id = $1 AND b.status = 'active'`,
+    [filters.appId],
+    client,
+  );
+  const marketing = connections.find((c) => c.role === 'marketing_network');
+  const attribution = connections.find((c) => c.role === 'primary_attribution');
+  if (!marketing || !attribution) {
+    throw new Error(
+      'cohort currency proof needs a marketing network and an attribution provider bound',
+    );
+  }
+
+  // The injected cohort must be MATURE, or the maturity gate - correctly -
+  // hides it before the currency gate ever sees it. Dated at the window start
+  // and observed far enough after; the horizon is whatever the app has.
+  const cohortDate = filters.from;
+  const attributionCampaignId = `${PROOF_TAG}:cohort:${nonce}`;
+  const marketingCampaignId = `${PROOF_TAG}:spend:${nonce}`;
+  await queryRows(
+    `INSERT INTO attribution_revenue_metrics
+       (organization_id, app_id, connection_id, provider_key, grain, activity_date, cohort_age_days,
+        revenue_type, media_source, normalized_media_source, external_campaign_id,
+        country, platform, currency, revenue, dimension_hash, observed_at)
+     VALUES ($1, $2, $3, $4, 'cohort_date', $5, $6, 'iap', $7, 'meta', $8, NULL, 'unknown', $9, 1, $10,
+             ($5::date + $6::int + 2)::timestamptz + interval '1 year')`,
+    [
+      filters.organizationId,
+      filters.appId,
+      attribution.connection_id,
+      attribution.provider_key,
+      cohortDate,
+      ageDays,
+      PROOF_TAG,
+      attributionCampaignId,
+      currency,
+      `${PROOF_TAG}:cohort:${nonce}`,
+    ],
+    client,
+  );
+  // An operational mapping and same-day spend, so the row lands in the
+  // ALIGNED population the ROAS actually reads.
+  await queryRows(
+    `INSERT INTO provider_entity_mappings
+       (organization_id, app_id, entity_type, source_provider, source_external_id, source_name,
+        target_provider, target_external_id, target_name, mapping_method, mapping_confidence, status)
+     VALUES ($1, $2, 'campaign', $3, $4, $5, $6, $7, $5, 'manual', 1, 'manually_verified')`,
+    [
+      filters.organizationId,
+      filters.appId,
+      marketing.provider_key,
+      marketingCampaignId,
+      PROOF_TAG,
+      attribution.provider_key,
+      attributionCampaignId,
+    ],
+    client,
+  );
+  await queryRows(
+    `INSERT INTO marketing_daily_metrics
+       (organization_id, app_id, connection_id, provider_key, report_date,
+        external_account_id, external_campaign_id, country, platform, currency,
+        spend, impressions, clicks, dimension_hash)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, 'unknown', $8, 1, 1, 1, $9)`,
+    [
+      filters.organizationId,
+      filters.appId,
+      marketing.connection_id,
+      marketing.provider_key,
+      cohortDate,
+      PROOF_TAG,
+      marketingCampaignId,
+      currency,
+      `${PROOF_TAG}:spend:${nonce}`,
+    ],
+    client,
+  );
+
+  const mixedCohort = await loadCohortAggregate(filters, client);
+  const mixedAge = mixedCohort.byAge[ageDays];
+  const [marketingAgg, attributionAgg] = await Promise.all([
+    loadMarketingAggregate(filters, client),
+    loadAttributionAggregate(filters, client),
+  ]);
+  const gate = summarizeKeys(
+    computeMetricValues({
+      context,
+      marketing: marketingAgg,
+      attribution: attributionAgg,
+      cohort: mixedCohort,
+    }),
+  );
+
+  const revenueCurrencies = mixedAge.revenue.total.currencies;
+  const spendCurrencies = mixedAge.alignedSpendCurrencies;
+  const detected = revenueCurrencies.includes(currency) && spendCurrencies.includes(currency);
+  const notSummed = gate.cohortRevenue.value === null && gate.cohortRoas.value === null;
+  const blocked =
+    gate.cohortRevenue.availability === 'blocked' &&
+    gate.cohortRevenue.blocker === 'mixed_currency' &&
+    gate.cohortRoas.availability === 'blocked' &&
+    gate.cohortRoas.blocker === 'mixed_currency';
+  const reasonNamesCurrency =
+    (gate.cohortRevenue.reason ?? '').includes(currency) &&
+    (gate.cohortRoas.reason ?? '').includes(currency);
+
+  return {
+    injected: { currency, cohortDate, ageDays },
+    natural: {
+      revenueCurrencies: naturalAge.revenue.total.currencies,
+      spendCurrencies: naturalAge.alignedSpendCurrencies,
+    },
+    gate: { revenueCurrencies, spendCurrencies, ...gate },
+    verdict: {
+      detected,
+      notSummed,
+      blocked,
+      reasonNamesCurrency,
+      passed: detected && notSummed && blocked && reasonNamesCurrency,
+    },
+  };
 }
